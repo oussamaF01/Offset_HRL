@@ -1,0 +1,21 @@
+{
+  "run_timestamp": "20260610_143544",
+  "total_timesteps": 50000,
+  "seed": 7,
+  "model_dir": "models/upper_ppo_3gnb/run_20260610_143544",
+  "device": "cpu",
+  "use_sumo_mobility": false,
+  "include_ue_counts": true,
+  "n_gnbs": 3,
+  "slice_types": [
+    "eMBB",
+    "URLLC",
+    "mMTC"
+  ],
+  "local_steps_per_global": 10,
+  "global_steps_per_episode": 3,
+  "scenario_mode": "snapshot",
+  "snapshot_scenario": "mixed",
+  "terminal_reward_only": true,
+  "use_progress_reward": false
+}

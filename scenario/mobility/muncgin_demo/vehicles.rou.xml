@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-06-07 11:10:15.928200 by randomTrips.py UNKNOWN
+<configuration>
+    <net-file value="scenario/mobility/muncgin_demo/muncgin.net.xml"/>
+    <output-trip-file value="scenario/mobility/muncgin_demo/vehicles.trips.xml"/>
+    <route-file value="scenario/mobility/muncgin_demo/vehicles.rou.xml"/>
+    <prefix value="ue"/>
+    <vehicle-class value="passenger"/>
+    <validate value="True"/>
+    <end value="20.0"/>
+    <period value="1.0"/>
+</configuration>
+-->
+
+<!-- generated on 2026-06-07 11:10:15 by Eclipse SUMO duarouter Version 1.18.0
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="scenario/mobility/muncgin_demo/muncgin.net.xml"/>
+        <route-files value="scenario/mobility/muncgin_demo/vehicles.trips.xml"/>
+    </input>
+
+    <output>
+        <output-file value="scenario/mobility/muncgin_demo/vehicles.rou.xml"/>
+        <alternatives-output value="NUL"/>
+    </output>
+
+    <time>
+        <begin value="0.0"/>
+        <end value="20.0"/>
+    </time>
+
+    <report>
+        <no-warnings value="true"/>
+        <ignore-errors value="true"/>
+        <no-step-log value="true"/>
+    </report>
+
+</configuration>
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="ue_passenger" vClass="passenger"/>
+    <vehicle id="ue0" type="ue_passenger" depart="0.00">
+        <route edges="30805091#0 534107305#0 -55971658#3 -137269175#5"/>
+    </vehicle>
+    <vehicle id="ue1" type="ue_passenger" depart="1.00">
+        <route edges="-4645415#3 -4645415#2 -4645415#1 24061194#0 93891975 -4645408#2 -4645408#1 1285216792 31159271#0 1012878037#0 1012878037#1 315220271#0 143927076 159687505 23462077#0 350873889#0 666490437#0 -30932612 -365018750#2 -365018752#2 -3654343 -144061668#3 -144061668#1 -365018746 -33131466#2 -23457653#2 1485006481#0 1485006481#2 -3926353#3"/>
+    </vehicle>
+    <vehicle id="ue2" type="ue_passenger" depart="2.00">
+        <route edges="365018753#1 315220257 350873890#0 72546416#0 37723863#1 30923288#0"/>
+    </vehicle>
+    <vehicle id="ue5" type="ue_passenger" depart="5.00">
+        <route edges="-3926353#2 -3926353#1 477009659#0 3926353#2 3926353#3 -3810596#3 -1485006481#1 1485006481#0"/>
+    </vehicle>
+    <vehicle id="ue6" type="ue_passenger" depart="6.00">
+        <route edges="-1389356645 3812984#2 535322385 38332819#0 38332819#1 38332820 38332821#0 -38332822"/>
+    </vehicle>
+    <vehicle id="ue7" type="ue_passenger" depart="7.00">
+        <route edges="30923286#0 -30923287 30923287 -30923288#1 -37723863#3 37723863#1 30923285 -30923154#1 -30923154#0 -3812483#3 -3812483#2 148881875#0 1102911624 -365018752#2 -3654343 -144061668#3 -144061668#1 -365018746 -33131466#2 -23457653#2 1485006481#0 1485006481#2 -3926353#3 -3926353#2 -3926353#1 -137269175#5 -137269175#1 -163316371#5 -163316371#2 -3926687#1 3926687#0 163316371#0 163316371#4"/>
+    </vehicle>
+    <vehicle id="ue8" type="ue_passenger" depart="8.00">
+        <route edges="-3926353#2 -3926353#1 477009659#0 3926353#2 3926353#3 -3810596#3 -1485006481#1 23457653#0 33131466#0 365018746 144061668#0 144061668#2 3654343 365018752#0 365018750#0 30932611 23462075#0 666490436#0 365018753#0 365018753#1 315220257 350873890#0 143927075 143927077 1285216790#0 1285216790#2 1285216794 1285216791 163628891 1285216787 315220272#0 -38332822 -38332820 -38332819#1 -38332819#0 4645419#0 151730511 24061812"/>
+    </vehicle>
+    <vehicle id="ue9" type="ue_passenger" depart="9.00">
+        <route edges="3926026#0 3926025#0 3926025#2 -3926024#2 145571051#0 -148688774#1 23462127#0 666490437#0 -30932612 -365018750#2 -1102911480#2"/>
+    </vehicle>
+    <vehicle id="ue11" type="ue_passenger" depart="11.00">
+        <route edges="121542794 -121542794 257683432#0 4240773#0 477009659#0 3926353#2 3926353#3 -3810596#3 -1485006481#1 23457653#0 33131466#0 365018746 144061668#0 144061668#2 3654343 365018752#0 365018750#0 30932611 23462075#0 666490436#0 365018753#0 365018753#1 315220257 350873890#0 143927075 143927077 1285216790#0 350848866 1012878037#1 315220271#0 143927076 159687505 23462077#0 350873889#0 666490437#0 -30932612 -365018750#2"/>
+    </vehicle>
+    <vehicle id="ue13" type="ue_passenger" depart="13.00">
+        <route edges="-23462127#1 -23374338#2 436996282#0 26695828 143732074 143927075 143927077 1285216790#0 1285216790#2 -152095521 -25693733#6"/>
+    </vehicle>
+    <vehicle id="ue14" type="ue_passenger" depart="14.00">
+        <route edges="4239280#0 257683432#0 4240773#0 477009659#0 3926353#2 3926353#3 -3810596#3 -1485006481#1 23457653#0 33131466#0 365018746 144061668#0 144061668#2 3654343 365018752#0 365018750#0 30932611 23462075#0 666490436#0 365018753#0 365018753#1 315220257 350873890#0 143927075 143927077 1285216790#0 1285216790#2 -152095521 -25693733#6 25693733#0"/>
+    </vehicle>
+    <vehicle id="ue15" type="ue_passenger" depart="15.00">
+        <route edges="3926025#2 3926024#3 143652213#0 143652213#1 143652215 30750675#1 356582887"/>
+    </vehicle>
+    <vehicle id="ue16" type="ue_passenger" depart="16.00">
+        <route edges="216110865 145571054#0 1285216795 1285216796 1285216793 1285216792 31159271#0 1012878037#0 1012878037#1 315220271#0 143927076 159687506 72546416#0 37723863#1 30923285 -30923154#1 -30923154#0 23462159#0 666490436#0"/>
+    </vehicle>
+    <vehicle id="ue17" type="ue_passenger" depart="17.00">
+        <route edges="1285234244 1285234243 144278190#0 145571054#0 1285216795 1285216796 1285216793 1285216792 31159271#0 1012878037#0 1012878037#1 315220271#0 143927076 159687506 72546416#0 145628200#0 102604787 364988565 878577785 1285216790#0 1285216790#2 1285216794 1285216791 163628891"/>
+    </vehicle>
+    <vehicle id="ue19" type="ue_passenger" depart="19.00">
+        <route edges="4564466#2 -143451087#1 32209559 436996282#0 26695828 23462077#0"/>
+    </vehicle>
+</routes>

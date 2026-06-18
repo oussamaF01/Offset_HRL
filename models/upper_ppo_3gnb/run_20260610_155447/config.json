@@ -1,0 +1,36 @@
+{
+  "run_timestamp": "20260610_155447",
+  "total_timesteps": 50000,
+  "seed": 7,
+  "model_dir": "models/upper_ppo_3gnb/run_20260610_155447",
+  "device": "cpu",
+  "use_sumo_mobility": false,
+  "include_ue_counts": true,
+  "n_gnbs": 3,
+  "slice_types": [
+    "eMBB",
+    "URLLC",
+    "mMTC"
+  ],
+  "local_steps_per_global": 10,
+  "global_steps_per_episode": 1,
+  "max_handovers_per_local_step": 1,
+  "action_direction_reward_weight": 2.0,
+  "scenario_mode": "snapshot",
+  "snapshot_scenario": "all_offload_balancing",
+  "terminal_reward_only": true,
+  "use_progress_reward": false,
+  "saved_final_model": "models/upper_ppo_3gnb/run_20260610_155447/upper_ppo_final.zip",
+  "saved_best_model": "models/upper_ppo_3gnb/run_20260610_155447/upper_ppo_best.zip",
+  "training_csv": "models/upper_ppo_3gnb/run_20260610_155447/training_log.csv",
+  "validation": {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -3.7127809715324753,
+    "mean_target_load_error_delta": -0.1308910237603747,
+    "mean_handover_count_per_step": 2.3,
+    "mean_sla_count": 4.0,
+    "mean_overloaded_negative_fraction": 0.7983333333333333,
+    "mean_light_nonnegative_fraction": 0.9216666666666666,
+    "validation_csv": "models/upper_ppo_3gnb/run_20260610_155447/validation_log.csv"
+  }
+}

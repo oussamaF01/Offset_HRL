@@ -1,0 +1,42 @@
+{
+  "city": "muncgin_demo",
+  "source_osm": "city_senario/Muncgin_map.osm",
+  "sumo_config_path": "scenario/mobility/muncgin_demo/sim.sumocfg",
+  "sumo_net_path": "scenario/mobility/muncgin_demo/muncgin.net.xml",
+  "gnb_positions": [
+    [
+      739.485,
+      421.692
+    ],
+    [
+      2218.455,
+      421.692
+    ],
+    [
+      739.485,
+      1265.077
+    ],
+    [
+      2218.455,
+      1265.077
+    ]
+  ],
+  "coverage_radius": [
+    1242.335,
+    1242.335,
+    1242.335,
+    1242.335
+  ],
+  "carrier_ids": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "max_prbs_per_gnb": [
+    120,
+    120,
+    120,
+    120
+  ]
+}

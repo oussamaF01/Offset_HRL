@@ -1,0 +1,198 @@
+{
+  "snapshot_mode": "feasible_mixed",
+  "slice_types": [
+    "eMBB",
+    "URLLC",
+    "mMTC"
+  ],
+  "training_scenarios": [
+    "feasible_embb_offload_only",
+    "feasible_urllc_offload_only",
+    "feasible_mmtc_offload_only",
+    "feasible_embb_offload_urllc_retain_mmtc_neutral",
+    "feasible_urllc_offload_mmtc_retain_embb_neutral",
+    "feasible_mmtc_offload_embb_retain_urllc_neutral",
+    "feasible_all_offload",
+    "feasible_all_neutral"
+  ],
+  "scenario_hold_episodes": 10,
+  "run_timestamp": "20260608_233050",
+  "total_timesteps": 50000,
+  "episode_steps": 40,
+  "seed": 7,
+  "save_path": "models/local_a3_fixed_feasible_mixed",
+  "saved_model": "models/local_a3_fixed_feasible_mixed/local_a3_td3_final.zip",
+  "load_path": null,
+  "episode_csv": "models/local_a3_fixed_feasible_mixed/episode_trace.csv",
+  "evaluation": [
+    {
+      "snapshot_name": "feasible_embb_offload_only",
+      "expected_offset_sign": "negative",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "negative",
+        "URLLC": "near zero",
+        "mMTC": "near zero"
+      },
+      "mean_applied_offset": -3.625,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -3.625,
+        "URLLC": 0.37,
+        "mMTC": -1.885
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": true,
+        "mMTC": false
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_urllc_offload_only",
+      "expected_offset_sign": "near zero",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "near zero",
+        "URLLC": "negative",
+        "mMTC": "near zero"
+      },
+      "mean_applied_offset": -0.275,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -0.275,
+        "URLLC": -4.28,
+        "mMTC": -2.27
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": true,
+        "mMTC": false
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_mmtc_offload_only",
+      "expected_offset_sign": "near zero",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "near zero",
+        "URLLC": "near zero",
+        "mMTC": "negative"
+      },
+      "mean_applied_offset": -0.435,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -0.435,
+        "URLLC": -2.245,
+        "mMTC": -5.39
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": false,
+        "mMTC": true
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_embb_offload_urllc_retain_mmtc_neutral",
+      "expected_offset_sign": "negative",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "negative",
+        "URLLC": "positive",
+        "mMTC": "near zero"
+      },
+      "mean_applied_offset": -5.625,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -5.625,
+        "URLLC": 4.76,
+        "mMTC": -1.815
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": true,
+        "mMTC": false
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_urllc_offload_mmtc_retain_embb_neutral",
+      "expected_offset_sign": "near zero",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "near zero",
+        "URLLC": "negative",
+        "mMTC": "positive"
+      },
+      "mean_applied_offset": -1.045,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -1.045,
+        "URLLC": -4.63,
+        "mMTC": 4.52
+      },
+      "passed_by_slice": {
+        "eMBB": false,
+        "URLLC": true,
+        "mMTC": true
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_mmtc_offload_embb_retain_urllc_neutral",
+      "expected_offset_sign": "positive",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "positive",
+        "URLLC": "near zero",
+        "mMTC": "negative"
+      },
+      "mean_applied_offset": 3.94,
+      "mean_applied_offset_by_slice": {
+        "eMBB": 3.94,
+        "URLLC": -1.155,
+        "mMTC": -3.44
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": false,
+        "mMTC": true
+      },
+      "passed": false
+    },
+    {
+      "snapshot_name": "feasible_all_offload",
+      "expected_offset_sign": "negative",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "negative",
+        "URLLC": "negative",
+        "mMTC": "negative"
+      },
+      "mean_applied_offset": -2.125,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -2.125,
+        "URLLC": -4.765,
+        "mMTC": -4.23
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": true,
+        "mMTC": true
+      },
+      "passed": true
+    },
+    {
+      "snapshot_name": "feasible_all_neutral",
+      "expected_offset_sign": "near zero",
+      "expected_offset_sign_by_slice": {
+        "eMBB": "near zero",
+        "URLLC": "near zero",
+        "mMTC": "near zero"
+      },
+      "mean_applied_offset": -0.82,
+      "mean_applied_offset_by_slice": {
+        "eMBB": -0.82,
+        "URLLC": 1.355,
+        "mMTC": -0.545
+      },
+      "passed_by_slice": {
+        "eMBB": true,
+        "URLLC": false,
+        "mMTC": true
+      },
+      "passed": false
+    }
+  ],
+  "passed_all": false
+}

@@ -1,0 +1,35 @@
+{
+  "run_timestamp": "20260612_135631",
+  "total_timesteps": 10000,
+  "seed": 7,
+  "model_dir": "models/upper_ppo_3gnb/run_20260612_135631",
+  "device": "auto",
+  "use_sumo_mobility": false,
+  "include_ue_counts": true,
+  "include_service_metrics": true,
+  "directional_global_action": true,
+  "slice_prb_budgets": {
+    "eMBB": 50,
+    "URLLC": 50,
+    "mMTC": 50
+  },
+  "max_prbs_per_ue": 20,
+  "n_gnbs": 3,
+  "slice_types": [
+    "eMBB",
+    "URLLC",
+    "mMTC"
+  ],
+  "local_steps_per_global": 5,
+  "global_steps_per_episode": 8,
+  "max_handovers_per_local_step": 1,
+  "action_direction_reward_weight": 2.0,
+  "scenario_mode": "snapshot",
+  "snapshot_scenario": "mixed",
+  "snapshot_block_episodes": 10,
+  "light_load_ues": 1,
+  "medium_load_ues": 2,
+  "high_load_ues": 3,
+  "terminal_reward_only": false,
+  "use_progress_reward": false
+}

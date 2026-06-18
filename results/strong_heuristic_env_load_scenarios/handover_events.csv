@@ -1,0 +1,17 @@
+step,ue_id,slice_type,from_gnb,to_gnb,rsrp_serving_dbm,rsrp_target_dbm,offset_db,controller,time_s,scenario,mode
+139,4,EMBB,0,1,-79.6332194941465,-78.31718973318937,0.0,MultiGNBWrapper,13.9,g0_embb_moving_to_g1,baseline
+158,3,EMBB,0,1,-79.3499943469289,-78.06132516025495,0.0,MultiGNBWrapper,15.8,g0_embb_moving_to_g1,baseline
+178,2,EMBB,0,1,-79.24700414315673,-77.94059581113132,0.0,MultiGNBWrapper,17.8,g0_embb_moving_to_g1,baseline
+198,1,EMBB,0,1,-79.28155094839731,-77.98112225918628,0.0,MultiGNBWrapper,19.8,g0_embb_moving_to_g1,baseline
+229,0,EMBB,0,1,-79.46665698358072,-78.12114277879263,0.0,MultiGNBWrapper,22.900000000000002,g0_embb_moving_to_g1,baseline
+55,4,EMBB,0,1,-76.64760252710597,-81.14224991913744,-6.0,MultiGNBWrapper,5.5,g0_embb_moving_to_g1,heuristic
+75,3,EMBB,0,1,-76.23238930500811,-80.90539512491667,-6.0,MultiGNBWrapper,7.5,g0_embb_moving_to_g1,heuristic
+96,2,EMBB,0,1,-76.10319379019475,-80.77733623499398,-6.0,MultiGNBWrapper,9.600000000000001,g0_embb_moving_to_g1,heuristic
+116,1,EMBB,0,1,-76.16594591777871,-80.8127955593995,-6.0,MultiGNBWrapper,11.600000000000001,g0_embb_moving_to_g1,heuristic
+144,0,EMBB,0,1,-76.34699115825993,-81.02437957419538,-6.0,MultiGNBWrapper,14.4,g0_embb_moving_to_g1,heuristic
+153,2,EMBB,0,1,-79.38371606312847,-78.1239190156036,0.0,MultiGNBWrapper,15.3,g0_source_g1_busy_target,baseline
+175,1,EMBB,0,1,-79.22582186860103,-77.95511094047166,0.0,MultiGNBWrapper,17.5,g0_source_g1_busy_target,baseline
+198,0,EMBB,0,1,-79.39255016180675,-78.0957040156253,0.0,MultiGNBWrapper,19.8,g0_source_g1_busy_target,baseline
+60,2,EMBB,0,1,-76.26207618081861,-80.97660458312743,-6.0,MultiGNBWrapper,6.0,g0_source_g1_busy_target,heuristic
+84,1,EMBB,0,1,-76.08078528543794,-80.78694922960807,-6.0,MultiGNBWrapper,8.4,g0_source_g1_busy_target,heuristic
+105,0,EMBB,0,1,-76.26981319826233,-80.953785086561,-6.0,MultiGNBWrapper,10.5,g0_source_g1_busy_target,heuristic

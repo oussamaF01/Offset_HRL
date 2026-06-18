@@ -1,0 +1,32 @@
+{
+  "snapshot_mode": "offload",
+  "run_timestamp": "20260608_224854",
+  "total_timesteps": 50000,
+  "episode_steps": 40,
+  "seed": 7,
+  "save_path": "models/local_a3_fixed_offload",
+  "saved_model": "models/local_a3_fixed_offload/local_a3_td3_final.zip",
+  "load_path": null,
+  "episode_csv": "models/local_a3_fixed_offload/episode_trace.csv",
+  "evaluation": [
+    {
+      "snapshot_name": "fixed_embb_offload_snapshot",
+      "expected_offset_sign": "negative",
+      "mean_applied_offset": -4.666666666666667,
+      "passed": true
+    },
+    {
+      "snapshot_name": "fixed_embb_retain_snapshot",
+      "expected_offset_sign": "positive",
+      "mean_applied_offset": -2.6666666666666665,
+      "passed": false
+    },
+    {
+      "snapshot_name": "fixed_embb_neutral_snapshot",
+      "expected_offset_sign": "near zero",
+      "mean_applied_offset": -2.888888888888889,
+      "passed": false
+    }
+  ],
+  "passed_all": false
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <net-file value="muncgin.net.xml"/>
+        <route-files value="vehicles.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="180"/>
+        <step-length value="1.0"/>
+    </time>
+</configuration>
