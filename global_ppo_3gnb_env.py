@@ -12,7 +12,11 @@ import numpy as np
 from local_a3_agent_wrapper import normalize_slice_type
 from scenario_creator import create_multignb_env
 from slice_ran import Packet
-from strong_heuristic_local_executor import strong_heuristic_local_executor
+from strong_heuristic_local_executor import strong_directional_heuristic_local_executor
+from upper_agent_training_scenarios import (
+    UpperTrainingScenario,
+    get_upper_training_scenarios,
+)
 
 
 SLICE_TYPES = ("eMBB", "URLLC", "mMTC")
@@ -112,13 +116,17 @@ class GlobalPPO3GNBEnv(gym.Env):
         use_sumo_mobility: bool = False,
         local_steps_per_global: int = 10,
         global_steps_per_episode: int = 12,
-        radio_substeps: int = 10,
+        radio_substeps: int = 20,
+        radio_tick_seconds: float | None = None,
         gnb_configs: Sequence[Mapping] | None = None,
         scenario_mode: str = "snapshot",
         snapshot_scenario: str = "mixed",
         terminal_reward_only: bool = True,
         use_progress_reward: bool = False,
         max_handovers_per_local_step: int = 1,
+        max_handovers_per_ue_episode: int = 2,
+        max_handovers_per_episode: int = 20,
+        handover_pingpong_guard_s: float = 30.0,
         action_direction_reward_weight: float = 2.0,
         snapshot_block_episodes: int = 10,
         light_load_ues: int = 1,
@@ -127,16 +135,30 @@ class GlobalPPO3GNBEnv(gym.Env):
         print_scenarios: bool = False,
         slice_prb_budgets: Mapping[str, int] | None = None,
         max_prbs_per_ue: int | None = 20,
-        directional_global_action: bool = True,
-        global_reward_mu: float = 1.0,
+        directional_global_action: bool = False,
+        global_reward_mu: float = 2.0,
         global_reward_zeta: float = 1.0,
-        global_reward_beta: float = 5.0,
+        global_reward_beta: float = 1.0,
         global_action_lambda: float = 0.01,
-        global_action_kappa: float = 0.05,
-        global_bad_direction_eta: float = 0.5,
-        global_unsafe_target_rho: float = 1.0,
+        global_action_kappa: float = 0.005,
+        global_bad_direction_eta: float = 0.025,
+        global_unsafe_target_rho: float = 0.05,
         sla_deadband: float = 0.05,
         critical_load_thresholds: Mapping[str, float] | None = None,
+        safe_admission_load_limits: Mapping[str, float] | None = None,
+        upper_window_seconds: float = 1.0,
+        training_scenarios: str | Sequence[str] | None = None,
+        scenario_selection: str = "cycle",
+        fixed_stage_episodes: int = 500,
+        slow_stage_episodes: int = 1000,
+        global_neutral_bias_weight: float = 0.1,
+        neutral_bias_eps: float = 0.05,
+        sla_severity_level_weight: float = 0.1,
+        load_balance_level_weight: float = 1.0,
+        a3_handover_cooldown_s: float = 2.0,
+        a3_min_residence_s: float = 2.0,
+        a3_history_window_s: float = 20.0,
+        a3_pingpong_threshold_s: float = 5.0,
     ):
         super().__init__()
         if int(n_gnbs) != 3:
@@ -150,14 +172,48 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.include_service_metrics = bool(include_service_metrics)
         self.use_sumo_mobility = bool(use_sumo_mobility)
         self.local_steps_per_global = max(1, int(local_steps_per_global))
+        self.upper_window_seconds = max(float(upper_window_seconds), 1e-6)
+        self.local_step_seconds = self.upper_window_seconds / self.local_steps_per_global
         self.global_steps_per_episode = max(1, int(global_steps_per_episode))
-        self.radio_substeps = int(radio_substeps)
+        self.training_scenarios = get_upper_training_scenarios(training_scenarios)
+        self.scenario_selection = str(scenario_selection).strip().lower()
+        if self.scenario_selection not in {"cycle", "random", "staged"}:
+            raise ValueError("scenario_selection must be 'cycle', 'random', or 'staged'")
+        self.fixed_stage_episodes = max(int(fixed_stage_episodes), 0)
+        self.slow_stage_episodes = max(int(slow_stage_episodes), 0)
+        self.max_curriculum_episode_steps = max(
+            int(math.ceil(scenario.duration_s / self.upper_window_seconds))
+            for scenario in self.training_scenarios
+        )
+        self.radio_substeps = max(1, int(radio_substeps))
+        expected_radio_tick_seconds = self.local_step_seconds / self.radio_substeps
+        self.radio_tick_seconds = (
+            expected_radio_tick_seconds
+            if radio_tick_seconds is None
+            else max(float(radio_tick_seconds), 1e-6)
+        )
+        if not math.isclose(
+            self.radio_tick_seconds * self.radio_substeps,
+            self.local_step_seconds,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "Radio and mobility clocks must match: "
+                "radio_substeps * radio_tick_seconds must equal "
+                "upper_window_seconds / local_steps_per_global. "
+                f"Got {self.radio_substeps} * {self.radio_tick_seconds} != "
+                f"{self.local_step_seconds}."
+            )
         self.gnb_configs = [dict(cfg) for cfg in (gnb_configs or DEFAULT_GNB_CONFIGS_3)]
         self.scenario_mode = str(scenario_mode).strip().lower()
         self.snapshot_scenario = str(snapshot_scenario).strip()
         self.terminal_reward_only = bool(terminal_reward_only)
         self.use_progress_reward = bool(use_progress_reward)
         self.max_handovers_per_local_step = max(1, int(max_handovers_per_local_step))
+        self.max_handovers_per_ue_episode = max(1, int(max_handovers_per_ue_episode))
+        self.max_handovers_per_episode = max(1, int(max_handovers_per_episode))
+        self.handover_pingpong_guard_s = max(float(handover_pingpong_guard_s), 0.0)
         self.action_direction_reward_weight = float(action_direction_reward_weight)
         self.snapshot_block_episodes = max(1, int(snapshot_block_episodes))
         self.light_load_ues = max(1, int(light_load_ues))
@@ -166,7 +222,9 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.print_scenarios = bool(print_scenarios)
         self.slice_prb_budgets = None if slice_prb_budgets is None else dict(slice_prb_budgets)
         self.max_prbs_per_ue = None if max_prbs_per_ue is None else max(int(max_prbs_per_ue), 1)
-        self.directional_global_action = bool(directional_global_action)
+        # v15 deliberately keeps the upper action non-directional. The flag is
+        # retained only so older launch scripts do not fail.
+        self.directional_global_action = False
         self.global_reward_mu = float(global_reward_mu)
         self.global_reward_zeta = float(global_reward_zeta)
         self.global_reward_beta = float(global_reward_beta)
@@ -174,33 +232,37 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.global_action_kappa = float(global_action_kappa)
         self.global_bad_direction_eta = float(global_bad_direction_eta)
         self.global_unsafe_target_rho = float(global_unsafe_target_rho)
+        self.global_neutral_bias_weight = float(global_neutral_bias_weight)
+        self.neutral_bias_eps = float(neutral_bias_eps)
+        self.sla_severity_level_weight = float(sla_severity_level_weight)
+        self.load_balance_level_weight = max(float(load_balance_level_weight), 0.0)
+        self.a3_handover_cooldown_s = max(float(a3_handover_cooldown_s), 0.0)
+        self.a3_min_residence_s = max(float(a3_min_residence_s), self.a3_handover_cooldown_s)
+        self.a3_history_window_s = max(float(a3_history_window_s), 0.0)
+        self.a3_pingpong_threshold_s = max(float(a3_pingpong_threshold_s), 0.0)
         self.sla_deadband = max(float(sla_deadband), 0.0)
         default_critical = {"eMBB": 0.95, "URLLC": 0.95, "mMTC": 0.95}
         if critical_load_thresholds is not None:
             default_critical.update({normalize_slice_type(k): float(v) for k, v in critical_load_thresholds.items()})
         self.critical_load_thresholds = default_critical
+        self.safe_admission_load_limits = {
+            normalize_slice_type(key): float(value)
+            for key, value in dict(safe_admission_load_limits or {}).items()
+        }
 
         self.neighbors = {0: [1, 2], 1: [0, 2], 2: [0, 1]}
         self.max_neighbors = max(len(values) for values in self.neighbors.values())
         self.lower_agents = {}
 
-        action_dim = (
-            self.n_gnbs * self.max_neighbors * len(self.slice_types)
-            if self.directional_global_action
-            else self.n_gnbs * len(self.slice_types)
-        )
+        action_dim = self.n_gnbs * len(self.slice_types)
         self.action_space = gym.spaces.Box(
             low=-1.0,
             high=1.0,
             shape=(action_dim,),
             dtype=np.float32,
         )
-        signals_per_key = 2
-        if self.include_service_metrics:
-            signals_per_key += 3
-        if self.include_ue_counts:
-            signals_per_key += 1
-        obs_dim = self.n_gnbs * len(self.slice_types) * signals_per_key
+        # v15 upper state: [L_i,s, normalized K_i,s, SLA_i,s, previous b_i,s].
+        obs_dim = self.n_gnbs * len(self.slice_types) * 4
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -216,7 +278,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
         self._previous_directional_bias_tensor = self._last_directional_bias_tensor.copy()
         self._last_bias_matrix = np.zeros((self.n_gnbs, len(self.slice_types)), dtype=np.float32)
-        self._strong_prev_offsets = np.zeros((self.n_gnbs, len(self.slice_types)), dtype=float)
+        self._strong_prev_offsets = np.zeros(
+            (self.n_gnbs, self.max_neighbors, len(self.slice_types)),
+            dtype=float,
+        )
         self._last_strong_offsets = self._strong_prev_offsets.copy()
         self._last_strong_offset_debug = {}
         self._last_info: Dict = {}
@@ -226,23 +291,44 @@ class GlobalPPO3GNBEnv(gym.Env):
         self._episode_window_rewards = []
         self._episode_handovers = 0
         self._episode_start_imbalance = 0.0
+        self._episode_start_variance = 0.0
+        self._previous_window_sla_severity: float | None = None
         self._episode_index = 0
+        self._active_training_scenario: UpperTrainingScenario | None = None
+        self._active_episode_steps = self.global_steps_per_episode
 
     def _make_base_env(self):
-        return create_multignb_env(
+        env = create_multignb_env(
             rng=self.rng,
             n=4,
             gnb_configs=self.gnb_configs,
             slots_per_step=5,
             L1_level=False,
-            step_dt=1e-3,
-            mobility_dt=0.0,
+            step_dt=self.radio_tick_seconds,
+            mobility_dt=self.local_step_seconds,
             radio_substeps=self.radio_substeps,
-            max_episode_steps=self.global_steps_per_episode * self.local_steps_per_global + 5,
+            max_episode_steps=max(
+                self.global_steps_per_episode,
+                self.max_curriculum_episode_steps,
+            ) * self.local_steps_per_global + 5,
             use_sumo_mobility=self.use_sumo_mobility,
             slice_prb_budgets=self.slice_prb_budgets,
             max_prbs_per_ue=self.max_prbs_per_ue,
+            a3_history_window_s=self.a3_history_window_s,
+            a3_pingpong_threshold_s=self.a3_pingpong_threshold_s,
+            max_handovers_per_step=self.max_handovers_per_local_step,
+            max_handovers_per_ue_episode=self.max_handovers_per_ue_episode,
+            max_handovers_per_episode=self.max_handovers_per_episode,
+            a3_handover_cooldown_s=self.a3_handover_cooldown_s,
+            a3_min_residence_s=self.a3_min_residence_s,
+            a3_pingpong_guard_s=self.handover_pingpong_guard_s,
+            safe_admission_enabled=True,
+            safe_admission_load_limits=self.safe_admission_load_limits,
         )
+        # The upper environment ignores the base wrapper's bulky info/history
+        # on every local step and builds one authoritative upper-step record.
+        env.collect_step_diagnostics = False
+        return env
 
     def reset(self, *, seed=None, options=None):
         if seed is not None:
@@ -255,64 +341,152 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=np.float32,
         )
         self._previous_directional_bias_tensor = self._last_directional_bias_tensor.copy()
-        self._strong_prev_offsets = np.zeros((self.n_gnbs, len(self.slice_types)), dtype=float)
+        self._strong_prev_offsets = np.zeros(
+            (self.n_gnbs, self.max_neighbors, len(self.slice_types)),
+            dtype=float,
+        )
         self._last_strong_offsets = self._strong_prev_offsets.copy()
         self._last_strong_offset_debug = {}
         self._episode_instant_rewards = []
         self._episode_window_rewards = []
         self._episode_handovers = 0
+        self._previous_window_sla_severity = None
         for agent in self.lower_agents.values():
             agent.reset()
 
         self.base_env.clear_ues(reset_ids=True)
-        self._initialize_load_scenario()
+        self.base_env.reset(seed=seed)
+        if self.scenario_mode == "curriculum":
+            self._initialize_training_scenario()
+        else:
+            self._active_episode_steps = self.global_steps_per_episode
+            self._initialize_load_scenario()
         self.base_env._invalidate_metric_caches()
-        self._episode_start_imbalance = self._target_load_error()
+        self._episode_start_imbalance = self._load_balance_cost()
+        self._episode_start_variance = self._load_variance()
+        reset_cost = self._load_balance_cost()
         obs = self._get_observation()
         info = self._build_info(
             reward=0.0,
             instant_rewards=[],
             handovers=0,
-            start_imbalance=self._target_load_error(),
-            end_imbalance=self._target_load_error(),
+            start_imbalance=reset_cost,
+            end_imbalance=reset_cost,
         )
         self._last_info = info
         return obs, info
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        directional_bias = self._action_to_directional_tensor(action)
-        previous_directional_bias = self._last_directional_bias_tensor.copy()
-        bias_matrix = self._directional_to_summary_bias_matrix(directional_bias)
-
-        self._previous_directional_bias_tensor = previous_directional_bias.astype(np.float32)
+        bias_matrix = self._action_to_bias_matrix(action)
+        previous_bias_matrix = self._last_bias_matrix.copy()
+        directional_bias = np.repeat(
+            bias_matrix[:, None, :],
+            self.max_neighbors,
+            axis=1,
+        )
+        self._previous_directional_bias_tensor = np.repeat(
+            previous_bias_matrix[:, None, :],
+            self.max_neighbors,
+            axis=1,
+        ).astype(np.float32)
         self._last_directional_bias_tensor = directional_bias.astype(np.float32)
         self._last_bias_matrix = bias_matrix.astype(np.float32)
         start_loads = self._load_matrix()
-        start_sla = self._sla_matrix()
-        start_cost = self._global_network_cost(start_loads, start_sla)
-        start_imbalance = self._load_variance(start_loads)
+        start_variance = self._load_variance(start_loads)
+        start_saturation = self._saturation_count(start_loads)
+        start_imbalance = self._load_balance_cost(start_loads)
         instant_rewards = []
         start_handover_idx = len(getattr(self.base_env, "handover_events", []))
 
         offsets, offset_debug = self._compute_strong_local_offsets(bias_matrix)
         self._apply_slice_offsets(offsets)
+        self.base_env.begin_safe_admission_window(bias_matrix, self.slice_types)
+        self.base_env.begin_sla_window()
         self._last_strong_offsets = offsets.copy()
         self._last_strong_offset_debug = offset_debug
         self._strong_prev_offsets = offsets.copy()
 
         for _ in range(self.local_steps_per_global):
             _obs, _reward, terminated, truncated, _info = self.base_env.step(0)
+            self._recalibrate_handover_ues()
             if terminated or truncated:
                 break
 
         end_loads = self._load_matrix()
         end_sla = self._sla_matrix()
-        end_cost = self._global_network_cost(end_loads, end_sla)
-        end_imbalance = self._load_variance(end_loads)
-        action_penalty = self._global_action_penalty(directional_bias, previous_directional_bias)
-        bad_direction_penalty = self._bad_direction_penalty(directional_bias, start_loads, start_sla)
-        window_reward = float(start_cost - end_cost - action_penalty - bad_direction_penalty)
+        end_variance = self._load_variance(end_loads)
+        end_saturation = self._saturation_count(end_loads)
+        end_sla_severity = self._network_sla_severity()
+        # Reset opens a fresh SLA window with no samples.  Comparing that
+        # artificial zero with the first populated window creates a large,
+        # action-independent penalty.  Bootstrap the first SLA baseline from
+        # the first measured window, then compare populated windows thereafter.
+        start_sla_severity = (
+            end_sla_severity
+            if self._previous_window_sla_severity is None
+            else float(self._previous_window_sla_severity)
+        )
+        start_cost = float(
+            self.global_reward_mu * start_variance
+            + self.global_reward_zeta * start_saturation
+            + self.global_reward_beta * start_sla_severity
+        )
+        end_cost = float(
+            self.global_reward_mu * end_variance
+            + self.global_reward_zeta * end_saturation
+            + self.global_reward_beta * end_sla_severity
+        )
+        end_imbalance = self._load_balance_cost(end_loads)
+        action_penalty = self._bias_smoothness_penalty(bias_matrix, previous_bias_matrix)
+        neutral_bias_penalty = self._balanced_slice_neutral_bias_penalty(
+            start_loads, bias_matrix, eps=self.neutral_bias_eps
+        )
+        bad_direction_penalty = self._bad_direction_penalty(
+            directional_bias, loads=start_loads, sla=self._sla_matrix()
+        )
+        # Balance is the upper agent's principal objective.  Normalize progress
+        # by the imbalance available at the start of the window so the same
+        # fractional improvement has comparable value across scenarios.
+        normalized_balance_progress = float(
+            np.clip(
+                (start_variance - end_variance) / max(start_variance, 0.05),
+                -1.0,
+                1.0,
+            )
+        )
+        load_reward = self.global_reward_mu * normalized_balance_progress
+        saturation_reward = self.global_reward_zeta * (
+            start_saturation - end_saturation
+        )
+        sla_reward = self.global_reward_beta * (
+            start_sla_severity - end_sla_severity
+        )
+        # Penalise absolute SLA severity each step so the agent is punished
+        # for every window it stays in a violated state, not only at the
+        # transition where the delta fires.
+        sla_severity_level_penalty = self.sla_severity_level_weight * end_sla_severity
+        normalized_load_level = float(
+            np.clip(
+                end_variance / max(self._episode_start_variance, 0.05),
+                0.0,
+                1.0,
+            )
+        )
+        load_balance_level_bonus = (
+            self.load_balance_level_weight * (1.0 - normalized_load_level)
+        )
+        window_reward = float(
+            load_reward
+            + load_balance_level_bonus
+            + saturation_reward
+            + sla_reward
+            - action_penalty
+            - self.global_neutral_bias_weight * neutral_bias_penalty
+            - bad_direction_penalty
+            - sla_severity_level_penalty
+        )
+        self._previous_window_sla_severity = float(end_sla_severity)
         instant_rewards = [window_reward]
         progress_reward = 2.0 * (start_imbalance - end_imbalance) if self.use_progress_reward else 0.0
         dense_reward = window_reward + progress_reward
@@ -321,7 +495,7 @@ class GlobalPPO3GNBEnv(gym.Env):
 
         self._global_step += 1
         terminated = False
-        truncated = self._global_step >= self.global_steps_per_episode
+        truncated = self._global_step >= self._active_episode_steps
         total_handovers = len(getattr(self.base_env, "handover_events", [])) - start_handover_idx
         self._episode_handovers += int(total_handovers)
         if self.terminal_reward_only:
@@ -342,6 +516,14 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["global_cost_improvement"] = float(start_cost - end_cost)
         info["global_action_penalty"] = float(action_penalty)
         info["global_bad_direction_penalty"] = float(bad_direction_penalty)
+        info["reward_load_improvement"] = float(load_reward)
+        info["reward_saturation_improvement"] = float(saturation_reward)
+        info["reward_sla_improvement"] = float(sla_reward)
+        info["reward_neutral_bias_penalty"] = float(neutral_bias_penalty)
+        info["reward_sla_severity_level_penalty"] = float(sla_severity_level_penalty)
+        info["reward_load_balance_level_bonus"] = float(
+            load_balance_level_bonus
+        )
         info["terminal_reward_only"] = bool(self.terminal_reward_only)
         info["use_progress_reward"] = bool(self.use_progress_reward)
         info["episode_terminal_reward"] = (
@@ -353,34 +535,15 @@ class GlobalPPO3GNBEnv(gym.Env):
     def close(self):
         self.base_env.close()
 
-    def _action_to_directional_tensor(self, action: np.ndarray) -> np.ndarray:
+    def _action_to_bias_matrix(self, action: np.ndarray) -> np.ndarray:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        directional_size = self.n_gnbs * self.max_neighbors * len(self.slice_types)
-        legacy_size = self.n_gnbs * len(self.slice_types)
-
-        if action.size == directional_size:
-            return np.clip(action, -1.0, 1.0).reshape(
-                self.n_gnbs,
-                self.max_neighbors,
-                len(self.slice_types),
-            )
-
-        if action.size == legacy_size:
-            legacy = np.clip(action, -1.0, 1.0).reshape(self.n_gnbs, len(self.slice_types))
-            return np.repeat(legacy[:, None, :], self.max_neighbors, axis=1)
-
-        raise ValueError(
-            f"Expected action shape {self.action_space.shape} "
-            f"or legacy flat size {legacy_size}, got {action.shape}"
+        expected = self.n_gnbs * len(self.slice_types)
+        if action.size != expected:
+            raise ValueError(f"Expected upper action size {expected}, got {action.size}")
+        return np.clip(action, -1.0, 1.0).reshape(
+            self.n_gnbs,
+            len(self.slice_types),
         )
-
-    def _directional_to_summary_bias_matrix(self, directional_bias: np.ndarray) -> np.ndarray:
-        directional_bias = np.asarray(directional_bias, dtype=float)
-        summary = np.zeros((self.n_gnbs, len(self.slice_types)), dtype=float)
-        for gnb_id in range(self.n_gnbs):
-            n_neighbors = max(len(self.neighbors.get(gnb_id, [])), 1)
-            summary[gnb_id, :] = np.mean(directional_bias[gnb_id, :n_neighbors, :], axis=0)
-        return summary
 
     def _directional_bias_row(self, directional_bias: np.ndarray, gnb_id: int) -> Dict[Tuple[int, str], float]:
         row = {}
@@ -390,24 +553,18 @@ class GlobalPPO3GNBEnv(gym.Env):
         return row
 
     def _get_observation(self) -> np.ndarray:
-        try:
-            obs = self.base_env.get_global_agent_observation(
-                include_ue_counts=self.include_ue_counts,
-                include_service_metrics=self.include_service_metrics,
-            )
-        except Exception:
-            obs = self._fallback_observation()
-        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
-        if self.include_ue_counts:
-            n_keys = self.n_gnbs * len(self.slice_types)
-            count_block_start = n_keys * (5 if self.include_service_metrics else 2)
-            if obs.size >= count_block_start + n_keys:
-                obs = obs.copy()
-                for idx, slice_type in enumerate(self.slice_types):
-                    denom = max(self._kmax_by_slice().get(slice_type, 1.0), 1e-9)
-                    for gnb_idx in range(self.n_gnbs):
-                        count_idx = count_block_start + gnb_idx * len(self.slice_types) + idx
-                        obs[count_idx] = obs[count_idx] / denom
+        loads = self._load_matrix().reshape(-1)
+        counts = np.asarray(
+            [
+                self.base_env.get_slice_ue_count(gnb_id, slice_type)
+                / max(self._kmax_by_slice().get(slice_type, 1.0), 1e-9)
+                for gnb_id in range(self.n_gnbs)
+                for slice_type in self.slice_types
+            ],
+            dtype=float,
+        )
+        sla = np.clip(self._sla_matrix(), 0.0, 1.0).reshape(-1)
+        obs = np.concatenate((loads, counts, sla, self._last_bias_matrix.reshape(-1)))
         return np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
 
     def _fallback_observation(self) -> np.ndarray:
@@ -447,9 +604,9 @@ class GlobalPPO3GNBEnv(gym.Env):
     def _apply_slice_offsets(self, offsets: np.ndarray) -> None:
         offsets = np.asarray(offsets, dtype=float)
         for serving_id in range(self.n_gnbs):
-            for s_idx, slice_type in enumerate(self.slice_types):
-                offset_db = float(offsets[serving_id, s_idx])
-                for neighbor_id in self.neighbors.get(serving_id, []):
+            for neighbor_slot, neighbor_id in enumerate(self.neighbors.get(serving_id, [])):
+                for s_idx, slice_type in enumerate(self.slice_types):
+                    offset_db = float(offsets[serving_id, neighbor_slot, s_idx])
                     self.base_env.set_a3_offset(serving_id, neighbor_id, slice_type, offset_db)
 
     def _aggregate_mobility_ratio_matrix(self, ratios: Mapping[Tuple[int, int, str], float]) -> np.ndarray:
@@ -468,6 +625,32 @@ class GlobalPPO3GNBEnv(gym.Env):
             matrix[serving_id, s_idx] += float(max(value, 0.0))
             counts[serving_id, s_idx] += 1.0
         return matrix / np.maximum(counts, 1.0)
+
+    def _directional_mobility_ratio_tensor(
+        self,
+        ratios: Mapping[Tuple[int, int, str], float],
+    ) -> np.ndarray:
+        tensor = np.zeros(
+            (self.n_gnbs, self.max_neighbors, len(self.slice_types)),
+            dtype=float,
+        )
+        slice_index = {
+            normalize_slice_type(slice_type): idx
+            for idx, slice_type in enumerate(self.slice_types)
+        }
+        for source_id, neighbors in self.neighbors.items():
+            for neighbor_slot, target_id in enumerate(neighbors):
+                for slice_type, s_idx in slice_index.items():
+                    tensor[source_id, neighbor_slot, s_idx] = float(
+                        max(
+                            ratios.get(
+                                (source_id, target_id, slice_type.upper()),
+                                ratios.get((source_id, target_id, slice_type), 0.0),
+                            ),
+                            0.0,
+                        )
+                    )
+        return tensor
 
     def _strong_executor_arrays(self):
         slice_index = {normalize_slice_type(s): idx for idx, s in enumerate(self.slice_types)}
@@ -504,8 +687,12 @@ class GlobalPPO3GNBEnv(gym.Env):
             rsrp_matrix,
             self._load_matrix(),
             np.clip(self._sla_matrix(), 0.0, 1.0),
-            self._aggregate_mobility_ratio_matrix(self.base_env.get_handover_failure_ratios()),
-            self._aggregate_mobility_ratio_matrix(self.base_env.get_ping_pong_ratios()),
+            self._directional_mobility_ratio_tensor(
+                self.base_env.get_handover_failure_ratios()
+            ),
+            self._directional_mobility_ratio_tensor(
+                self.base_env.get_ping_pong_ratios()
+            ),
         )
 
     def _compute_strong_local_offsets(self, bias_matrix: np.ndarray):
@@ -519,7 +706,7 @@ class GlobalPPO3GNBEnv(gym.Env):
             pingpong_ratio,
         ) = self._strong_executor_arrays()
 
-        return strong_heuristic_local_executor(
+        return strong_directional_heuristic_local_executor(
             B=np.asarray(bias_matrix, dtype=float),
             prev_offsets=self._strong_prev_offsets,
             ue_slice=ue_slice,
@@ -531,8 +718,9 @@ class GlobalPPO3GNBEnv(gym.Env):
             ho_failure_ratio=ho_failure_ratio,
             pingpong_ratio=pingpong_ratio,
             hysteresis_db=float(getattr(self.base_env, "a3_hysteresis_db", 1.0)),
-            l_safe=0.85,
+            l_safe=min(self.safe_admission_load_limits.values(), default=0.80),
             slice_types=self.slice_types,
+            allow_extended_negative_offsets=True,
             return_debug=True,
         )
 
@@ -558,14 +746,23 @@ class GlobalPPO3GNBEnv(gym.Env):
     def _global_network_cost(self, loads: np.ndarray | None = None, sla: np.ndarray | None = None) -> float:
         if loads is None:
             loads = self._load_matrix()
-        if sla is None:
-            sla = self._sla_matrix()
         loads = np.asarray(loads, dtype=float)
-        sla = np.asarray(sla, dtype=float)
 
         variance_cost = float(sum(np.var(loads[:, s_idx]) for s_idx in range(len(self.slice_types))))
         saturation_count = self._saturation_count(loads)
-        sla_severity = self._sla_severity(sla)
+        if sla is None:
+            # Use the normalized mean over active slice/cell windows.  The old
+            # summed 3x3 severity had a range near 0..9 and overwhelmed load
+            # variance, whose natural range is below 1.
+            sla_severity = self._network_sla_severity()
+        else:
+            sla = np.asarray(sla, dtype=float)
+            active = sla[sla > 0.0]
+            sla_severity = (
+                float(np.mean(np.maximum(active - self.sla_deadband, 0.0)))
+                if active.size
+                else 0.0
+            )
         return float(
             self.global_reward_mu * variance_cost
             + self.global_reward_zeta * float(saturation_count)
@@ -577,6 +774,131 @@ class GlobalPPO3GNBEnv(gym.Env):
             sla = self._sla_matrix()
         sla = np.asarray(sla, dtype=float)
         return float(np.sum(np.maximum(sla - self.sla_deadband, 0.0)))
+
+    def _network_sla_severity(self) -> float:
+        metrics = self.base_env.get_slice_sla_metrics()
+        active = [
+            float(values["severity"])
+            for values in metrics.values()
+            if bool(values.get("active", 0.0))
+        ]
+        return float(np.mean(active)) if active else 0.0
+
+    def _qos_snapshot(self) -> Dict[str, object]:
+        shape = (self.n_gnbs, len(self.slice_types))
+        matrices = {
+            "throughput_mbps_matrix": np.zeros(shape, dtype=float),
+            "offered_mbps_matrix": np.zeros(shape, dtype=float),
+            "delivery_ratio_matrix": np.zeros(shape, dtype=float),
+            "completed_delay_ms_matrix": np.zeros(shape, dtype=float),
+            "mean_hol_delay_ms_matrix": np.zeros(shape, dtype=float),
+            "max_hol_delay_ms_matrix": np.zeros(shape, dtype=float),
+            "queue_kbits_matrix": np.zeros(shape, dtype=float),
+            "drop_ratio_matrix": np.zeros(shape, dtype=float),
+            "packet_failure_ratio_matrix": np.zeros(shape, dtype=float),
+        }
+        metrics = self.base_env.get_slice_sla_metrics()
+        duration_s = max(
+            self.local_steps_per_global
+            * self.base_env.radio_substeps
+            * self.base_env.step_dt,
+            1e-9,
+        )
+        total_offered = total_delivered = 0.0
+        total_generated = total_dropped = total_failed = 0.0
+        total_completed = total_delay_sum = 0.0
+        active_hol_delays = []
+        total_queue_bits = 0.0
+
+        for gnb_id in range(self.n_gnbs):
+            for s_idx, slice_type in enumerate(self.slice_types):
+                key = (gnb_id, slice_type)
+                values = metrics.get(key, {})
+                offered = float(values.get("offered_bits", 0.0))
+                delivered = float(values.get("delivered_bits", 0.0))
+                generated = float(values.get("generated_packets", 0.0))
+                completed = float(values.get("completed_packets", 0.0))
+                delay_sum = float(values.get("completed_delay_sum_s", 0.0))
+                dropped = float(values.get("dropped_packets", 0.0))
+                failed = float(values.get("failed_packets", 0.0))
+                ues = [
+                    ue for ue in self.base_env.get_all_ues()
+                    if ue.connected
+                    and ue.serving_gnb is not None
+                    and int(ue.serving_gnb) == gnb_id
+                    and normalize_slice_type(getattr(ue, "slice_type", "eMBB"))
+                    == slice_type
+                ]
+                hol_delays = [
+                    max(float(getattr(ue, "hol_delay_s", 0.0)), 0.0)
+                    for ue in ues
+                ]
+                queue_bits = sum(
+                    max(float(getattr(ue, "queue", 0.0)), 0.0) for ue in ues
+                )
+
+                matrices["throughput_mbps_matrix"][gnb_id, s_idx] = (
+                    delivered / duration_s / 1e6
+                )
+                matrices["offered_mbps_matrix"][gnb_id, s_idx] = (
+                    offered / duration_s / 1e6
+                )
+                matrices["delivery_ratio_matrix"][gnb_id, s_idx] = (
+                    delivered / offered if offered > 0.0 else 1.0
+                )
+                matrices["completed_delay_ms_matrix"][gnb_id, s_idx] = (
+                    1000.0 * delay_sum / completed if completed > 0.0 else 0.0
+                )
+                matrices["mean_hol_delay_ms_matrix"][gnb_id, s_idx] = (
+                    1000.0 * float(np.mean(hol_delays)) if hol_delays else 0.0
+                )
+                matrices["max_hol_delay_ms_matrix"][gnb_id, s_idx] = (
+                    1000.0 * max(hol_delays) if hol_delays else 0.0
+                )
+                matrices["queue_kbits_matrix"][gnb_id, s_idx] = queue_bits / 1000.0
+                matrices["drop_ratio_matrix"][gnb_id, s_idx] = (
+                    dropped / generated if generated > 0.0 else 0.0
+                )
+                matrices["packet_failure_ratio_matrix"][gnb_id, s_idx] = (
+                    failed / generated if generated > 0.0 else 0.0
+                )
+
+                total_offered += offered
+                total_delivered += delivered
+                total_generated += generated
+                total_completed += completed
+                total_delay_sum += delay_sum
+                total_dropped += dropped
+                total_failed += failed
+                active_hol_delays.extend(hol_delays)
+                total_queue_bits += queue_bits
+
+        return {
+            **matrices,
+            "network_throughput_mbps": total_delivered / duration_s / 1e6,
+            "network_offered_mbps": total_offered / duration_s / 1e6,
+            "network_delivery_ratio": (
+                total_delivered / total_offered if total_offered > 0.0 else 1.0
+            ),
+            "network_completed_delay_ms": (
+                1000.0 * total_delay_sum / total_completed
+                if total_completed > 0.0 else 0.0
+            ),
+            "network_mean_hol_delay_ms": (
+                1000.0 * float(np.mean(active_hol_delays))
+                if active_hol_delays else 0.0
+            ),
+            "network_max_hol_delay_ms": (
+                1000.0 * max(active_hol_delays) if active_hol_delays else 0.0
+            ),
+            "network_queue_kbits": total_queue_bits / 1000.0,
+            "network_drop_ratio": (
+                total_dropped / total_generated if total_generated > 0.0 else 0.0
+            ),
+            "network_packet_failure_ratio": (
+                total_failed / total_generated if total_generated > 0.0 else 0.0
+            ),
+        }
 
     def _saturation_count(self, loads: np.ndarray | None = None) -> int:
         if loads is None:
@@ -601,6 +923,51 @@ class GlobalPPO3GNBEnv(gym.Env):
             self.global_action_lambda * negative_penalty
             + self.global_action_kappa * smoothness_penalty
         )
+
+    def _bias_smoothness_penalty(
+        self,
+        bias_matrix: np.ndarray,
+        previous_bias_matrix: np.ndarray,
+    ) -> float:
+        return float(
+            self.global_action_kappa
+            * np.sum((np.asarray(bias_matrix) - np.asarray(previous_bias_matrix)) ** 2)
+        )
+
+    def _balanced_slice_neutral_bias_penalty(
+        self,
+        start_loads: np.ndarray,
+        bias_matrix: np.ndarray,
+        eps: float = 0.03,
+    ) -> float:
+        """Penalize non-zero bias for slices whose actual load is already balanced.
+
+        For each slice column s, if every gNB's load is within `eps` of the
+        per-slice balance target, the mean absolute bias for that column is
+        accumulated. The final penalty is the mean over all balanced slices
+        (zero when no slice is balanced).
+        """
+        start_loads = np.asarray(start_loads, dtype=float)
+        bias_matrix = np.asarray(bias_matrix, dtype=float)
+        target = self._balance_target_matrix()
+        penalties = []
+        for s_idx in range(len(self.slice_types)):
+            # Empty slices are operationally irrelevant. Penalizing their
+            # exploratory biases made the reward strongly negative even when
+            # PPO correctly balanced the only active slice.
+            if float(np.sum(self._active_target_load_matrix[:, s_idx])) <= 1e-9:
+                continue
+            slice_error = float(np.max(np.abs(start_loads[:, s_idx] - target[:, s_idx])))
+            if slice_error <= eps:
+                penalties.append(float(np.mean(np.abs(bias_matrix[:, s_idx]))))
+        return float(np.mean(penalties)) if penalties else 0.0
+
+    def _load_balance_cost(self, loads: np.ndarray | None = None) -> float:
+        if loads is None:
+            loads = self._load_matrix()
+        loads = np.asarray(loads, dtype=float)
+        slice_means = np.mean(loads, axis=0, keepdims=True)
+        return float(np.sum((loads - slice_means) ** 2))
 
     def _bad_direction_penalty(
         self,
@@ -627,9 +994,13 @@ class GlobalPPO3GNBEnv(gym.Env):
                     load_penalty += offload_strength * max(float(loads[dst, s_idx] - loads[src, s_idx]), 0.0)
                     unsafe_target_penalty += offload_strength * max(float(sla[dst, s_idx]), 0.0)
 
+        n_directions = max(
+            sum(len(neighbors) for neighbors in self.neighbors.values()),
+            1,
+        )
         return float(
-            self.global_bad_direction_eta * load_penalty
-            + self.global_unsafe_target_rho * unsafe_target_penalty
+            self.global_bad_direction_eta * load_penalty / n_directions
+            + self.global_unsafe_target_rho * unsafe_target_penalty / n_directions
         )
 
     def _action_direction_reward(self, bias_matrix: np.ndarray) -> float:
@@ -689,6 +1060,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
 
     def _sla_matrix(self) -> np.ndarray:
+        severity = self.base_env.get_slice_sla_severity()
+        return np.asarray(
+            [
+                [float(severity.get((gnb_id, slice_type), 0.0)) for slice_type in self.slice_types]
+                for gnb_id in range(self.n_gnbs)
+            ],
+            dtype=float,
+        )
+
+    def _sla_violation_matrix(self) -> np.ndarray:
         flags = self.base_env.get_slice_sla_flags()
         return np.asarray(
             [
@@ -714,8 +1095,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         }
 
     def _kmax_by_slice(self) -> Dict[str, float]:
-        kmax = float(max(self.high_load_ues, 1))
-        return {"eMBB": kmax, "URLLC": kmax, "mMTC": kmax}
+        result = {
+            slice_type: float(max(self.high_load_ues, 1))
+            for slice_type in self.slice_types
+        }
+        for scenario in self.training_scenarios:
+            for group in scenario.groups:
+                slice_type = normalize_slice_type(group.slice_type)
+                if slice_type in result:
+                    result[slice_type] = max(result[slice_type], float(group.count))
+        return result
 
     def _build_info(
         self,
@@ -725,9 +1114,35 @@ class GlobalPPO3GNBEnv(gym.Env):
         start_imbalance: float,
         end_imbalance: float,
     ) -> Dict:
+        qos = self._qos_snapshot()
         return {
             "global_step": int(self._global_step),
             "scenario_name": self._active_scenario,
+            "episode_time_s": float(self._global_step * self.upper_window_seconds),
+            "episode_duration_s": float(self._active_episode_steps * self.upper_window_seconds),
+            "upper_window_seconds": float(self.upper_window_seconds),
+            "local_step_seconds": float(self.local_step_seconds),
+            "radio_tick_seconds": float(self.base_env.step_dt),
+            "radio_ticks_per_local_step": int(self.base_env.radio_substeps),
+            "radio_service_seconds_per_upper_window": float(
+                self.local_steps_per_global
+                * self.base_env.radio_substeps
+                * self.base_env.step_dt
+            ),
+            "clock_synchronized": bool(
+                math.isclose(
+                    self.local_steps_per_global
+                    * self.base_env.radio_substeps
+                    * self.base_env.step_dt,
+                    self.upper_window_seconds,
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                )
+            ),
+            "a3_history_window_s": float(self.base_env.a3_history_window_s),
+            "a3_pingpong_threshold_s": float(
+                self.base_env.a3_pingpong_threshold_s
+            ),
             "reward": float(reward),
             "instant_reward_mean": float(np.mean(instant_rewards)) if instant_rewards else 0.0,
             "load_variance": self._load_variance(),
@@ -737,8 +1152,8 @@ class GlobalPPO3GNBEnv(gym.Env):
             "target_load_error_start": float(start_imbalance),
             "target_load_error_end": float(end_imbalance),
             "overload_ratio": float(np.mean(self._load_matrix() > 0.85)),
-            "sla_count": float(np.sum(self._sla_matrix() > 0.0)),
-            "sla_severity": float(self._sla_severity(self._sla_matrix())),
+            "sla_count": float(np.sum(self._sla_violation_matrix() > 0.0)),
+            "sla_severity": self._network_sla_severity(),
             "sla_deadband": float(self.sla_deadband),
             "saturation_count": int(self._saturation_count(self._load_matrix())),
             "global_network_cost": float(self._global_network_cost()),
@@ -747,11 +1162,17 @@ class GlobalPPO3GNBEnv(gym.Env):
             "bias_matrix": self._last_bias_matrix.copy(),
             "directional_bias_tensor": self._last_directional_bias_tensor.copy(),
             "strong_local_offsets": self._last_strong_offsets.copy(),
+            "directional_offset_tensor": self._last_strong_offsets.copy(),
             "strong_local_offset_debug": dict(self._last_strong_offset_debug),
+            "safe_admission": self.base_env.get_safe_admission_state(),
             "target_load_matrix": self._active_target_load_matrix.copy(),
             "balance_target_matrix": self._balance_target_matrix(),
             "load_matrix": self._load_matrix(),
             "sla_matrix": self._sla_matrix(),
+            "sla_violation_matrix": self._sla_violation_matrix(),
+            "sla_severity_matrix": self._sla_matrix(),
+            "sla_window_metrics": self.base_env.get_slice_sla_metrics(),
+            "qos": qos,
             "ue_count_matrix": np.asarray(
                 [
                     [self.base_env.get_slice_ue_count(i, s) for s in self.slice_types]
@@ -760,6 +1181,125 @@ class GlobalPPO3GNBEnv(gym.Env):
                 dtype=float,
             ),
         }
+
+    def _choose_training_scenario(self) -> UpperTrainingScenario:
+        if self.scenario_selection == "staged":
+            episode = self._episode_index
+            fixed = tuple(s for s in self.training_scenarios if s.tier == "fixed")
+            slow = tuple(s for s in self.training_scenarios if s.tier == "slow")
+            fast = tuple(s for s in self.training_scenarios if s.tier == "fast")
+            if episode < self.fixed_stage_episodes and fixed:
+                pool = fixed
+                index = episode % len(pool)
+            elif episode < self.fixed_stage_episodes + self.slow_stage_episodes:
+                pool = tuple(
+                    scenario
+                    for pair in zip(fixed, slow)
+                    for scenario in pair
+                ) + fixed[len(slow):] + slow[len(fixed):]
+                pool = pool or fixed or slow
+                index = (episode - self.fixed_stage_episodes) % len(pool)
+            else:
+                available_tiers = [
+                    (fixed, 0.4),
+                    (slow, 0.4),
+                    (fast, 0.2),
+                ]
+                available_tiers = [(tier, weight) for tier, weight in available_tiers if tier]
+                if available_tiers:
+                    probabilities = np.asarray(
+                        [weight for _, weight in available_tiers],
+                        dtype=float,
+                    )
+                    probabilities /= probabilities.sum()
+                    tier_index = int(self.rng.choice(len(available_tiers), p=probabilities))
+                    pool = available_tiers[tier_index][0]
+                else:
+                    pool = self.training_scenarios
+                index = int(self.rng.integers(len(pool)))
+        elif self.scenario_selection == "random":
+            pool = self.training_scenarios
+            index = int(self.rng.integers(len(self.training_scenarios)))
+        else:
+            pool = self.training_scenarios
+            index = self._episode_index % len(self.training_scenarios)
+        self._episode_index += 1
+        return pool[index]
+
+    def _initialize_training_scenario(self) -> None:
+        scenario = self._choose_training_scenario()
+        self._active_training_scenario = scenario
+        self._active_scenario = scenario.name
+        self._active_episode_steps = max(
+            1,
+            int(math.ceil(float(scenario.duration_s) / self.upper_window_seconds)),
+        )
+        self._active_target_load_matrix = np.zeros(
+            (self.n_gnbs, len(self.slice_types)),
+            dtype=float,
+        )
+
+        for group_idx, group in enumerate(scenario.groups):
+            slice_type = normalize_slice_type(group.slice_type)
+            s_idx = self.slice_types.index(slice_type)
+            self._active_target_load_matrix[group.source_gnb, s_idx] += float(group.total_load)
+            source = self.base_env._get_gnb_by_id(group.source_gnb)
+            target = (
+                self.base_env._get_gnb_by_id(group.target_gnb)
+                if group.target_gnb is not None
+                else None
+            )
+            for ue_idx in range(group.count):
+                x, y, vx, vy = self._training_group_ue_state(
+                    source, target, group, ue_idx, group_idx
+                )
+                ue_id = self.base_env.add_ue(
+                    x=x,
+                    y=y,
+                    vx=vx,
+                    vy=vy,
+                    slice_type=slice_type,
+                )
+                self._force_attach(ue_id, group.source_gnb)
+
+        for group in scenario.groups:
+            self._set_slice_prb_load(
+                group.source_gnb,
+                normalize_slice_type(group.slice_type),
+                group.total_load,
+            )
+
+        if self.print_scenarios:
+            print(
+                f"[Upper curriculum] scenario={scenario.name} "
+                f"duration={scenario.duration_s:.1f}s windows={self._active_episode_steps}",
+                flush=True,
+            )
+
+    def _training_group_ue_state(self, source, target, group, ue_idx: int, group_idx: int):
+        if source is None:
+            return 0.0, 0.0, 0.0, 0.0
+        if target is None:
+            angle = 2.0 * math.pi * (ue_idx + 1) / max(group.count, 1)
+            radius = 35.0 + 8.0 * group_idx
+            return (
+                float(source.x + radius * math.cos(angle)),
+                float(source.y + radius * math.sin(angle)),
+                0.0,
+                0.0,
+            )
+
+        dx = float(target.x - source.x)
+        dy = float(target.y - source.y)
+        distance = max(math.hypot(dx, dy), 1e-9)
+        ux, uy = dx / distance, dy / distance
+        px, py = -uy, ux
+        lateral = float(group.lateral_offset_m) + (
+            ue_idx - 0.5 * (group.count - 1)
+        ) * 5.0
+        x = float(source.x + group.path_progress * dx + lateral * px)
+        y = float(source.y + group.path_progress * dy + lateral * py)
+        return x, y, float(group.speed_mps * ux), float(group.speed_mps * uy)
 
     def _initialize_load_scenario(self):
         if self.scenario_mode == "random":
@@ -881,7 +1421,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         remainder = target_used % len(ues)
         for idx, ue in enumerate(ues):
             prbs = int(per_ue + (1 if idx < remainder else 0))
+            ue.upper_demand_prbs = prbs
             ue.prbs = prbs
+            ue.useful_prbs = prbs
+            ue.wasted_prbs = 0
             metrics = self.base_env._compute_link_metrics(self.base_env._get_gnb_by_id(gnb_id), ue)
             sinr_db = float(metrics.get("sinr_db", self.base_env.disconnect_sinr_db))
             if hasattr(self.base_env, "_frequency_selective_snr_vector"):
@@ -900,6 +1443,96 @@ class GlobalPPO3GNBEnv(gym.Env):
                 ue,
                 SNAPSHOT_DEMAND_SAFETY * prbs * bits_per_prb / max(float(self.base_env.step_dt), 1e-9),
             )
+
+    def _recalibrate_handover_ues(self) -> None:
+        """Restore persistent UE demand after mobility without exceeding budgets.
+
+        The radio scheduler may temporarily allocate an entire slice budget to
+        one backlogged UE after handover.  Upper-agent load, however, represents
+        offered PRB demand.  Each UE therefore carries ``upper_demand_prbs``
+        across cells.  If aggregate demand exceeds the target slice budget, it
+        is proportionally clipped and integer PRBs are distributed by largest
+        remainder.
+        """
+        grouped_ues = {
+            (gnb_id, slice_type): []
+            for gnb_id in range(self.n_gnbs)
+            for slice_type in self.slice_types
+        }
+        for ue in self.base_env.get_all_ues():
+            if not ue.connected or ue.serving_gnb is None:
+                continue
+            key = (
+                int(ue.serving_gnb),
+                normalize_slice_type(getattr(ue, "slice_type", "eMBB")),
+            )
+            if key in grouped_ues:
+                grouped_ues[key].append(ue)
+
+        changed = False
+        for gnb_id in range(self.n_gnbs):
+            for slice_type in self.slice_types:
+                all_ues = grouped_ues[(gnb_id, slice_type)]
+                if not all_ues:
+                    continue
+                budget = max(int(self.base_env.get_slice_prb_budget(gnb_id, slice_type)), 1)
+                per_ue_cap = (
+                    budget
+                    if self.max_prbs_per_ue is None
+                    else min(int(self.max_prbs_per_ue), budget)
+                )
+                requested = np.asarray(
+                    [
+                        max(
+                            0,
+                            min(
+                                int(
+                                    getattr(
+                                        ue,
+                                        "upper_demand_prbs",
+                                        getattr(ue, "useful_prbs", getattr(ue, "prbs", 0)),
+                                    )
+                                ),
+                                per_ue_cap,
+                            ),
+                        )
+                        for ue in all_ues
+                    ],
+                    dtype=int,
+                )
+                requested_total = int(requested.sum())
+                if requested_total <= budget:
+                    allocated = requested.copy()
+                elif requested_total > 0:
+                    exact = requested.astype(float) * (float(budget) / requested_total)
+                    allocated = np.floor(exact).astype(int)
+                    remaining = int(budget - allocated.sum())
+                    if remaining > 0:
+                        order = np.argsort(-(exact - allocated), kind="stable")
+                        allocated[order[:remaining]] += 1
+                else:
+                    allocated = np.zeros(len(all_ues), dtype=int)
+
+                gnb_obj = self.base_env._get_gnb_by_id(gnb_id)
+                for ue, prbs in zip(all_ues, allocated):
+                    prbs = int(prbs)
+                    ue.prbs = prbs
+                    ue.useful_prbs = prbs
+                    ue.wasted_prbs = 0
+                    if gnb_obj is not None:
+                        metrics = self.base_env._compute_link_metrics(gnb_obj, ue)
+                        sinr_db = float(
+                            metrics.get("sinr_db", getattr(self.base_env, "disconnect_sinr_db", 0.0))
+                        )
+                        bits_per_prb = self._bits_per_prb(sinr_db)
+                        self._set_ue_offered_bit_rate(
+                            ue,
+                            SNAPSHOT_DEMAND_SAFETY * prbs * bits_per_prb
+                            / max(float(self.base_env.step_dt), 1e-9),
+                        )
+                    changed = True
+        if changed:
+            self.base_env._invalidate_metric_caches()
 
     def _bits_per_prb(self, sinr_db: float) -> float:
         if hasattr(self.base_env, "_ensure_mcs_scheduler") and self.base_env._ensure_mcs_scheduler():

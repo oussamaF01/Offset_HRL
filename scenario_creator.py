@@ -358,9 +358,17 @@ def create_multignb_env(
     default_traffic_model: str = "fixed_packet_cbr",
     slice_prb_budgets: Optional[Dict[str, int]] = None,
     max_prbs_per_ue: Optional[int] = 20,
+    a3_history_window_s: float = 20.0,
+    a3_pingpong_threshold_s: float = 5.0,
     a3_handover_cooldown_s: float = 5.0,
     a3_min_residence_s: float = 15.0,
+    a3_pingpong_guard_s: float = 30.0,
     a3_emergency_sinr_db: float = -5.0,
+    max_handovers_per_step: int = 1,
+    max_handovers_per_ue_episode: int = 2,
+    max_handovers_per_episode: int = 20,
+    safe_admission_enabled: bool = False,
+    safe_admission_load_limits: Optional[Dict[str, float]] = None,
 ):
     if MultiGNBWrapper is None:
         raise ImportError(
@@ -419,9 +427,17 @@ def create_multignb_env(
         default_traffic_model=default_traffic_model,
         slice_prb_budgets=slice_prb_budgets,
         max_prbs_per_ue=max_prbs_per_ue,
+        a3_history_window_s=a3_history_window_s,
+        a3_pingpong_threshold_s=a3_pingpong_threshold_s,
         a3_handover_cooldown_s=a3_handover_cooldown_s,
         a3_min_residence_s=a3_min_residence_s,
+        a3_pingpong_guard_s=a3_pingpong_guard_s,
         a3_emergency_sinr_db=a3_emergency_sinr_db,
+        max_handovers_per_step=max_handovers_per_step,
+        max_handovers_per_ue_episode=max_handovers_per_ue_episode,
+        max_handovers_per_episode=max_handovers_per_episode,
+        safe_admission_enabled=safe_admission_enabled,
+        safe_admission_load_limits=safe_admission_load_limits,
     )
 
 

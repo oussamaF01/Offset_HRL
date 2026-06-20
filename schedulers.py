@@ -54,7 +54,13 @@ class ProportionalFair:
             prbs = min(n_prb - r, self.granularity)
 
             # selected user for this resource (remove users without data)
-            index = np.argmax(ue_rate * (ue_queue > 0)/ ue_th)
+            scores = ue_rate * (ue_queue > 0) / ue_th
+            index = int(np.argmax(scores))
+            # Do not burn the rest of the PRB budget after every queue has
+            # drained. Besides avoiding wasted allocations, this removes many
+            # no-op PF iterations in light-load training scenarios.
+            if scores[index] <= 0:
+                break
             
             # assign the resource to this ue
             ue_rbs[index] += prbs
@@ -83,8 +89,20 @@ class ProportionalFair:
 
                 target_rx_prob = 1.0 - float(error_bound)
                 mcs_realized = 0
+                effective_snr_by_modulation = {}
                 for candidate_mcs in range(self.mcs_codeset.n_mcs):
-                    if self.mcs_codeset.response(candidate_mcs, snr_values) < target_rx_prob:
+                    modulation = str(self.mcs_codeset.modulation[candidate_mcs])
+                    effective_snr = effective_snr_by_modulation.get(modulation)
+                    if effective_snr is None:
+                        effective_snr = self.mcs_codeset.effective_snr(
+                            candidate_mcs,
+                            snr_values,
+                        )
+                        effective_snr_by_modulation[modulation] = effective_snr
+                    if (
+                        self.mcs_codeset.estimate_rx_prob(candidate_mcs, effective_snr)
+                        < target_rx_prob
+                    ):
                         break
                     mcs_realized = candidate_mcs
                 bits_per_sym = self.mcs_codeset.nominal_rate(mcs_realized)
@@ -95,7 +113,14 @@ class ProportionalFair:
                 ue.mcs = int(mcs_realized)
                 ue.bits = int(realized_bits)
                 ue.spectral_efficiency = float(self.mcs_codeset.nominal_rate(mcs_realized))
-                ue.p = self.mcs_codeset.response(mcs_realized, snr_values)
+                realized_modulation = str(self.mcs_codeset.modulation[mcs_realized])
+                effective_snr = effective_snr_by_modulation.get(realized_modulation)
+                if effective_snr is None:
+                    effective_snr = self.mcs_codeset.effective_snr(
+                        mcs_realized,
+                        snr_values,
+                    )
+                ue.p = self.mcs_codeset.estimate_rx_prob(mcs_realized, effective_snr)
                 if realized_bits > 0 and realized_rate > 0:
                     ue.useful_prbs = int(min(prbs, np.ceil(realized_bits / float(realized_rate))))
                 else:

@@ -384,6 +384,13 @@ class LocalA3OffsetEnv(gym.Env):
             for gnb in self.base_env.gnbs
             for slice_type in self.slice_types
         }
+        if hasattr(self.base_env, "get_slice_sla_severity"):
+            severity = self.base_env.get_slice_sla_severity()
+            return {
+                key: float(np.clip(severity.get(key, 0.0), 0.0, 1.0))
+                for key in flags
+            }
+
         samples = {key: [] for key in flags}
 
         for ue in self.base_env.get_all_ues():

@@ -306,6 +306,17 @@ class MCSCodeset:
                 return max(mcs-1, 0), self.rate[mcs] * self.order[mcs]
         return mcs, self.rate[mcs] * self.order[mcs]
 
+    def effective_snr(self, mcs, snr):
+        """Return the scalar effective SNR used by the MCS response curve."""
+        snr_values = np.asarray(snr, dtype=float)
+        if snr_values.size > 1:
+            modulation = str(self.modulation[mcs])
+            params = self.MIparameters[modulation]
+            MIvalues = sigmoid(snr_values, *params)
+            averageMI = np.mean(MIvalues)
+            return inv_sigmoid(averageMI, *params)
+        return float(snr_values.reshape(-1)[0])
+
     def response(self, mcs, snr):
         # returns the response of the channel for a given MCS
         # the channel is characterized by the SINR values of each RB
@@ -314,13 +325,7 @@ class MCSCodeset:
         #  - snr: list with the SINRs of each RB
         # outputs:
         #  - error probabilty
-        if len(snr) > 1: # the UE measures one sinr per RB
-            # compute the average mutual information of each RB
-            modulation = str(self.modulation[mcs])
-            params = self.MIparameters[modulation]
-            MIvalues = sigmoid(snr, *params)
-            averageMI = np.mean(MIvalues)
-            snr = inv_sigmoid(averageMI, *params)
+        snr = self.effective_snr(mcs, snr)
         rx_prob = self.estimate_rx_prob(mcs, snr)
         return rx_prob
 

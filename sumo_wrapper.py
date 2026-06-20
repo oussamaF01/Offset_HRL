@@ -17,12 +17,14 @@ class SumoMobilityWrapper:
         port=8813,
         label=None,
         begin_time=0,
+        step_length=1.0,
     ):
         self.config_path = config_path
         self.sumo_binary = sumo_binary
         self.port = port
         self.label = label or f"sumo_{next(_SUMO_CONNECTION_COUNTER)}"
         self.begin_time = begin_time
+        self.step_length = max(float(step_length), 1e-6)
         self.started = False
         self.sumo_process = None
         self.traci = None
@@ -84,6 +86,8 @@ class SumoMobilityWrapper:
                     self.config_path,
                     "--begin",
                     str(self.begin_time),
+                    "--step-length",
+                    str(self.step_length),
                     "--remote-port",
                     str(self.port),
                     "--ignore-route-errors",

@@ -96,9 +96,20 @@ class UE:
         self.dropped_bits_step = 0
         self.total_bits_arrived = 0
         self.total_bits_dropped = 0
+        self.total_bits_served = 0
+        self.total_packets_generated = 0
+        self.total_packets_completed = 0
+        self.total_completed_packet_delay_s = 0.0
+        self.total_packets_dropped = 0
+        self.total_packets_deadline_missed = 0
+        self.total_packets_expired = 0
+        self._expired_packet_ids = set()
+        self.total_packets_failed_sla = 0
+        self._failed_sla_packet_ids = set()
 
         self._next_packet_id = 0
         self._step_counter = 0
+        self._time_s = 0.0
         self._last_packet_arrival_step = 0
 
         # Delay. wait_time is kept as a legacy slot-count view.
@@ -128,7 +139,7 @@ class UE:
         self._step_counter = max(int(step), int(self._step_counter))
 
     def get_current_time_s(self) -> float:
-        return float(self._step_counter) * float(self.slot_length)
+        return float(self._time_s)
 
     def _update_hol_delay(self) -> float:
         if not self.packet_queue:
@@ -160,6 +171,7 @@ class UE:
 
     def traffic_step(self):
         """Generate new traffic as timestamped packets."""
+        self._time_s += float(self.slot_length)
         self.new_bits = self.traffic_source.step()
         self.dropped_bits_step = 0
         self.total_bits_arrived += self.new_bits
@@ -172,6 +184,7 @@ class UE:
                 packet_id=int(self._next_packet_id),
             )
             self._next_packet_id += 1
+            self.total_packets_generated += 1
             self._last_packet_arrival_step = int(self._step_counter)
             self.packet_queue.append(packet)
             self.queue += self.new_bits
@@ -186,6 +199,8 @@ class UE:
                 self.dropped_bits_step += dropped.bits
                 self.dropped_bits += dropped.bits
                 self.total_bits_dropped += dropped.bits
+                self.total_packets_dropped += 1
+                self._mark_packet_sla_failed(dropped.packet_id)
                 self.queue -= dropped.bits
                 self._delay_samples.append(
                     self.get_current_time_s() - dropped.arrival_time_s
@@ -201,6 +216,7 @@ class UE:
         if received:
             served_bits = min(float(self.queue), self.scheduled_bits)
             self.bits = served_bits
+            self.total_bits_served += served_bits
 
             remaining = int(served_bits)
             while remaining > 0 and self.packet_queue:
@@ -210,6 +226,12 @@ class UE:
                     remaining -= served_packet.bits
                     packet_delay = self.get_current_time_s() - served_packet.arrival_time_s
                     self._delay_samples.append(packet_delay)
+                    self.total_packets_completed += 1
+                    self.total_completed_packet_delay_s += packet_delay
+                    deadline_s = self._sla_deadline_s()
+                    if deadline_s is not None and packet_delay > deadline_s:
+                        self.total_packets_deadline_missed += 1
+                        self._mark_packet_sla_failed(served_packet.packet_id)
                 else:
                     packet.bits -= remaining
                     remaining = 0
@@ -221,6 +243,36 @@ class UE:
         self.hol_delay_s = self._update_hol_delay()
         self._update_mean_delay()
         self.wait_time = min(self.hol_delay_s / max(float(self.slot_length), 1e-12), 1000.0)
+
+    def _sla_deadline_s(self):
+        slice_name = str(self.slice_type or "").replace("_", "").replace("-", "").upper()
+        if slice_name == "URLLC":
+            return 0.010
+        if slice_name == "MMTC":
+            return 1.0
+        return None
+
+    def update_sla_expirations(self):
+        """Count each queued packet once when it first exceeds its slice deadline."""
+        deadline_s = self._sla_deadline_s()
+        if deadline_s is None:
+            return
+        now_s = self.get_current_time_s()
+        for packet in self.packet_queue:
+            packet_id = int(packet.packet_id)
+            if packet_id in self._expired_packet_ids:
+                continue
+            if now_s - float(packet.arrival_time_s) > deadline_s:
+                self._expired_packet_ids.add(packet_id)
+                self.total_packets_expired += 1
+                self._mark_packet_sla_failed(packet_id)
+
+    def _mark_packet_sla_failed(self, packet_id):
+        packet_id = int(packet_id)
+        if packet_id in self._failed_sla_packet_ids:
+            return
+        self._failed_sla_packet_ids.add(packet_id)
+        self.total_packets_failed_sla += 1
 
     def update_position(self, dt):
         self.x += self.vx * dt
