@@ -140,7 +140,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         global_reward_zeta: float = 1.0,
         global_reward_beta: float = 1.0,
         global_action_lambda: float = 0.01,
-        global_action_kappa: float = 0.005,
+        global_action_kappa: float = 0.01,
         global_bad_direction_eta: float = 0.025,
         global_unsafe_target_rho: float = 0.05,
         sla_deadband: float = 0.05,
@@ -445,9 +445,13 @@ class GlobalPPO3GNBEnv(gym.Env):
         bad_direction_penalty = self._bad_direction_penalty(
             directional_bias, loads=start_loads, sla=self._sla_matrix()
         )
-        # Balance is the upper agent's principal objective.  Normalize progress
-        # by the imbalance available at the start of the window so the same
-        # fractional improvement has comparable value across scenarios.
+        # PDF v15, Section 6, plus a neutral-bias penalty for slices that are
+        # already balanced:
+        #   r_H(t) = J_H(t) - J_H(t + T_H)
+        #            - lambda_delta * ||B(t) - B(t - T_H)||^2
+        #            - lambda_neutral * P_neutral(t)
+        # where J_H is the sum of per-slice squared load deviations across
+        # gNBs. Keep the richer terms below as diagnostics only.
         normalized_balance_progress = float(
             np.clip(
                 (start_variance - end_variance) / max(start_variance, 0.05),
@@ -455,16 +459,15 @@ class GlobalPPO3GNBEnv(gym.Env):
                 1.0,
             )
         )
-        load_reward = self.global_reward_mu * normalized_balance_progress
+        load_reward = float(start_imbalance - end_imbalance)
         saturation_reward = self.global_reward_zeta * (
             start_saturation - end_saturation
         )
         sla_reward = self.global_reward_beta * (
             start_sla_severity - end_sla_severity
         )
-        # Penalise absolute SLA severity each step so the agent is punished
-        # for every window it stays in a violated state, not only at the
-        # transition where the delta fires.
+        # Retained as a diagnostic for comparing with older composite-reward
+        # runs; it is not included in the PDF v15 PPO reward.
         sla_severity_level_penalty = self.sla_severity_level_weight * end_sla_severity
         normalized_load_level = float(
             np.clip(
@@ -478,18 +481,14 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
         window_reward = float(
             load_reward
-            + load_balance_level_bonus
-            + saturation_reward
-            + sla_reward
             - action_penalty
             - self.global_neutral_bias_weight * neutral_bias_penalty
-            - bad_direction_penalty
-            - sla_severity_level_penalty
         )
         self._previous_window_sla_severity = float(end_sla_severity)
         instant_rewards = [window_reward]
-        progress_reward = 2.0 * (start_imbalance - end_imbalance) if self.use_progress_reward else 0.0
-        dense_reward = window_reward + progress_reward
+        # Legacy target-error shaping is intentionally excluded from the v15
+        # PDF objective, even if an older launcher passes use_progress_reward.
+        dense_reward = window_reward
         self._episode_instant_rewards.extend(float(value) for value in instant_rewards)
         self._episode_window_rewards.append(float(dense_reward))
 
@@ -949,15 +948,15 @@ class GlobalPPO3GNBEnv(gym.Env):
         """
         start_loads = np.asarray(start_loads, dtype=float)
         bias_matrix = np.asarray(bias_matrix, dtype=float)
-        target = self._balance_target_matrix()
         penalties = []
         for s_idx in range(len(self.slice_types)):
             # Empty slices are operationally irrelevant. Penalizing their
             # exploratory biases made the reward strongly negative even when
             # PPO correctly balanced the only active slice.
-            if float(np.sum(self._active_target_load_matrix[:, s_idx])) <= 1e-9:
+            if float(np.sum(slice_loads := start_loads[:, s_idx])) <= 1e-9:
                 continue
-            slice_error = float(np.max(np.abs(start_loads[:, s_idx] - target[:, s_idx])))
+            slice_mean = float(np.mean(slice_loads))
+            slice_error = float(np.max(np.abs(slice_loads - slice_mean)))
             if slice_error <= eps:
                 penalties.append(float(np.mean(np.abs(bias_matrix[:, s_idx]))))
         return float(np.mean(penalties)) if penalties else 0.0

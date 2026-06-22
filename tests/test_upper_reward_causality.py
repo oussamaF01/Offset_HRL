@@ -48,7 +48,7 @@ def test_useful_release_beats_neutral_over_full_episode():
     assert release_return > neutral_return
 
 
-def test_persistent_load_bonus_remains_after_progress_window():
+def test_reward_matches_pdf_terms_plus_balanced_nonzero_bias_penalty():
     release = np.zeros(9, dtype=np.float32)
     release[0] = -0.4
     release[3] = 0.4
@@ -66,12 +66,15 @@ def test_persistent_load_bonus_remains_after_progress_window():
     )
     try:
         env.reset(seed=123)
-        _obs, _reward, _terminated, _truncated, first = env.step(release)
-        _obs, _reward, _terminated, _truncated, info = env.step(release)
+        _obs, reward, _terminated, _truncated, info = env.step(release)
 
-        assert info["reward_load_balance_level_bonus"] > 0.0
-        assert first["reward_load_balance_level_bonus"] > 0.0
-        assert info["reward_load_balance_level_bonus"] <= 1.0
+        expected = (
+            info["load_imbalance_start"]
+            - info["load_imbalance_end"]
+            - info["global_action_penalty"]
+            - env.global_neutral_bias_weight * info["reward_neutral_bias_penalty"]
+        )
+        assert np.isclose(reward, expected)
     finally:
         env.close()
 
@@ -101,14 +104,39 @@ def test_inactive_slice_biases_do_not_trigger_neutral_penalty():
         env.close()
 
 
-def test_load_terms_dominate_default_reward_weights():
+def test_balanced_active_slice_prefers_near_zero_bias():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
         training_scenarios="fixed_embb_g0_overlap",
     )
     try:
-        assert env.global_reward_mu > env.global_reward_beta
-        assert env.load_balance_level_weight > env.sla_severity_level_weight
-        assert env.global_neutral_bias_weight <= 0.1
+        balanced_loads = np.zeros((3, 3), dtype=np.float32)
+        balanced_loads[:, 0] = [0.60, 0.62, 0.58]
+
+        near_zero = np.zeros((3, 3), dtype=np.float32)
+        near_zero[:, 0] = [0.01, -0.02, 0.01]
+        strong_bias = np.zeros((3, 3), dtype=np.float32)
+        strong_bias[:, 0] = [-0.8, 0.7, 0.6]
+
+        near_zero_penalty = env._balanced_slice_neutral_bias_penalty(
+            balanced_loads, near_zero, eps=0.05
+        )
+        strong_bias_penalty = env._balanced_slice_neutral_bias_penalty(
+            balanced_loads, strong_bias, eps=0.05
+        )
+
+        assert near_zero_penalty < strong_bias_penalty
+        assert np.isclose(strong_bias_penalty, 0.7)
+    finally:
+        env.close()
+
+
+def test_pdf_bias_smoothing_default_is_in_recommended_range():
+    env = GlobalPPO3GNBEnv(
+        scenario_mode="curriculum",
+        training_scenarios="fixed_embb_g0_overlap",
+    )
+    try:
+        assert 0.01 <= env.global_action_kappa <= 0.05
     finally:
         env.close()

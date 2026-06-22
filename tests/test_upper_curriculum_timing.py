@@ -82,17 +82,16 @@ def test_first_populated_sla_window_does_not_create_bootstrap_penalty():
 
         assert info["reward_sla_improvement"] == 0.0
         expected = (
-            info["reward_load_improvement"]
-            + info["reward_load_balance_level_bonus"]
-            + info["reward_saturation_improvement"]
-            + info["reward_sla_improvement"]
+            info["load_imbalance_start"]
+            - info["load_imbalance_end"]
             - info["global_action_penalty"]
-            - 0.5 * info["reward_neutral_bias_penalty"]
-            - info["global_bad_direction_penalty"]
-            - info["reward_sla_severity_level_penalty"]
+            - env.global_neutral_bias_weight * info["reward_neutral_bias_penalty"]
         )
         assert np.isclose(reward, expected)
-        assert info["reward_load_improvement"] > 0.0
+        assert np.isclose(
+            info["reward_load_improvement"],
+            info["load_imbalance_start"] - info["load_imbalance_end"],
+        )
         assert np.isfinite(reward)
     finally:
         env.close()

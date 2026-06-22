@@ -453,6 +453,7 @@ def make_env(args) -> Monitor:
         global_reward_mu=getattr(args, "load_balance_reward_weight", 2.0),
         global_reward_zeta=getattr(args, "saturation_reward_weight", 1.0),
         global_reward_beta=getattr(args, "sla_reward_weight", 1.0),
+        global_action_kappa=getattr(args, "bias_smoothing_weight", 0.01),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
         training_scenarios=args.training_scenarios,
@@ -762,7 +763,7 @@ def main():
         "--global-neutral-bias-weight",
         type=float,
         default=0.1,
-        help="Small penalty on non-zero bias when an active slice is already balanced.",
+        help="Penalty weight for non-zero bias when an active slice is already balanced.",
     )
     parser.add_argument(
         "--neutral-bias-eps",
@@ -774,27 +775,27 @@ def main():
         "--global-bad-direction-eta",
         type=float,
         default=0.025,
-        help="Weight for offloading toward a heavier-loaded neighbor penalty.",
+        help="Legacy bad-direction diagnostic weight; excluded from the PDF v15 PPO reward.",
     )
     parser.add_argument(
         "--global-unsafe-target-rho",
         type=float,
         default=0.05,
-        help="Weight for offloading toward a neighbor with active SLA violations.",
+        help="Legacy unsafe-target diagnostic weight; excluded from the PDF v15 PPO reward.",
     )
     parser.add_argument(
         "--sla-severity-level-weight",
         type=float,
         default=0.1,
-        help="Per-step penalty weight on absolute SLA severity so bad states hurt every step, not only at transitions.",
+        help="Legacy SLA-level diagnostic weight; excluded from the PDF v15 PPO reward.",
     )
     parser.add_argument(
         "--load-balance-level-weight",
         type=float,
         default=1.0,
         help=(
-            "Persistent penalty on remaining normalized load variance. This "
-            "keeps balanced states preferable after the one-step progress reward."
+            "Legacy persistent-balance diagnostic weight; excluded from the "
+            "PDF v15 PPO reward."
         ),
     )
     parser.add_argument(
@@ -825,19 +826,25 @@ def main():
         "--load-balance-reward-weight",
         type=float,
         default=2.0,
-        help="Weight of normalized load-variance improvement.",
+        help="Legacy diagnostic weight; the PDF v15 PPO reward uses raw load-dispersion improvement.",
     )
     parser.add_argument(
         "--saturation-reward-weight",
         type=float,
         default=1.0,
-        help="Weight of the reduction in critically loaded gNB/slice pairs.",
+        help="Diagnostic saturation-improvement weight; it is not part of the PDF v15 PPO reward.",
     )
     parser.add_argument(
         "--sla-reward-weight",
         type=float,
         default=1.0,
-        help="Weight of normalized SLA-severity improvement.",
+        help="Diagnostic SLA-improvement weight; it is not part of the PDF v15 PPO reward.",
+    )
+    parser.add_argument(
+        "--bias-smoothing-weight",
+        type=float,
+        default=0.01,
+        help="PDF v15 lambda_delta for squared upper-bias changes.",
     )
     parser.add_argument(
         "--scenario-mode",
@@ -882,13 +889,14 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument(
         "--dense-window-reward",
-        action="store_true",
-        help="Return a reward after every upper window instead of only at episode end.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Return the PDF reward after every upper window (default: enabled).",
     )
     parser.add_argument(
         "--use-progress-reward",
         action="store_true",
-        help="Add target-load-error progress shaping. Disabled by default for snapshot training.",
+        help="Deprecated compatibility flag; target-error shaping is excluded from the PDF v15 reward.",
     )
     parser.add_argument(
         "--log-every",
