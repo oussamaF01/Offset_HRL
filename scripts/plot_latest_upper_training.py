@@ -43,11 +43,13 @@ CORE_COLUMNS = [
     "global_network_cost",
     "global_cost_improvement",
     "global_action_penalty",
+    "global_negative_bias_penalty",
     "global_bad_direction_penalty",
     "reward_load_improvement",
     "reward_saturation_improvement",
     "reward_sla_improvement",
     "reward_neutral_bias_penalty",
+    "reward_wrong_bias_penalty",
     "reward_sla_severity_level_penalty",
     "reward_load_balance_level_bonus",
     "saturation_count",
@@ -381,6 +383,8 @@ def plot_reward_components(
         ("global_action_penalty", "Action smoothness"),
         ("global_bad_direction_penalty", "Bad direction"),
         ("reward_neutral_bias_penalty", "Neutral-bias raw penalty"),
+        ("reward_wrong_bias_penalty", "Wrong-bias raw penalty"),
+        ("global_negative_bias_penalty", "Negative-bias magnitude penalty"),
         ("reward_sla_severity_level_penalty", "Persistent SLA"),
     )
     for column, label in positive:

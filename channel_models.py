@@ -303,8 +303,10 @@ class MCSCodeset:
         rx_prob = 1.0 - error_upper_bound
         for mcs in range(self.n_mcs):
             if self.estimate_rx_prob(mcs, snr) < rx_prob:
-                return max(mcs-1, 0), self.rate[mcs] * self.order[mcs]
-        return mcs, self.rate[mcs] * self.order[mcs]
+                selected_mcs = max(mcs - 1, 0)
+                return selected_mcs, self.nominal_rate(selected_mcs)
+        selected_mcs = self.n_mcs - 1
+        return selected_mcs, self.nominal_rate(selected_mcs)
 
     def effective_snr(self, mcs, snr):
         """Return the scalar effective SNR used by the MCS response curve."""

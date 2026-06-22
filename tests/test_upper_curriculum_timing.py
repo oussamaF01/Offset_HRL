@@ -85,7 +85,9 @@ def test_first_populated_sla_window_does_not_create_bootstrap_penalty():
             info["load_imbalance_start"]
             - info["load_imbalance_end"]
             - info["global_action_penalty"]
+            - info["global_negative_bias_penalty"]
             - env.global_neutral_bias_weight * info["reward_neutral_bias_penalty"]
+            - env.wrong_bias_penalty_weight * info["reward_wrong_bias_penalty"]
         )
         assert np.isclose(reward, expected)
         assert np.isclose(

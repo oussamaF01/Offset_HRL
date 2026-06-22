@@ -37,9 +37,7 @@ def _episode_return(action):
 def test_useful_release_beats_neutral_over_full_episode():
     neutral = np.zeros(9, dtype=np.float32)
     release = neutral.copy()
-    release[0] = -0.4
-    release[3] = 0.4
-    release[6] = 0.4
+    release[0] = -0.2
 
     release_return, release_info = _episode_return(release)
     neutral_return, neutral_info = _episode_return(neutral)
@@ -72,7 +70,9 @@ def test_reward_matches_pdf_terms_plus_balanced_nonzero_bias_penalty():
             info["load_imbalance_start"]
             - info["load_imbalance_end"]
             - info["global_action_penalty"]
+            - info["global_negative_bias_penalty"]
             - env.global_neutral_bias_weight * info["reward_neutral_bias_penalty"]
+            - env.wrong_bias_penalty_weight * info["reward_wrong_bias_penalty"]
         )
         assert np.isclose(reward, expected)
     finally:
@@ -127,6 +127,53 @@ def test_balanced_active_slice_prefers_near_zero_bias():
 
         assert near_zero_penalty < strong_bias_penalty
         assert np.isclose(strong_bias_penalty, 0.7)
+    finally:
+        env.close()
+
+
+def test_wrong_bias_direction_penalizes_release_from_light_cells():
+    env = GlobalPPO3GNBEnv(
+        scenario_mode="curriculum",
+        training_scenarios="fixed_embb_g0_overlap",
+    )
+    try:
+        loads = np.zeros((3, 3), dtype=np.float32)
+        loads[:, 0] = [0.90, 0.20, 0.10]
+        selective = np.zeros((3, 3), dtype=np.float32)
+        selective[0, 0] = -0.5
+        release_everywhere = np.zeros((3, 3), dtype=np.float32)
+        release_everywhere[:, 0] = -0.5
+        retain_overloaded = np.zeros((3, 3), dtype=np.float32)
+        retain_overloaded[0, 0] = 0.5
+
+        assert env._wrong_bias_direction_penalty(loads, selective) == 0.0
+        assert env._wrong_bias_direction_penalty(loads, release_everywhere) > 0.0
+        assert env._wrong_bias_direction_penalty(loads, retain_overloaded) > 0.0
+    finally:
+        env.close()
+
+
+def test_negative_bias_magnitude_penalty_is_persistent_and_monotonic():
+    env = GlobalPPO3GNBEnv(
+        scenario_mode="curriculum",
+        training_scenarios="fixed_embb_g0_overlap",
+        global_action_lambda=0.01,
+    )
+    try:
+        weak = np.zeros((3, 3), dtype=np.float32)
+        weak[0, 0] = -0.2
+        strong = np.zeros((3, 3), dtype=np.float32)
+        strong[0, 0] = -0.8
+        release_everywhere = np.full((3, 3), -0.8, dtype=np.float32)
+
+        weak_penalty = env._negative_bias_magnitude_penalty(weak)
+        strong_penalty = env._negative_bias_magnitude_penalty(strong)
+        everywhere_penalty = env._negative_bias_magnitude_penalty(release_everywhere)
+
+        assert weak_penalty > 0.0
+        assert weak_penalty < strong_penalty < everywhere_penalty
+        assert np.isclose(weak_penalty, 0.01 * 0.2**2)
+        assert np.isclose(everywhere_penalty, 0.01 * 9 * 0.8**2)
     finally:
         env.close()
 

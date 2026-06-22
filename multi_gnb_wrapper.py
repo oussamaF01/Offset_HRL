@@ -153,6 +153,7 @@ class MultiGNBWrapper(gym.Env):
         self.use_mcs_scheduler = True
         self._pf_scheduler = None
         self._mcs_codeset = None
+        self._mcs_codeset_urllc = None
         self._fading_samples = None
         self._fading_users: Dict[int, Dict[str, int]] = {}
         self._last_scheduler_mode = "mcs_pf_csv_fading"
@@ -374,9 +375,10 @@ class MultiGNBWrapper(gym.Env):
         return self._clip01(used_prbs / float(total_prbs))
 
     def _estimate_bits_per_prb_for_ue(self, ue: UE) -> float:
-        if self._mcs_codeset is not None:
+        codeset = self._mcs_codeset_for_slice(getattr(ue, "slice_type", "eMBB"))
+        if codeset is not None:
             try:
-                _mcs, bits_per_sym = self._mcs_codeset.mcs_rate_vs_error(
+                _mcs, bits_per_sym = codeset.mcs_rate_vs_error(
                     float(getattr(ue, "e_snr", self.disconnect_sinr_db)),
                     0.1,
                 )
@@ -390,6 +392,12 @@ class MultiGNBWrapper(gym.Env):
         sinr_linear = max(10.0 ** (sinr_db / 10.0), 1e-6)
         spectral_eff = min(max(math.log2(1.0 + sinr_linear), 0.0), 8.0)
         return max(180e3 * max(float(self.step_dt), 1e-9) * spectral_eff, 1.0)
+
+    def _mcs_codeset_for_slice(self, slice_type: str):
+        normalized = self.normalize_slice_type(slice_type)
+        if normalized == "URLLC" and self._mcs_codeset_urllc is not None:
+            return self._mcs_codeset_urllc
+        return self._mcs_codeset
 
     def _estimate_queue_demand_prbs(self, ue: UE) -> int:
         queue_bits = max(float(getattr(ue, "queue", 0.0)), 0.0)
@@ -704,6 +712,8 @@ class MultiGNBWrapper(gym.Env):
             ue.useful_prbs = 0
             ue.wasted_prbs = 0
             ue.p = 0
+            ue.effective_sinr_db = float("nan")
+            ue.mcs_codeset_name = "default"
             ue.connected = True
             ue.target_gnb = None
             ue.ho_pending = False
@@ -824,9 +834,10 @@ class MultiGNBWrapper(gym.Env):
                     # release/retain and its magnitude directly controls the
                     # fraction of source UEs that may be admitted:
                     #   -1.0 -> up to 100%, -0.5 -> up to 50%.
-                    # Radio feasibility and target choice remain lower-layer
-                    # responsibilities; target load safety is checked again
-                    # for every candidate below.
+                    # The safe layer does not reinterpret whether the source
+                    # "should" release based on average load. Radio feasibility
+                    # and target choice remain lower-layer responsibilities;
+                    # target load safety is checked again for every candidate.
                     key = (source_id, target_id, slice_type.upper())
                     self._safe_admission_target_headroom[key] = target_headroom
                     self._safe_admission_capacities[key] = source_capacity
@@ -862,13 +873,7 @@ class MultiGNBWrapper(gym.Env):
             self._safe_admission_stats["rejected_no_pressure"] += 1
             return False
 
-        source_excess = float(
-            self._safe_admission_source_excess.get((int(source_id), normalized_slice), 0.0)
-        )
         target_headroom = float(self._safe_admission_target_headroom.get(key, 0.0))
-        if source_excess <= 0.0:
-            self._safe_admission_stats["rejected_no_source_excess"] += 1
-            return False
         if target_headroom <= 0.0:
             self._safe_admission_stats["rejected_no_target_headroom"] += 1
             return False
@@ -894,12 +899,28 @@ class MultiGNBWrapper(gym.Env):
             self._safe_admission_stats["rejected_target_safety"] += 1
             return False
 
+        # This method is intentionally a read-only eligibility check. Quota is
+        # consumed only after _perform_handover() confirms success.
+        return True
+
+    def _commit_safe_admission(
+        self,
+        source_id: int,
+        target_id: int,
+        slice_type: str,
+    ) -> None:
+        """Consume one admission slot after a successful handover."""
+        if not self.safe_admission_enabled:
+            return
+
+        normalized_slice = self.normalize_slice_type(slice_type)
+        key = (int(source_id), int(target_id), normalized_slice.upper())
+        source_key = (int(source_id), normalized_slice)
         self._safe_admission_accepted[key] = self._safe_admission_accepted.get(key, 0) + 1
         self._safe_admission_source_accepted[source_key] = (
             self._safe_admission_source_accepted.get(source_key, 0) + 1
         )
         self._safe_admission_stats["accepted"] += 1
-        return True
 
     def _handover_stability_allows(
         self,
@@ -1283,6 +1304,11 @@ class MultiGNBWrapper(gym.Env):
                     serving_gnb.reset_a3_counter(ue_id, int(best_neighbor_id))
                 continue
 
+            self._commit_safe_admission(
+                serving_id,
+                best_neighbor_id,
+                slice_type,
+            )
             self._ho_successes.setdefault(key, []).append(t)
             last = self._last_ho.get(ue_id)
             previous_source = self._last_ho_source.get(ue_id)
@@ -1642,6 +1668,7 @@ class MultiGNBWrapper(gym.Env):
             "environment_loss_db": float(self._environment_loss_db(ue)),
         }
 
+        transmission_attempted = bool(int(getattr(ue, "prbs", 0)) > 0)
         return {
             "ue_id": ue.id,
             "serving_gnb": ue.serving_gnb,
@@ -1665,10 +1692,21 @@ class MultiGNBWrapper(gym.Env):
             "used_prbs": int(getattr(ue, "useful_prbs", ue.prbs)),
             "useful_prbs": int(getattr(ue, "useful_prbs", ue.prbs)),
             "wasted_prbs": int(getattr(ue, "wasted_prbs", 0)),
-            "rx_probability": self._scalar_rx_probability(getattr(ue, "p", 0.0)),
+            # No PRBs means no decoding attempt. Report NaN rather than
+            # conflating "not scheduled" with a radio failure probability of 0.
+            "rx_probability": (
+                self._scalar_rx_probability(getattr(ue, "p", 0.0))
+                if transmission_attempted
+                else float("nan")
+            ),
+            "transmission_attempted": transmission_attempted,
             "mcs": -1 if (not ue.connected or getattr(ue, "mcs", None) is None) else int(ue.mcs),
+            "mcs_codeset": str(getattr(ue, "mcs_codeset_name", "default")),
             "spectral_efficiency": float(getattr(ue, "spectral_efficiency", 0.0)),
             "scheduled_sinr_db": float(getattr(ue, "e_sinr", metrics["sinr_db"])),
+            "effective_sinr_db": float(
+                getattr(ue, "effective_sinr_db", float("nan"))
+            ),
             "scheduler_mode": self._last_scheduler_mode,
             "snr_db": float(metrics["snr_db"]),
             "sinr_db": float(metrics["sinr_db"]),
@@ -1751,7 +1789,11 @@ class MultiGNBWrapper(gym.Env):
         return rewards
 
     def _ensure_mcs_scheduler(self):
-        if self._pf_scheduler is not None and self._mcs_codeset is not None:
+        if (
+            self._pf_scheduler is not None
+            and self._mcs_codeset is not None
+            and self._mcs_codeset_urllc is not None
+        ):
             return True
 
         try:
@@ -1763,12 +1805,16 @@ class MultiGNBWrapper(gym.Env):
             return False
 
         self._mcs_codeset = MCSCodeset()
+        self._mcs_codeset_urllc = MCSCodeset(
+            Path(__file__).resolve().parent / "datasets" / "mcs_codeset_urllc.csv"
+        )
         self._pf_scheduler = ProportionalFair(
             self._mcs_codeset,
             granularity=2,
             slot_length=self.step_dt,
+            mcs_codesets_by_slice={"URLLC": self._mcs_codeset_urllc},
         )
-        self._last_scheduler_mode = "mcs_pf_csv_fading"
+        self._last_scheduler_mode = "slice_aware_mcs_pf_csv_fading"
         return True
 
     def _ensure_fading_samples(self, n_prbs: int):
@@ -1851,6 +1897,8 @@ class MultiGNBWrapper(gym.Env):
         ue.p = 0
         ue.mcs = None
         ue.spectral_efficiency = 0.0
+        ue.effective_sinr_db = float("nan")
+        ue.mcs_codeset_name = "default"
         ue.serving_power_dbm = -100.0
         ue.interference_dbm = -100.0
         ue.noise_dbm = -100.0
@@ -1895,6 +1943,8 @@ class MultiGNBWrapper(gym.Env):
                 ue.p = 0
                 ue.mcs = None
                 ue.spectral_efficiency = 0.0
+                ue.effective_sinr_db = float("nan")
+                ue.mcs_codeset_name = "default"
                 metrics_map[ue.id] = self._compute_link_metrics(gnb, ue)
 
             if self.use_mcs_scheduler and self._ensure_mcs_scheduler():
@@ -1930,8 +1980,20 @@ class MultiGNBWrapper(gym.Env):
                 for ue in schedulable_ues:
                     if getattr(ue, "mcs", None) is None and self._mcs_codeset is not None:
                         try:
-                            ue.mcs, bits_per_sym = self._mcs_codeset.mcs_rate_vs_error(float(ue.e_snr), 0.1)
+                            codeset = self._mcs_codeset_for_slice(
+                                getattr(ue, "slice_type", "eMBB")
+                            )
+                            ue.mcs, bits_per_sym = codeset.mcs_rate_vs_error(
+                                float(ue.e_snr), 0.1
+                            )
                             ue.spectral_efficiency = float(bits_per_sym)
+                            ue.mcs_codeset_name = (
+                                "URLLC"
+                                if self.normalize_slice_type(
+                                    getattr(ue, "slice_type", "eMBB")
+                                ) == "URLLC"
+                                else "default"
+                            )
                         except Exception:
                             pass
                     rx_probability = self._scalar_rx_probability(getattr(ue, "p", 0.0))

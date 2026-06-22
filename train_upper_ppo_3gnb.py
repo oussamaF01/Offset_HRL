@@ -94,11 +94,13 @@ TRAINING_FIELDS = [
     "global_cost_end",
     "global_cost_improvement",
     "global_action_penalty",
+    "global_negative_bias_penalty",
     "global_bad_direction_penalty",
     "reward_load_improvement",
     "reward_saturation_improvement",
     "reward_sla_improvement",
     "reward_neutral_bias_penalty",
+    "reward_wrong_bias_penalty",
     "reward_sla_severity_level_penalty",
     "reward_load_balance_level_bonus",
     "saturation_count",
@@ -153,11 +155,13 @@ VALIDATION_FIELDS = [
     "global_cost_end",
     "global_cost_improvement",
     "global_action_penalty",
+    "global_negative_bias_penalty",
     "global_bad_direction_penalty",
     "reward_load_improvement",
     "reward_saturation_improvement",
     "reward_sla_improvement",
     "reward_neutral_bias_penalty",
+    "reward_wrong_bias_penalty",
     "reward_sla_severity_level_penalty",
     "reward_load_balance_level_bonus",
     "saturation_count",
@@ -318,6 +322,9 @@ class UpperTrainingCsvCallback(BaseCallback):
             "global_cost_end": float(info.get("global_cost_end", 0.0)),
             "global_cost_improvement": float(info.get("global_cost_improvement", 0.0)),
             "global_action_penalty": float(info.get("global_action_penalty", 0.0)),
+            "global_negative_bias_penalty": float(
+                info.get("global_negative_bias_penalty", 0.0)
+            ),
             "global_bad_direction_penalty": float(info.get("global_bad_direction_penalty", 0.0)),
             "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
             "reward_saturation_improvement": float(
@@ -325,6 +332,7 @@ class UpperTrainingCsvCallback(BaseCallback):
             ),
             "reward_sla_improvement": float(info.get("reward_sla_improvement", 0.0)),
             "reward_neutral_bias_penalty": float(info.get("reward_neutral_bias_penalty", 0.0)),
+            "reward_wrong_bias_penalty": float(info.get("reward_wrong_bias_penalty", 0.0)),
             "reward_sla_severity_level_penalty": float(
                 info.get("reward_sla_severity_level_penalty", 0.0)
             ),
@@ -454,6 +462,7 @@ def make_env(args) -> Monitor:
         global_reward_zeta=getattr(args, "saturation_reward_weight", 1.0),
         global_reward_beta=getattr(args, "sla_reward_weight", 1.0),
         global_action_kappa=getattr(args, "bias_smoothing_weight", 0.01),
+        global_action_lambda=getattr(args, "negative_bias_penalty_weight", 0.01),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
         training_scenarios=args.training_scenarios,
@@ -462,6 +471,7 @@ def make_env(args) -> Monitor:
         slow_stage_episodes=getattr(args, "slow_stage_episodes", 1000),
         global_neutral_bias_weight=getattr(args, "global_neutral_bias_weight", 0.1),
         neutral_bias_eps=getattr(args, "neutral_bias_eps", 0.05),
+        wrong_bias_penalty_weight=getattr(args, "wrong_bias_penalty_weight", 0.05),
         global_bad_direction_eta=getattr(args, "global_bad_direction_eta", 0.025),
         global_unsafe_target_rho=getattr(args, "global_unsafe_target_rho", 0.05),
         sla_severity_level_weight=getattr(args, "sla_severity_level_weight", 0.1),
@@ -552,6 +562,9 @@ def evaluate_upper_policy(
                 "global_cost_end": float(info.get("global_cost_end", 0.0)),
                 "global_cost_improvement": float(info.get("global_cost_improvement", 0.0)),
                 "global_action_penalty": float(info.get("global_action_penalty", 0.0)),
+                "global_negative_bias_penalty": float(
+                    info.get("global_negative_bias_penalty", 0.0)
+                ),
                 "global_bad_direction_penalty": float(info.get("global_bad_direction_penalty", 0.0)),
                 "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
                 "reward_saturation_improvement": float(
@@ -559,6 +572,7 @@ def evaluate_upper_policy(
                 ),
                 "reward_sla_improvement": float(info.get("reward_sla_improvement", 0.0)),
                 "reward_neutral_bias_penalty": float(info.get("reward_neutral_bias_penalty", 0.0)),
+                "reward_wrong_bias_penalty": float(info.get("reward_wrong_bias_penalty", 0.0)),
             "reward_sla_severity_level_penalty": float(
                 info.get("reward_sla_severity_level_penalty", 0.0)
             ),
@@ -772,6 +786,15 @@ def main():
         help="Max per-gNB load deviation from balance target before the neutral-bias penalty fires.",
     )
     parser.add_argument(
+        "--wrong-bias-penalty-weight",
+        type=float,
+        default=0.05,
+        help=(
+            "Penalty weight for retaining above-average cells or releasing "
+            "below-average cells."
+        ),
+    )
+    parser.add_argument(
         "--global-bad-direction-eta",
         type=float,
         default=0.025,
@@ -847,6 +870,12 @@ def main():
         help="PDF v15 lambda_delta for squared upper-bias changes.",
     )
     parser.add_argument(
+        "--negative-bias-penalty-weight",
+        type=float,
+        default=0.01,
+        help="Persistent penalty weight on squared negative upper-bias magnitude.",
+    )
+    parser.add_argument(
         "--scenario-mode",
         choices=("curriculum", "snapshot", "random"),
         default="curriculum",
@@ -887,6 +916,10 @@ def main():
         help="UEs created for target loads from 0.8 upward.",
     )
     parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--ppo-n-steps", type=int, default=2048)
+    parser.add_argument("--ppo-batch-size", type=int, default=256)
+    parser.add_argument("--ppo-n-epochs", type=int, default=10)
     parser.add_argument(
         "--dense-window-reward",
         action=argparse.BooleanOptionalAction,
@@ -964,6 +997,8 @@ def main():
         "sla_reward_weight": float(args.sla_reward_weight),
         "global_neutral_bias_weight": float(args.global_neutral_bias_weight),
         "neutral_bias_eps": float(args.neutral_bias_eps),
+        "wrong_bias_penalty_weight": float(args.wrong_bias_penalty_weight),
+        "negative_bias_penalty_weight": float(args.negative_bias_penalty_weight),
         "global_bad_direction_eta": float(args.global_bad_direction_eta),
         "global_unsafe_target_rho": float(args.global_unsafe_target_rho),
         "sla_severity_level_weight": float(args.sla_severity_level_weight),
@@ -982,6 +1017,10 @@ def main():
         "use_progress_reward": bool(args.use_progress_reward),
         "log_every": int(args.log_every),
         "log_flush_every": int(args.log_flush_every),
+        "learning_rate": float(args.learning_rate),
+        "ppo_n_steps": int(args.ppo_n_steps),
+        "ppo_batch_size": int(args.ppo_batch_size),
+        "ppo_n_epochs": int(args.ppo_n_epochs),
     }
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -995,13 +1034,13 @@ def main():
         model = PPO(
             "MlpPolicy",
             env,
-            learning_rate=3e-4,
+            learning_rate=float(args.learning_rate),
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_steps=2048,
-            batch_size=256,
-            n_epochs=10,
+            n_steps=int(args.ppo_n_steps),
+            batch_size=int(args.ppo_batch_size),
+            n_epochs=int(args.ppo_n_epochs),
             verbose=1,
             tensorboard_log=tensorboard_log,
             device=args.device,

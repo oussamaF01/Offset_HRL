@@ -103,10 +103,19 @@ def test_rx_probability_stays_high_for_high_sinr():
     high_sinr_rxp = [
         row["rx_probability"]
         for row in rows
-        if row["sinr_db"] > 15.0
+        if row["sinr_db"] > 15.0 and row["transmission_attempted"]
     ]
     assert high_sinr_rxp
-    assert float(np.mean(high_sinr_rxp)) >= 0.85
+    assert float(np.mean(high_sinr_rxp)) >= 0.90
+
+
+def test_unscheduled_radio_metric_is_not_reported_as_rx_failure():
+    _env, rows = _run_trace()
+    unscheduled = [row for row in rows if not row["transmission_attempted"]]
+
+    assert unscheduled
+    assert all(row["allocated_prbs"] == 0 for row in unscheduled)
+    assert all(np.isnan(row["rx_probability"]) for row in unscheduled)
 
 
 def test_handover_cooldown_blocks_immediate_return():

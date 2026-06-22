@@ -101,6 +101,7 @@ def test_admission_capacity_uses_absolute_bias_fraction_and_is_enforced():
     ue = SimpleNamespace(prbs=5, useful_prbs=5)
     for _ in range(8):
         assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+        env._commit_safe_admission(0, 1, "eMBB")
     assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
     assert env.get_safe_admission_state()["stats"]["rejected_capacity"] == 1
 
@@ -114,6 +115,7 @@ def test_half_release_bias_shares_one_quota_across_both_neighbors():
     ue = SimpleNamespace(prbs=1, useful_prbs=1)
     for target in (1, 2, 1, 2, 1):
         assert env._safe_admission_allows(ue, 0, target, "eMBB")
+        env._commit_safe_admission(0, target, "eMBB")
     assert not env._safe_admission_allows(ue, 0, 2, "eMBB")
     state = env.get_safe_admission_state()
     assert state["source_capacities"][(0, "eMBB")] == 5
@@ -142,6 +144,58 @@ def test_hard_target_limit_rejects_candidate():
     ue = SimpleNamespace(prbs=5, useful_prbs=5)
     assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
     assert env.get_safe_admission_state()["stats"]["rejected_target_safety"] == 1
+
+
+def test_negative_bias_controls_release_even_when_source_is_below_slice_average():
+    env, loads = _admission_stub()
+    loads[(0, "eMBB")] = 0.30
+    loads[(1, "eMBB")] = 0.10
+    loads[(2, "eMBB")] = 0.90
+    bias = np.zeros((3, 3), dtype=float)
+    bias[0, 0] = -0.5
+    env.begin_safe_admission_window(bias)
+    ue = SimpleNamespace(prbs=1, useful_prbs=1)
+
+    # The upper action is authoritative: -0.5 requests a five-UE release
+    # quota. The safe layer may still reject unsafe targets, but it no longer
+    # cancels the request merely because gNB0 is below the network average.
+    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 5
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+    env._commit_safe_admission(0, 1, "eMBB")
+    assert env.get_safe_admission_state()["source_accepted"][(0, "eMBB")] == 1
+    assert env.get_safe_admission_state()["stats"]["rejected_no_source_excess"] == 0
+
+
+def test_failed_handover_does_not_consume_admission_quota():
+    env, _loads = _admission_stub()
+    bias = np.zeros((3, 3), dtype=float)
+    bias[0, 0] = -0.1
+    env.begin_safe_admission_window(bias)
+    ue = SimpleNamespace(prbs=1, useful_prbs=1)
+
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+    # Simulate _perform_handover() returning False: no commit occurs.
+    state = env.get_safe_admission_state()
+    assert state["source_capacities"][(0, "eMBB")] == 1
+    assert state["source_accepted"][(0, "eMBB")] == 0
+    assert state["stats"]["accepted"] == 0
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+
+
+def test_successful_handover_commit_consumes_exactly_one_slot():
+    env, _loads = _admission_stub()
+    bias = np.zeros((3, 3), dtype=float)
+    bias[0, 0] = -0.2
+    env.begin_safe_admission_window(bias)
+    ue = SimpleNamespace(prbs=1, useful_prbs=1)
+
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+    env._commit_safe_admission(0, 1, "eMBB")
+
+    state = env.get_safe_admission_state()
+    assert state["accepted"][(0, 1, "EMBB")] == 1
+    assert state["source_accepted"][(0, "eMBB")] == 1
+    assert state["stats"]["accepted"] == 1
 
 
 def _stability_stub():

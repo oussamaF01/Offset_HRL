@@ -153,6 +153,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         slow_stage_episodes: int = 1000,
         global_neutral_bias_weight: float = 0.1,
         neutral_bias_eps: float = 0.05,
+        wrong_bias_penalty_weight: float = 0.05,
         sla_severity_level_weight: float = 0.1,
         load_balance_level_weight: float = 1.0,
         a3_handover_cooldown_s: float = 2.0,
@@ -234,6 +235,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.global_unsafe_target_rho = float(global_unsafe_target_rho)
         self.global_neutral_bias_weight = float(global_neutral_bias_weight)
         self.neutral_bias_eps = float(neutral_bias_eps)
+        self.wrong_bias_penalty_weight = max(float(wrong_bias_penalty_weight), 0.0)
         self.sla_severity_level_weight = float(sla_severity_level_weight)
         self.load_balance_level_weight = max(float(load_balance_level_weight), 0.0)
         self.a3_handover_cooldown_s = max(float(a3_handover_cooldown_s), 0.0)
@@ -439,7 +441,11 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
         end_imbalance = self._load_balance_cost(end_loads)
         action_penalty = self._bias_smoothness_penalty(bias_matrix, previous_bias_matrix)
+        negative_bias_penalty = self._negative_bias_magnitude_penalty(bias_matrix)
         neutral_bias_penalty = self._balanced_slice_neutral_bias_penalty(
+            start_loads, bias_matrix, eps=self.neutral_bias_eps
+        )
+        wrong_bias_penalty = self._wrong_bias_direction_penalty(
             start_loads, bias_matrix, eps=self.neutral_bias_eps
         )
         bad_direction_penalty = self._bad_direction_penalty(
@@ -449,7 +455,9 @@ class GlobalPPO3GNBEnv(gym.Env):
         # already balanced:
         #   r_H(t) = J_H(t) - J_H(t + T_H)
         #            - lambda_delta * ||B(t) - B(t - T_H)||^2
+        #            - lambda_negative * ||min(B(t), 0)||^2
         #            - lambda_neutral * P_neutral(t)
+        #            - lambda_wrong * P_wrong(t)
         # where J_H is the sum of per-slice squared load deviations across
         # gNBs. Keep the richer terms below as diagnostics only.
         normalized_balance_progress = float(
@@ -482,7 +490,9 @@ class GlobalPPO3GNBEnv(gym.Env):
         window_reward = float(
             load_reward
             - action_penalty
+            - negative_bias_penalty
             - self.global_neutral_bias_weight * neutral_bias_penalty
+            - self.wrong_bias_penalty_weight * wrong_bias_penalty
         )
         self._previous_window_sla_severity = float(end_sla_severity)
         instant_rewards = [window_reward]
@@ -514,11 +524,13 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["global_cost_end"] = float(end_cost)
         info["global_cost_improvement"] = float(start_cost - end_cost)
         info["global_action_penalty"] = float(action_penalty)
+        info["global_negative_bias_penalty"] = float(negative_bias_penalty)
         info["global_bad_direction_penalty"] = float(bad_direction_penalty)
         info["reward_load_improvement"] = float(load_reward)
         info["reward_saturation_improvement"] = float(saturation_reward)
         info["reward_sla_improvement"] = float(sla_reward)
         info["reward_neutral_bias_penalty"] = float(neutral_bias_penalty)
+        info["reward_wrong_bias_penalty"] = float(wrong_bias_penalty)
         info["reward_sla_severity_level_penalty"] = float(sla_severity_level_penalty)
         info["reward_load_balance_level_bonus"] = float(
             load_balance_level_bonus
@@ -933,6 +945,15 @@ class GlobalPPO3GNBEnv(gym.Env):
             * np.sum((np.asarray(bias_matrix) - np.asarray(previous_bias_matrix)) ** 2)
         )
 
+    def _negative_bias_magnitude_penalty(self, bias_matrix: np.ndarray) -> float:
+        """Persistently penalize aggressive release pressure.
+
+        Unlike smoothness, this remains active when the same large negative
+        action is repeated and the safe layer blocks its consequences.
+        """
+        negative_bias = np.maximum(-np.asarray(bias_matrix, dtype=float), 0.0)
+        return float(self.global_action_lambda * np.sum(negative_bias ** 2))
+
     def _balanced_slice_neutral_bias_penalty(
         self,
         start_loads: np.ndarray,
@@ -967,6 +988,33 @@ class GlobalPPO3GNBEnv(gym.Env):
         loads = np.asarray(loads, dtype=float)
         slice_means = np.mean(loads, axis=0, keepdims=True)
         return float(np.sum((loads - slice_means) ** 2))
+
+    def _wrong_bias_direction_penalty(
+        self,
+        start_loads: np.ndarray,
+        bias_matrix: np.ndarray,
+        eps: float = 0.05,
+    ) -> float:
+        """Penalize bias signs that oppose current per-slice load balancing.
+
+        Above-average cells should release (negative bias), while below-average
+        cells should retain (positive bias). The score is normalized per active
+        unbalanced slice, keeping it in a comparable range across scenarios.
+        """
+        loads = np.asarray(start_loads, dtype=float)
+        bias = np.asarray(bias_matrix, dtype=float)
+        penalties = []
+        for s_idx in range(len(self.slice_types)):
+            slice_loads = loads[:, s_idx]
+            if float(np.sum(slice_loads)) <= 1e-9:
+                continue
+            deviations = slice_loads - float(np.mean(slice_loads))
+            scale = float(np.sum(np.abs(deviations)))
+            if scale <= max(float(eps), 1e-9):
+                continue
+            wrong = float(np.sum(np.maximum(bias[:, s_idx] * deviations, 0.0)))
+            penalties.append(wrong / scale)
+        return float(np.mean(penalties)) if penalties else 0.0
 
     def _bad_direction_penalty(
         self,
@@ -1434,7 +1482,7 @@ class GlobalPPO3GNBEnv(gym.Env):
                     n_prbs=budget_prbs,
                 )
                 sinr_db = float(np.mean(snr_vector))
-            bits_per_prb = self._bits_per_prb(sinr_db)
+            bits_per_prb = self._bits_per_prb(sinr_db, slice_type)
             source = getattr(ue, "traffic_source", None)
             if source is not None and hasattr(source, "packet_size"):
                 source.packet_size = max(1.0, min(float(source.packet_size), bits_per_prb))
@@ -1523,7 +1571,9 @@ class GlobalPPO3GNBEnv(gym.Env):
                         sinr_db = float(
                             metrics.get("sinr_db", getattr(self.base_env, "disconnect_sinr_db", 0.0))
                         )
-                        bits_per_prb = self._bits_per_prb(sinr_db)
+                        bits_per_prb = self._bits_per_prb(
+                            sinr_db, getattr(ue, "slice_type", "eMBB")
+                        )
                         self._set_ue_offered_bit_rate(
                             ue,
                             SNAPSHOT_DEMAND_SAFETY * prbs * bits_per_prb
@@ -1533,9 +1583,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         if changed:
             self.base_env._invalidate_metric_caches()
 
-    def _bits_per_prb(self, sinr_db: float) -> float:
+    def _bits_per_prb(self, sinr_db: float, slice_type: str = "eMBB") -> float:
         if hasattr(self.base_env, "_ensure_mcs_scheduler") and self.base_env._ensure_mcs_scheduler():
-            _mcs, bits_per_sym = self.base_env._mcs_codeset.mcs_rate_vs_error(float(sinr_db), 0.1)
+            codeset = self.base_env._mcs_codeset_for_slice(slice_type)
+            _mcs, bits_per_sym = codeset.mcs_rate_vs_error(float(sinr_db), 0.1)
             return max(158.0 * float(bits_per_sym), 1.0)
 
         sinr_linear = max(10.0 ** (float(sinr_db) / 10.0), 1e-6)
