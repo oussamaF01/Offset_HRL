@@ -14,28 +14,68 @@ from typing import Any, Dict, Sequence
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
 
 import numpy as np
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from global_ppo_3gnb_env import GlobalPPO3GNBEnv, SLICE_TYPES
+from upper_agent_training_scenarios import (
+    CENTER_GAP_GNB_CONFIGS,
+    get_upper_training_scenarios,
+)
 
 
 GNB_IDS = (0, 1, 2)
 MAX_NEIGHBORS = 2
-ACTION_FIELDS = [f"action_{idx}" for idx in range(len(GNB_IDS) * len(SLICE_TYPES))]
-OBSERVATION_FIELDS = [f"obs_{idx}" for idx in range(len(GNB_IDS) * len(SLICE_TYPES) * 4)]
+NEIGHBORS = {0: (1, 2), 1: (0, 2), 2: (0, 1)}
+ACTION_FIELDS = [
+    f"action_g{source}_to_g{target}_{slice_type}"
+    for source in GNB_IDS
+    for target in NEIGHBORS[source]
+    for slice_type in SLICE_TYPES
+]
+OBSERVATION_FIELDS = [
+    f"obs_{idx}"
+    for idx in range(
+        len(GNB_IDS) * len(SLICE_TYPES) * 3 + len(ACTION_FIELDS)
+    )
+]
+DIRECTIONAL_BIAS_FIELDS = [
+    f"bias_g{source}_to_g{target}_{slice_type}"
+    for source in GNB_IDS
+    for target in NEIGHBORS[source]
+    for slice_type in SLICE_TYPES
+]
 MATRIX_FIELDS = [
     f"{prefix}_g{gnb_id}_{slice_type}"
     for prefix in (
-        "bias", "target_load", "balance_target", "load", "sla", "ue_count",
-        "qos_throughput_mbps", "qos_offered_mbps", "qos_delivery_ratio",
-        "qos_completed_delay_ms", "qos_mean_hol_delay_ms",
-        "qos_max_hol_delay_ms", "qos_queue_kbits", "qos_drop_ratio",
-        "qos_packet_failure_ratio",
+        "target_load", "balance_target",
+        "demand_load_start", "demand_load_end",
+        "useful_load_start", "useful_load_end",
+        "sla", "ue_count",
     )
     for gnb_id in GNB_IDS
     for slice_type in SLICE_TYPES
+]
+DEMAND_LOAD_TOTAL_FIELDS = (
+    [f"gnb_demand_load_{phase}_g{gnb_id}" for phase in ("start", "end") for gnb_id in GNB_IDS]
+    + [
+        f"slice_demand_load_{phase}_{slice_type}"
+        for phase in ("start", "end")
+        for slice_type in SLICE_TYPES
+    ]
+)
+USEFUL_LOAD_TOTAL_FIELDS = (
+    [f"gnb_useful_load_{phase}_g{gnb_id}" for phase in ("start", "end") for gnb_id in GNB_IDS]
+    + [
+        f"slice_useful_load_{phase}_{slice_type}"
+        for phase in ("start", "end")
+        for slice_type in SLICE_TYPES
+    ]
+)
+SERVED_FLOOR_REFERENCE_FIELDS = [
+    f"served_active_floor_reference_g{gnb_id}" for gnb_id in GNB_IDS
 ]
 
 QOS_SCALAR_FIELDS = [
@@ -64,6 +104,9 @@ QOS_MATRIX_KEYS = [
 
 TRAINING_FIELDS = [
     "step",
+    "ppo_update_index",
+    "rollout_step_in_update",
+    "policy_has_updated",
     "episode",
     "episode_step",
     "reward",
@@ -75,118 +118,70 @@ TRAINING_FIELDS = [
     "upper_window_seconds",
     "local_step_seconds",
     "radio_service_seconds_per_upper_window",
-    "load_variance",
-    "target_load_error",
+    "post_handover_settle_steps",
+    "radio_measurement_steps",
+    "load_measurement_mode",
+    "ppo_network_demand_load_start",
+    "ppo_network_demand_load_end",
+    "radio_network_total_useful_load_start",
+    "radio_network_total_useful_load_end",
+    "radio_mean_gnb_useful_load_start",
+    "radio_mean_gnb_useful_load_end",
+    "radio_max_gnb_useful_load_start",
+    "radio_max_gnb_useful_load_end",
     "overload_ratio",
     "sla_count",
     "sla_severity",
-    "sla_deadband",
     "handover_count",
     "load_imbalance_start",
     "load_imbalance_end",
-    "target_load_error_start",
-    "target_load_error_end",
-    "instant_reward_mean",
-    "dense_window_reward",
-    "episode_terminal_reward",
-    "global_network_cost",
     "global_cost_start",
     "global_cost_end",
     "global_cost_improvement",
     "global_action_penalty",
     "global_negative_bias_penalty",
-    "global_bad_direction_penalty",
     "reward_load_improvement",
+    "reward_load_improvement_raw",
+    "reward_active_slice_count",
     "reward_saturation_improvement",
+    "reward_excess_load_improvement",
+    "reward_excess_load_improvement_raw",
+    "reward_served_share_improvement",
+    "reward_served_share_improvement_raw",
+    "served_share_cost_start",
+    "served_share_cost_end",
+    "reward_served_active_floor",
+    "reward_served_active_floor_raw",
+    "served_active_floor_cost_start",
+    "served_active_floor_cost_end",
+    "served_active_floor",
+    "gnb_excess_load_cost_start",
+    "gnb_excess_load_cost_end",
+    "gnb_load_target_requested",
+    "gnb_load_target_effective",
+    "gnb_load_target_feasible",
+    "persistent_demand_utilization",
     "reward_sla_improvement",
-    "reward_neutral_bias_penalty",
-    "reward_wrong_bias_penalty",
-    "reward_sla_severity_level_penalty",
-    "reward_load_balance_level_bonus",
     "saturation_count",
-    "action_direction_reward",
-    "terminal_reward_only",
-    "use_progress_reward",
     "overloaded_negative_fraction",
     "light_nonnegative_fraction",
-    "bias_matrix",
-    "directional_bias_tensor",
     "directional_offset_tensor",
     "safe_admission_capacities",
     "safe_admission_accepted",
+    "safe_admission_remaining",
     "safe_admission_source_capacities",
     "safe_admission_source_accepted",
     "safe_admission_stats",
-    "target_load_matrix",
-    "balance_target_matrix",
-    "load_matrix",
-    "sla_matrix",
-    "sla_violation_matrix",
-    "sla_severity_matrix",
-    "sla_window_metrics",
     *QOS_SCALAR_FIELDS,
-    *[f"qos_{key}" for key in QOS_MATRIX_KEYS],
-    "ue_count_matrix",
-] + ACTION_FIELDS + OBSERVATION_FIELDS + MATRIX_FIELDS
+    *DEMAND_LOAD_TOTAL_FIELDS,
+    *USEFUL_LOAD_TOTAL_FIELDS,
+    *SERVED_FLOOR_REFERENCE_FIELDS,
+] + DIRECTIONAL_BIAS_FIELDS + MATRIX_FIELDS
 
 VALIDATION_FIELDS = [
-    "episode",
-    "step",
-    "scenario_name",
-    "episode_time_s",
-    "episode_duration_s",
-    "upper_window_seconds",
-    "local_step_seconds",
-    "radio_service_seconds_per_upper_window",
-    "reward",
-    "load_variance",
-    "target_load_error",
-    "load_imbalance_start",
-    "load_imbalance_end",
-    "target_load_error_start",
-    "target_load_error_end",
-    "overload_ratio",
-    "sla_count",
-    "sla_severity",
-    "sla_deadband",
-    "handover_count",
-    "global_network_cost",
-    "global_cost_start",
-    "global_cost_end",
-    "global_cost_improvement",
-    "global_action_penalty",
-    "global_negative_bias_penalty",
-    "global_bad_direction_penalty",
-    "reward_load_improvement",
-    "reward_saturation_improvement",
-    "reward_sla_improvement",
-    "reward_neutral_bias_penalty",
-    "reward_wrong_bias_penalty",
-    "reward_sla_severity_level_penalty",
-    "reward_load_balance_level_bonus",
-    "saturation_count",
-    "action_direction_reward",
-    "overloaded_negative_fraction",
-    "light_nonnegative_fraction",
-    "bias_matrix",
-    "directional_bias_tensor",
-    "directional_offset_tensor",
-    "safe_admission_capacities",
-    "safe_admission_accepted",
-    "safe_admission_source_capacities",
-    "safe_admission_source_accepted",
-    "safe_admission_stats",
-    "target_load_matrix",
-    "balance_target_matrix",
-    "load_matrix",
-    "sla_matrix",
-    "sla_violation_matrix",
-    "sla_severity_matrix",
-    "sla_window_metrics",
-    *QOS_SCALAR_FIELDS,
-    *[f"qos_{key}" for key in QOS_MATRIX_KEYS],
-    "ue_count_matrix",
-] + [field for field in MATRIX_FIELDS if field.startswith("qos_")]
+    field for field in TRAINING_FIELDS
+    if field not in {"episode_return", "done"}
+]
 
 
 def _json_array(value) -> str:
@@ -215,7 +210,11 @@ def _matrix_or_nan(value) -> np.ndarray:
 
 
 def _bias_quality_scores(bias_matrix, load_matrix) -> tuple[float, float]:
-    bias = _matrix_or_nan(bias_matrix)
+    bias = np.asarray(bias_matrix, dtype=float)
+    if bias.shape == (len(GNB_IDS), len(NEIGHBORS[0]), len(SLICE_TYPES)):
+        bias = np.min(bias, axis=1)
+    else:
+        bias = _matrix_or_nan(bias)
     loads = _matrix_or_nan(load_matrix)
     if np.isnan(bias).any() or np.isnan(loads).any():
         return 0.0, 0.0
@@ -233,13 +232,54 @@ def _add_flat_matrix_fields(row: Dict[str, Any], prefix: str, value) -> None:
             row[f"{prefix}_g{gnb_id}_{slice_type}"] = float(matrix[g_idx, s_idx])
 
 
+def _add_directional_bias_fields(row: Dict[str, Any], value) -> None:
+    tensor = np.asarray(value, dtype=float)
+    expected = (len(GNB_IDS), len(NEIGHBORS[0]), len(SLICE_TYPES))
+    if tensor.shape != expected:
+        tensor = np.full(expected, np.nan, dtype=float)
+    for source in GNB_IDS:
+        for slot, target in enumerate(NEIGHBORS[source]):
+            for s_idx, slice_type in enumerate(SLICE_TYPES):
+                row[f"bias_g{source}_to_g{target}_{slice_type}"] = float(
+                    tensor[source, slot, s_idx]
+                )
+
+
 def _add_qos_fields(row: Dict[str, Any], info: Dict[str, Any]) -> None:
     qos = dict(info.get("qos", {}))
     for field in QOS_SCALAR_FIELDS:
         row[field] = float(qos.get(field, 0.0))
-    for key in QOS_MATRIX_KEYS:
-        row[f"qos_{key}"] = _json_array(qos.get(key, []))
-        _add_flat_matrix_fields(row, f"qos_{key.removesuffix('_matrix')}", qos.get(key, []))
+
+
+def _matrix_sum(value) -> float:
+    matrix = _matrix_or_nan(value)
+    return float(np.nansum(matrix))
+
+
+def _row_sum_mean(value) -> float:
+    matrix = _matrix_or_nan(value)
+    row_sums = np.nansum(matrix, axis=1)
+    return float(np.nanmean(row_sums))
+
+
+def _row_sum_max(value) -> float:
+    matrix = _matrix_or_nan(value)
+    row_sums = np.nansum(matrix, axis=1)
+    return float(np.nanmax(row_sums))
+
+
+def _add_matrix_total_fields(row: Dict[str, Any], prefix: str, value) -> None:
+    matrix = _matrix_or_nan(value)
+    for g_idx, gnb_id in enumerate(GNB_IDS):
+        row[f"gnb_{prefix}_g{gnb_id}"] = float(np.nansum(matrix[g_idx, :]))
+    for s_idx, slice_type in enumerate(SLICE_TYPES):
+        row[f"slice_{prefix}_{slice_type}"] = float(np.nansum(matrix[:, s_idx]))
+
+
+def _add_served_floor_reference_fields(row: Dict[str, Any], value) -> None:
+    values = _flat_first(value, len(GNB_IDS))
+    for idx, gnb_id in enumerate(GNB_IDS):
+        row[f"served_active_floor_reference_g{gnb_id}"] = float(values[idx])
 
 
 class UpperTrainingCsvCallback(BaseCallback):
@@ -280,16 +320,30 @@ class UpperTrainingCsvCallback(BaseCallback):
         should_log = done or self.num_timesteps == 1 or self.num_timesteps % self.log_every == 0
         if not should_log:
             return True
-        action_values = _flat_first(self.locals.get("actions", []), len(ACTION_FIELDS))
-        obs_values = _flat_first(self.locals.get("new_obs", []), len(OBSERVATION_FIELDS))
         infos = self.locals.get("infos", [{}])
         info = dict(infos[0])
+        ppo_n_steps = max(int(getattr(self.model, "n_steps", 1)), 1)
+        ppo_update_index = max((int(self.num_timesteps) - 1) // ppo_n_steps, 0)
+        rollout_step_in_update = ((int(self.num_timesteps) - 1) % ppo_n_steps) + 1
+        demand_load_start = info.get(
+            "demand_load_matrix_start",
+            info.get("load_matrix_start", []),
+        )
+        demand_load_end = info.get(
+            "demand_load_matrix_end",
+            info.get("load_matrix_end", []),
+        )
+        useful_load_start = info.get("load_matrix_start", [])
+        useful_load_end = info.get("useful_load_matrix_end", [])
         overloaded_negative, light_nonnegative = _bias_quality_scores(
-            info.get("bias_matrix", []),
+            info.get("directional_bias_tensor", []),
             info.get("load_matrix", []),
         )
         row = {
             "step": int(self.num_timesteps),
+            "ppo_update_index": int(ppo_update_index),
+            "rollout_step_in_update": int(rollout_step_in_update),
+            "policy_has_updated": bool(ppo_update_index > 0),
             "episode": int(self.episode),
             "episode_step": int(self.episode_step),
             "reward": reward,
@@ -303,21 +357,29 @@ class UpperTrainingCsvCallback(BaseCallback):
             "radio_service_seconds_per_upper_window": float(
                 info.get("radio_service_seconds_per_upper_window", 0.0)
             ),
-            "load_variance": float(info.get("load_variance", 0.0)),
-            "target_load_error": float(info.get("target_load_error", 0.0)),
+            "post_handover_settle_steps": int(
+                info.get("post_handover_settle_steps", 0)
+            ),
+            "radio_measurement_steps": int(
+                info.get("radio_measurement_steps", 0)
+            ),
+            "load_measurement_mode": str(
+                info.get("load_measurement_mode", "")
+            ),
+            "ppo_network_demand_load_start": _matrix_sum(demand_load_start),
+            "ppo_network_demand_load_end": _matrix_sum(demand_load_end),
+            "radio_network_total_useful_load_start": _matrix_sum(useful_load_start),
+            "radio_network_total_useful_load_end": _matrix_sum(useful_load_end),
+            "radio_mean_gnb_useful_load_start": _row_sum_mean(useful_load_start),
+            "radio_mean_gnb_useful_load_end": _row_sum_mean(useful_load_end),
+            "radio_max_gnb_useful_load_start": _row_sum_max(useful_load_start),
+            "radio_max_gnb_useful_load_end": _row_sum_max(useful_load_end),
             "overload_ratio": float(info.get("overload_ratio", 0.0)),
             "sla_count": float(info.get("sla_count", 0.0)),
             "sla_severity": float(info.get("sla_severity", 0.0)),
-            "sla_deadband": float(info.get("sla_deadband", 0.0)),
             "handover_count": int(info.get("handover_count", 0)),
             "load_imbalance_start": float(info.get("load_imbalance_start", 0.0)),
             "load_imbalance_end": float(info.get("load_imbalance_end", 0.0)),
-            "target_load_error_start": float(info.get("target_load_error_start", 0.0)),
-            "target_load_error_end": float(info.get("target_load_error_end", 0.0)),
-            "instant_reward_mean": float(info.get("instant_reward_mean", 0.0)),
-            "dense_window_reward": float(info.get("dense_window_reward", 0.0)),
-            "episode_terminal_reward": float(info.get("episode_terminal_reward", 0.0)),
-            "global_network_cost": float(info.get("global_network_cost", 0.0)),
             "global_cost_start": float(info.get("global_cost_start", 0.0)),
             "global_cost_end": float(info.get("global_cost_end", 0.0)),
             "global_cost_improvement": float(info.get("global_cost_improvement", 0.0)),
@@ -325,39 +387,94 @@ class UpperTrainingCsvCallback(BaseCallback):
             "global_negative_bias_penalty": float(
                 info.get("global_negative_bias_penalty", 0.0)
             ),
-            "global_bad_direction_penalty": float(info.get("global_bad_direction_penalty", 0.0)),
             "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
+            "reward_load_improvement_raw": float(
+                info.get("reward_load_improvement_raw", 0.0)
+            ),
+            "reward_active_slice_count": int(
+                info.get("reward_active_slice_count", 0)
+            ),
             "reward_saturation_improvement": float(
                 info.get("reward_saturation_improvement", 0.0)
             ),
+            "reward_excess_load_improvement": float(
+                info.get("reward_excess_load_improvement", 0.0)
+            ),
+            "reward_excess_load_improvement_raw": float(
+                info.get("reward_excess_load_improvement_raw", 0.0)
+            ),
+            "reward_served_share_improvement": float(
+                info.get("reward_served_share_improvement", 0.0)
+            ),
+            "reward_served_share_improvement_raw": float(
+                info.get("reward_served_share_improvement_raw", 0.0)
+            ),
+            "served_share_cost_start": float(
+                info.get("served_share_cost_start", 0.0)
+            ),
+            "served_share_cost_end": float(
+                info.get("served_share_cost_end", 0.0)
+            ),
+            "reward_served_active_floor": float(
+                info.get("reward_served_active_floor", 0.0)
+            ),
+            "reward_served_active_floor_raw": float(
+                info.get("reward_served_active_floor_raw", 0.0)
+            ),
+            "served_active_floor_cost_start": float(
+                info.get("served_active_floor_cost_start", 0.0)
+            ),
+            "served_active_floor_cost_end": float(
+                info.get("served_active_floor_cost_end", 0.0)
+            ),
+            "served_active_floor": float(
+                info.get("served_active_floor", 0.0)
+            ),
+            "gnb_excess_load_cost_start": float(
+                info.get("gnb_excess_load_cost_start", 0.0)
+            ),
+            "gnb_excess_load_cost_end": float(
+                info.get("gnb_excess_load_cost_end", 0.0)
+            ),
+            "gnb_load_target_requested": float(
+                info.get("gnb_load_target_requested", 0.65)
+            ),
+            "gnb_load_target_effective": float(
+                info.get("gnb_load_target_effective", 0.65)
+            ),
+            "gnb_load_target_feasible": bool(
+                info.get("gnb_load_target_feasible", True)
+            ),
+            "persistent_demand_utilization": float(
+                info.get("persistent_demand_utilization", 0.0)
+            ),
             "reward_sla_improvement": float(info.get("reward_sla_improvement", 0.0)),
-            "reward_neutral_bias_penalty": float(info.get("reward_neutral_bias_penalty", 0.0)),
-            "reward_wrong_bias_penalty": float(info.get("reward_wrong_bias_penalty", 0.0)),
-            "reward_sla_severity_level_penalty": float(
-                info.get("reward_sla_severity_level_penalty", 0.0)
-            ),
-            "reward_load_balance_level_bonus": float(
-                info.get("reward_load_balance_level_bonus", 0.0)
-            ),
             "saturation_count": int(info.get("saturation_count", 0)),
-            "action_direction_reward": float(info.get("action_direction_reward", 0.0)),
-            "terminal_reward_only": bool(info.get("terminal_reward_only", False)),
-            "use_progress_reward": bool(info.get("use_progress_reward", False)),
             "overloaded_negative_fraction": overloaded_negative,
             "light_nonnegative_fraction": light_nonnegative,
-            "bias_matrix": _json_array(info.get("bias_matrix", [])),
-            "directional_bias_tensor": _json_array(info.get("directional_bias_tensor", [])),
             "directional_offset_tensor": _json_array(info.get("directional_offset_tensor", [])),
             "safe_admission_capacities": json.dumps(
                 {
                     ":".join(map(str, key)): value
-                    for key, value in info.get("safe_admission", {}).get("capacities", {}).items()
+                    for key, value in info.get("safe_admission", {})
+                    .get("capacities", {})
+                    .items()
                 }
             ),
             "safe_admission_accepted": json.dumps(
                 {
                     ":".join(map(str, key)): value
-                    for key, value in info.get("safe_admission", {}).get("accepted", {}).items()
+                    for key, value in info.get("safe_admission", {})
+                    .get("accepted", {})
+                    .items()
+                }
+            ),
+            "safe_admission_remaining": json.dumps(
+                {
+                    ":".join(map(str, key)): value
+                    for key, value in info.get("safe_admission", {})
+                    .get("remaining", {})
+                    .items()
                 }
             ),
             "safe_admission_source_capacities": json.dumps(
@@ -379,30 +496,26 @@ class UpperTrainingCsvCallback(BaseCallback):
             "safe_admission_stats": json.dumps(
                 info.get("safe_admission", {}).get("stats", {})
             ),
-            "target_load_matrix": _json_array(info.get("target_load_matrix", [])),
-            "balance_target_matrix": _json_array(info.get("balance_target_matrix", [])),
-            "load_matrix": _json_array(info.get("load_matrix", [])),
-            "sla_matrix": _json_array(info.get("sla_matrix", [])),
-            "sla_violation_matrix": _json_array(info.get("sla_violation_matrix", [])),
-            "sla_severity_matrix": _json_array(info.get("sla_severity_matrix", [])),
-            "sla_window_metrics": json.dumps(
-                {
-                    ":".join(map(str, key)): value
-                    for key, value in info.get("sla_window_metrics", {}).items()
-                }
-            ),
-            "ue_count_matrix": _json_array(info.get("ue_count_matrix", [])),
         }
         _add_qos_fields(row, info)
-        for idx, value in enumerate(action_values):
-            row[f"action_{idx}"] = float(value)
-        for idx, value in enumerate(obs_values):
-            row[f"obs_{idx}"] = float(value)
+        _add_matrix_total_fields(row, "demand_load_start", demand_load_start)
+        _add_matrix_total_fields(row, "demand_load_end", demand_load_end)
+        _add_matrix_total_fields(row, "useful_load_start", useful_load_start)
+        _add_matrix_total_fields(row, "useful_load_end", useful_load_end)
+        _add_served_floor_reference_fields(
+            row,
+            info.get("served_active_floor_reference_gnb_loads", []),
+        )
+        _add_directional_bias_fields(
+            row, info.get("directional_bias_tensor", [])
+        )
         for prefix, key in (
-            ("bias", "bias_matrix"),
             ("target_load", "target_load_matrix"),
             ("balance_target", "balance_target_matrix"),
-            ("load", "load_matrix"),
+            ("demand_load_start", "demand_load_matrix_start"),
+            ("demand_load_end", "demand_load_matrix_end"),
+            ("useful_load_start", "load_matrix_start"),
+            ("useful_load_end", "useful_load_matrix_end"),
             ("sla", "sla_matrix"),
             ("ue_count", "ue_count_matrix"),
         ):
@@ -429,7 +542,65 @@ class UpperTrainingCsvCallback(BaseCallback):
             self.file = None
 
 
+def resolve_upper_training_curriculum_args(args):
+    """Keep upper PPO training on one coherent scenario unless requested.
+
+    The upper observation includes previous directional bias and the reward has
+    an action-smoothness penalty versus that previous bias. Mixing unrelated
+    scenarios by default makes the rollout distribution noisy before the policy
+    has learned one stable control problem, so the default is a single retained
+    scenario. Use --curriculum-training to intentionally train over a pool.
+    """
+    if bool(getattr(args, "block_curriculum_training", False)):
+        default_pool = (
+            "high_load_inner_embb,"
+            "high_load_inner_mixed,"
+            "high_load_inner_asymmetric"
+        )
+        if str(getattr(args, "training_scenarios", "")).strip() == str(
+            getattr(args, "single_training_scenario", "")
+        ).strip():
+            args.training_scenarios = default_pool
+        args.curriculum_training = True
+        args.scenario_selection = "block"
+        args.curriculum_block_episodes = resolve_curriculum_block_episodes(args)
+        return args
+
+    if bool(getattr(args, "curriculum_training", False)):
+        if not str(getattr(args, "training_scenarios", "")).strip():
+            args.training_scenarios = (
+                "high_load_inner_embb,"
+                "high_load_inner_mixed,"
+                "high_load_inner_asymmetric"
+            )
+        return args
+
+    args.training_scenarios = str(
+        getattr(args, "single_training_scenario", "high_load_inner_asymmetric")
+    )
+    args.scenario_selection = "cycle"
+    return args
+
+
+def resolve_curriculum_block_episodes(args) -> int:
+    requested = int(getattr(args, "curriculum_block_episodes", 0))
+    if requested > 0:
+        return requested
+
+    scenarios = get_upper_training_scenarios(getattr(args, "training_scenarios", None))
+    upper_window_seconds = max(float(getattr(args, "upper_window_seconds", 1.0)), 1e-6)
+    episode_steps = max(
+        1,
+        int(np.ceil(max(float(s.duration_s) for s in scenarios) / upper_window_seconds)),
+    )
+    ppo_updates = max(int(getattr(args, "ppo_updates_per_scenario", 3)), 1)
+    ppo_n_steps = max(int(getattr(args, "ppo_n_steps", 2048)), 1)
+    episodes_per_update = int(np.ceil(ppo_n_steps / episode_steps))
+    return max(1, ppo_updates * episodes_per_update)
+
+
 def make_env(args) -> Monitor:
+    topology_name = getattr(args, "center_gap_topology", "medium_270m")
     env = GlobalPPO3GNBEnv(
         seed=args.seed,
         n_gnbs=args.n_gnbs,
@@ -439,6 +610,8 @@ def make_env(args) -> Monitor:
         use_sumo_mobility=args.use_sumo_mobility,
         radio_substeps=args.radio_substeps,
         radio_tick_seconds=getattr(args, "radio_tick_seconds", None),
+        pf_averaging_window_s=getattr(args, "pf_averaging_window_s", 0.25),
+        gnb_configs=CENTER_GAP_GNB_CONFIGS[topology_name],
         local_steps_per_global=args.local_steps_per_global,
         global_steps_per_episode=args.global_steps_per_episode,
         scenario_mode=args.scenario_mode,
@@ -457,16 +630,28 @@ def make_env(args) -> Monitor:
         print_scenarios=args.debug,
         slice_prb_budgets=args.slice_prb_budgets,
         max_prbs_per_ue=args.max_prbs_per_ue,
-        directional_global_action=False,
+        directional_global_action=True,
         global_reward_mu=getattr(args, "load_balance_reward_weight", 2.0),
         global_reward_zeta=getattr(args, "saturation_reward_weight", 1.0),
-        global_reward_beta=getattr(args, "sla_reward_weight", 1.0),
+        global_reward_beta=0.0,
         global_action_kappa=getattr(args, "bias_smoothing_weight", 0.01),
         global_action_lambda=getattr(args, "negative_bias_penalty_weight", 0.01),
+        gnb_load_target=getattr(args, "gnb_load_target", 0.65),
+        excess_load_reward_weight=getattr(
+            args, "excess_load_reward_weight", 1.0
+        ),
+        served_share_reward_weight=getattr(
+            args, "served_share_reward_weight", 1.0
+        ),
+        served_active_floor_reward_weight=getattr(
+            args, "served_active_floor_reward_weight", 1.0
+        ),
+        served_active_floor=getattr(args, "served_active_floor", 0.20),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
         training_scenarios=args.training_scenarios,
         scenario_selection=args.scenario_selection,
+        curriculum_block_episodes=getattr(args, "curriculum_block_episodes", 1),
         fixed_stage_episodes=getattr(args, "fixed_stage_episodes", 500),
         slow_stage_episodes=getattr(args, "slow_stage_episodes", 1000),
         global_neutral_bias_weight=getattr(args, "global_neutral_bias_weight", 0.1),
@@ -480,6 +665,12 @@ def make_env(args) -> Monitor:
         a3_min_residence_s=getattr(args, "a3_min_residence_s", 2.0),
         a3_history_window_s=getattr(args, "a3_history_window_s", 20.0),
         a3_pingpong_threshold_s=getattr(args, "a3_pingpong_threshold_s", 5.0),
+        safe_admission_enabled=getattr(args, "safe_admission", False),
+        warmup_steps=getattr(args, "warmup_steps", 2),
+        post_handover_settle_steps=getattr(args, "post_handover_settle_steps", 4),
+        demand_calibration_alpha=getattr(
+            args, "demand_calibration_alpha", 0.5
+        ),
     )
     return Monitor(env)
 
@@ -517,22 +708,25 @@ def evaluate_upper_policy(
             last_imbalance = float(info.get("load_imbalance_end", 0.0))
             handovers.append(int(info.get("handover_count", 0)))
             sla_counts.append(float(info.get("sla_count", 0.0)))
-            bias_matrix = np.asarray(info.get("bias_matrix", []), dtype=float)
-            load_matrix = np.asarray(info.get("load_matrix", []), dtype=float)
-            overloaded = load_matrix > 0.85
-            light = load_matrix < 0.45
-            overloaded_negative = (
-                float(np.mean(bias_matrix[overloaded] < 0.0))
-                if overloaded.any() and bias_matrix.shape == load_matrix.shape
-                else 1.0
+            directional_bias = np.asarray(
+                info.get("directional_bias_tensor", []), dtype=float
             )
-            light_nonnegative = (
-                float(np.mean(bias_matrix[light] >= -0.1))
-                if light.any() and bias_matrix.shape == load_matrix.shape
-                else 1.0
+            load_matrix = np.asarray(info.get("load_matrix", []), dtype=float)
+            overloaded_negative, light_nonnegative = _bias_quality_scores(
+                directional_bias, load_matrix
             )
             overloaded_negative_scores.append(overloaded_negative)
             light_nonnegative_scores.append(light_nonnegative)
+            demand_load_start = info.get(
+                "demand_load_matrix_start",
+                info.get("load_matrix_start", []),
+            )
+            demand_load_end = info.get(
+                "demand_load_matrix_end",
+                info.get("load_matrix_end", []),
+            )
+            useful_load_start = info.get("load_matrix_start", [])
+            useful_load_end = info.get("useful_load_matrix_end", [])
 
             rows.append({
                 "episode": int(episode),
@@ -545,6 +739,23 @@ def evaluate_upper_policy(
                 "radio_service_seconds_per_upper_window": float(
                     info.get("radio_service_seconds_per_upper_window", 0.0)
                 ),
+                "post_handover_settle_steps": int(
+                    info.get("post_handover_settle_steps", 0)
+                ),
+                "radio_measurement_steps": int(
+                    info.get("radio_measurement_steps", 0)
+                ),
+                "load_measurement_mode": str(
+                    info.get("load_measurement_mode", "")
+                ),
+                "ppo_network_demand_load_start": _matrix_sum(demand_load_start),
+                "ppo_network_demand_load_end": _matrix_sum(demand_load_end),
+                "radio_network_total_useful_load_start": _matrix_sum(useful_load_start),
+                "radio_network_total_useful_load_end": _matrix_sum(useful_load_end),
+                "radio_mean_gnb_useful_load_start": _row_sum_mean(useful_load_start),
+                "radio_mean_gnb_useful_load_end": _row_sum_mean(useful_load_end),
+                "radio_max_gnb_useful_load_start": _row_sum_max(useful_load_start),
+                "radio_max_gnb_useful_load_end": _row_sum_max(useful_load_end),
                 "reward": float(reward),
                 "load_variance": float(info.get("load_variance", 0.0)),
                 "target_load_error": float(info.get("target_load_error", 0.0)),
@@ -565,20 +776,68 @@ def evaluate_upper_policy(
                 "global_negative_bias_penalty": float(
                     info.get("global_negative_bias_penalty", 0.0)
                 ),
-                "global_bad_direction_penalty": float(info.get("global_bad_direction_penalty", 0.0)),
                 "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
+                "reward_load_improvement_raw": float(
+                    info.get("reward_load_improvement_raw", 0.0)
+                ),
+                "reward_active_slice_count": int(
+                    info.get("reward_active_slice_count", 0)
+                ),
                 "reward_saturation_improvement": float(
                     info.get("reward_saturation_improvement", 0.0)
                 ),
+                "reward_excess_load_improvement": float(
+                    info.get("reward_excess_load_improvement", 0.0)
+                ),
+                "reward_excess_load_improvement_raw": float(
+                    info.get("reward_excess_load_improvement_raw", 0.0)
+                ),
+                "reward_served_share_improvement": float(
+                    info.get("reward_served_share_improvement", 0.0)
+                ),
+                "reward_served_share_improvement_raw": float(
+                    info.get("reward_served_share_improvement_raw", 0.0)
+                ),
+                "served_share_cost_start": float(
+                    info.get("served_share_cost_start", 0.0)
+                ),
+                "served_share_cost_end": float(
+                    info.get("served_share_cost_end", 0.0)
+                ),
+                "reward_served_active_floor": float(
+                    info.get("reward_served_active_floor", 0.0)
+                ),
+                "reward_served_active_floor_raw": float(
+                    info.get("reward_served_active_floor_raw", 0.0)
+                ),
+                "served_active_floor_cost_start": float(
+                    info.get("served_active_floor_cost_start", 0.0)
+                ),
+                "served_active_floor_cost_end": float(
+                    info.get("served_active_floor_cost_end", 0.0)
+                ),
+                "served_active_floor": float(
+                    info.get("served_active_floor", 0.0)
+                ),
+                "gnb_excess_load_cost_start": float(
+                    info.get("gnb_excess_load_cost_start", 0.0)
+                ),
+                "gnb_excess_load_cost_end": float(
+                    info.get("gnb_excess_load_cost_end", 0.0)
+                ),
+                "gnb_load_target_requested": float(
+                    info.get("gnb_load_target_requested", 0.65)
+                ),
+                "gnb_load_target_effective": float(
+                    info.get("gnb_load_target_effective", 0.65)
+                ),
+                "gnb_load_target_feasible": bool(
+                    info.get("gnb_load_target_feasible", True)
+                ),
+                "persistent_demand_utilization": float(
+                    info.get("persistent_demand_utilization", 0.0)
+                ),
                 "reward_sla_improvement": float(info.get("reward_sla_improvement", 0.0)),
-                "reward_neutral_bias_penalty": float(info.get("reward_neutral_bias_penalty", 0.0)),
-                "reward_wrong_bias_penalty": float(info.get("reward_wrong_bias_penalty", 0.0)),
-            "reward_sla_severity_level_penalty": float(
-                info.get("reward_sla_severity_level_penalty", 0.0)
-            ),
-            "reward_load_balance_level_bonus": float(
-                info.get("reward_load_balance_level_bonus", 0.0)
-            ),
                 "saturation_count": int(info.get("saturation_count", 0)),
                 "action_direction_reward": float(info.get("action_direction_reward", 0.0)),
                 "overloaded_negative_fraction": overloaded_negative,
@@ -632,6 +891,28 @@ def evaluate_upper_policy(
                 "ue_count_matrix": _json_array(info.get("ue_count_matrix", [])),
             })
             _add_qos_fields(rows[-1], info)
+            _add_matrix_total_fields(rows[-1], "demand_load_start", demand_load_start)
+            _add_matrix_total_fields(rows[-1], "demand_load_end", demand_load_end)
+            _add_matrix_total_fields(rows[-1], "useful_load_start", useful_load_start)
+            _add_matrix_total_fields(rows[-1], "useful_load_end", useful_load_end)
+            _add_served_floor_reference_fields(
+                rows[-1],
+                info.get("served_active_floor_reference_gnb_loads", []),
+            )
+            _add_directional_bias_fields(
+                rows[-1], info.get("directional_bias_tensor", [])
+            )
+            for prefix, key in (
+                ("target_load", "target_load_matrix"),
+                ("balance_target", "balance_target_matrix"),
+                ("demand_load_start", "demand_load_matrix_start"),
+                ("demand_load_end", "demand_load_matrix_end"),
+                ("useful_load_start", "load_matrix_start"),
+                ("useful_load_end", "useful_load_matrix_end"),
+                ("sla", "sla_matrix"),
+                ("ue_count", "ue_count_matrix"),
+            ):
+                _add_flat_matrix_fields(rows[-1], prefix, info.get(key, []))
 
         episode_returns.append(ep_return)
         if first_imbalance is not None and last_imbalance is not None:
@@ -644,7 +925,10 @@ def evaluate_upper_policy(
             writer = csv.DictWriter(fh, fieldnames=VALIDATION_FIELDS)
             writer.writeheader()
             for row in rows:
-                writer.writerow(row)
+                writer.writerow({
+                    field: row.get(field, "")
+                    for field in VALIDATION_FIELDS
+                })
 
     return {
         "n_eval_episodes": int(n_eval_episodes),
@@ -662,6 +946,102 @@ def evaluate_upper_policy(
         ),
         "validation_csv": None if validation_csv is None else str(validation_csv),
     }
+
+
+def save_learning_curve(
+    training_csv: Path,
+    output_path: Path,
+    rolling_window: int = 200,
+) -> Path | None:
+    """Create a compact directional-learning dashboard from the training CSV."""
+    training_csv = Path(training_csv)
+    if not training_csv.exists():
+        return None
+    with training_csv.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return None
+
+    def series(field: str) -> np.ndarray:
+        values = []
+        for row in rows:
+            try:
+                values.append(float(row.get(field, 0.0)))
+            except (TypeError, ValueError):
+                values.append(0.0)
+        return np.asarray(values, dtype=float)
+
+    def rolling(values: np.ndarray) -> np.ndarray:
+        window = max(min(int(rolling_window), values.size), 1)
+        cumulative = np.cumsum(np.insert(values, 0, 0.0))
+        result = np.empty_like(values)
+        for idx in range(values.size):
+            start = max(0, idx + 1 - window)
+            result[idx] = (
+                cumulative[idx + 1] - cumulative[start]
+            ) / float(idx + 1 - start)
+        return result
+
+    steps = series("step")
+    reward = series("reward")
+    imbalance = series("load_imbalance_end")
+    handovers = series("handover_count")
+    left_bias = series("bias_g1_to_g0_eMBB")
+    right_bias = series("bias_g1_to_g2_eMBB")
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    axes[0, 0].plot(steps, reward, color="#8ecae6", alpha=0.18, lw=0.7)
+    axes[0, 0].plot(
+        steps, rolling(reward), color="#023047", lw=2.0,
+        label=f"rolling mean ({min(rolling_window, len(rows))})",
+    )
+    axes[0, 0].axhline(0.0, color="black", lw=0.8)
+    axes[0, 0].set(title="Scaled causal reward", ylabel="reward")
+    axes[0, 0].legend()
+
+    axes[0, 1].plot(
+        steps, rolling(imbalance), color="#d62828", lw=2.0,
+        label="final imbalance",
+    )
+    axes[0, 1].set(title="Load balancing", ylabel="imbalance")
+    axes[0, 1].legend()
+
+    axes[1, 0].plot(
+        steps, rolling(left_bias), color="#e76f51", lw=2.0,
+        label="center to left",
+    )
+    axes[1, 0].plot(
+        steps, rolling(right_bias), color="#2a9d8f", lw=2.0,
+        label="center to right",
+    )
+    axes[1, 0].axhline(0.0, color="black", lw=0.8)
+    axes[1, 0].set(
+        title="Learned directional biases",
+        xlabel="training step",
+        ylabel="bias",
+    )
+    axes[1, 0].legend()
+
+    axes[1, 1].plot(
+        steps, rolling(handovers), color="#6a4c93", lw=2.0,
+        label="handovers",
+    )
+    axes[1, 1].set(
+        title="Executed migration volume",
+        xlabel="training step",
+        ylabel="UEs per episode",
+    )
+    axes[1, 1].legend()
+
+    for axis in axes.reshape(-1):
+        axis.grid(alpha=0.25)
+    fig.suptitle("Directional upper-PPO learning curve", fontsize=14)
+    fig.tight_layout()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
 
 
 def main():
@@ -685,7 +1065,7 @@ def main():
         default=None,
         help='Optional JSON dict, for example \'{"eMBB": 50, "URLLC": 50, "mMTC": 50}\'.',
     )
-    parser.add_argument("--max-prbs-per-ue", type=int, default=20)
+    parser.add_argument("--max-prbs-per-ue", type=int, default=None)
     parser.add_argument(
         "--sla-deadband",
         type=float,
@@ -697,8 +1077,14 @@ def main():
     parser.add_argument(
         "--radio-substeps",
         type=int,
-        default=20,
+        default=100,
         help="Number of radio-service ticks simulated inside each local mobility step.",
+    )
+    parser.add_argument(
+        "--pf-averaging-window-s",
+        type=float,
+        default=0.25,
+        help="Physical duration of the proportional-fair throughput averaging window.",
     )
     parser.add_argument(
         "--radio-tick-seconds",
@@ -719,26 +1105,86 @@ def main():
     parser.add_argument(
         "--training-scenarios",
         type=str,
-        default="all",
-        help="Comma-separated curriculum scenario names, or 'all'.",
+        default="high_load_inner_asymmetric",
+        help=(
+            "Comma-separated slice-aware scenario names, or 'all'. In default "
+            "single-scenario mode this is overwritten by --single-training-scenario. "
+            "Use --curriculum-training when you intentionally want a scenario pool."
+        ),
+    )
+    parser.add_argument(
+        "--single-training-scenario",
+        type=str,
+        default="high_load_inner_asymmetric",
+        help=(
+            "Scenario used by default upper PPO training. Keeping one scenario "
+            "makes the previous-bias state and bias-smoothness reward coherent "
+            "while the policy learns."
+        ),
+    )
+    parser.add_argument(
+        "--curriculum-training",
+        action="store_true",
+        help=(
+            "Train over the comma-separated --training-scenarios pool. Leave off "
+            "for the default fixed single-scenario training."
+        ),
+    )
+    parser.add_argument(
+        "--block-curriculum-training",
+        action="store_true",
+        help=(
+            "Train over a scenario pool in long blocks: repeat one scenario for "
+            "--curriculum-block-episodes, then switch to the next scenario."
+        ),
+    )
+    parser.add_argument(
+        "--curriculum-block-episodes",
+        type=int,
+        default=0,
+        help=(
+            "Episodes to keep each scenario before switching in block curriculum. "
+            "Use 0 to compute enough episodes for --ppo-updates-per-scenario PPO updates."
+        ),
+    )
+    parser.add_argument(
+        "--ppo-updates-per-scenario",
+        type=int,
+        default=3,
+        help=(
+            "When --curriculum-block-episodes is 0, compute a block long enough "
+            "for this many PPO rollout updates on one scenario before switching."
+        ),
+    )
+    parser.add_argument(
+        "--center-gap-topology",
+        choices=tuple(CENTER_GAP_GNB_CONFIGS),
+        default="medium_270m",
+        help=(
+            "Left-center-right gNB gap topology. UE placement and traffic "
+            "remain identical across tight_220m, medium_270m, and wide_320m."
+        ),
     )
     parser.add_argument(
         "--scenario-selection",
-        choices=("cycle", "random", "staged"),
-        default="staged",
-        help="Use fixed-first staged training, deterministic cycling, or random selection.",
+        choices=("cycle", "random", "staged", "block"),
+        default="cycle",
+        help=(
+            "Select retained scenarios by deterministic cycle, random, or staged mode. "
+            "Ignored unless --curriculum-training or --block-curriculum-training is set."
+        ),
     )
     parser.add_argument(
         "--fixed-stage-episodes",
         type=int,
         default=500,
-        help="In staged mode, train only fixed-overlap scenarios for this many episodes.",
+        help="In staged mode, train retained fixed scenarios for this many episodes.",
     )
     parser.add_argument(
         "--slow-stage-episodes",
         type=int,
         default=1000,
-        help="Then train fixed plus slow scenarios for this many episodes before the full mix.",
+        help="Compatibility option; all retained scenarios currently use the fixed tier.",
     )
     parser.add_argument(
         "--max-handovers-per-local-step",
@@ -855,13 +1301,57 @@ def main():
         "--saturation-reward-weight",
         type=float,
         default=1.0,
-        help="Diagnostic saturation-improvement weight; it is not part of the PDF v15 PPO reward.",
+        help=(
+            "Weight for normalized saturation-count improvement. This prevents "
+            "allocated-utilization balancing from rewarding all cells at 100%%."
+        ),
+    )
+    parser.add_argument(
+        "--gnb-load-target",
+        type=float,
+        default=0.65,
+        help=(
+            "Preferred maximum total physical utilization per gNB. It is "
+            "raised to mean persistent demand when 0.65 is infeasible."
+        ),
+    )
+    parser.add_argument(
+        "--excess-load-reward-weight",
+        type=float,
+        default=1.0,
+        help="Weight for improvement in squared utilization above the feasible target.",
+    )
+    parser.add_argument(
+        "--served-share-reward-weight",
+        "--demand-share-reward-weight",
+        dest="served_share_reward_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for served-useful-PRB sharing improvement across gNBs. "
+            "This discourages emptying one cell while useful PRBs look balanced."
+        ),
+    )
+    parser.add_argument(
+        "--served-active-floor-reward-weight",
+        type=float,
+        default=1.0,
+        help="Weight for penalizing initially served gNBs that become nearly idle.",
+    )
+    parser.add_argument(
+        "--served-active-floor",
+        type=float,
+        default=0.20,
+        help="Minimum useful-load row total for a gNB that was active at window start.",
     )
     parser.add_argument(
         "--sla-reward-weight",
         type=float,
-        default=1.0,
-        help="Diagnostic SLA-improvement weight; it is not part of the PDF v15 PPO reward.",
+        default=0.0,
+        help=(
+            "Deprecated compatibility option. SLA is logged and may guard safe "
+            "admission, but it is excluded from the upper routing reward."
+        ),
     )
     parser.add_argument(
         "--bias-smoothing-weight",
@@ -924,7 +1414,17 @@ def main():
         "--dense-window-reward",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Return the PDF reward after every upper window (default: enabled).",
+        help="Return the PDF reward after every upper window (default: enabled). PPO with GAE requires dense per-step rewards for correct advantage estimation.",
+    )
+    parser.add_argument(
+        "--safe-admission",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the SafeAdmissionController quota gate (default: disabled). "
+            "When disabled the agent's A3 offsets are the sole driver of handovers, "
+            "giving PPO a clean bias→HO gradient without load-based fallback interference."
+        ),
     )
     parser.add_argument(
         "--use-progress-reward",
@@ -943,14 +1443,46 @@ def main():
         default=100,
         help="Flush the sampled training CSV after this many written rows.",
     )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=2,
+        help=(
+            "Number of upper-window steps to run with zero bias at the start of each episode "
+            "before the agent's first action. The SLA window and load state are populated "
+            "during warmup so the first real observation is not cold. Warmup interactions "
+            "are invisible to PPO (episode counters reset afterwards). A value of 2-4 is "
+            "recommended when using 1-step episodes."
+        ),
+    )
+    parser.add_argument(
+        "--post-handover-settle-steps",
+        type=int,
+        default=4,
+        help=(
+            "Number of local steps to run after applying the action but BEFORE opening the "
+            "radio measurement window. During these steps the A3 handover fires and PRBs "
+            "recalculate at the new gNB, so the transient coverage-gap peak is excluded from "
+            "the reward signal. Must be < local_steps_per_global. A value of handover_ttt+1 "
+            "is recommended (e.g. 4 when handover_ttt=3 and local_steps_per_global=10)."
+        ),
+    )
+    parser.add_argument(
+        "--demand-calibration-alpha",
+        type=float,
+        default=0.5,
+        help="Smoothing gain for requested-versus-achieved PRB demand calibration.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+    args = resolve_upper_training_curriculum_args(args)
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_dir = Path(args.model_dir) / f"run_{run_timestamp}"
     model_dir.mkdir(parents=True, exist_ok=True)
     training_csv = model_dir / "training_log.csv"
     validation_csv = model_dir / "validation_log.csv"
+    learning_curve_path = model_dir / "learning_curve.png"
     final_model_path = model_dir / "upper_ppo_final.zip"
     best_model_path = model_dir / "upper_ppo_best.zip"
     config_path = model_dir / "config.json"
@@ -971,7 +1503,7 @@ def main():
         "use_sumo_mobility": bool(args.use_sumo_mobility),
         "include_ue_counts": bool(args.include_ue_counts),
         "include_service_metrics": bool(args.include_service_metrics),
-        "directional_global_action": False,
+        "directional_global_action": True,
         "slice_prb_budgets": args.slice_prb_budgets,
         "max_prbs_per_ue": None if args.max_prbs_per_ue is None else int(args.max_prbs_per_ue),
         "sla_deadband": float(args.sla_deadband),
@@ -980,10 +1512,25 @@ def main():
         "local_steps_per_global": int(args.local_steps_per_global),
         "radio_substeps": int(args.radio_substeps),
         "radio_tick_seconds": effective_radio_tick_seconds,
+        "pf_averaging_window_s": float(args.pf_averaging_window_s),
+        "demand_calibration_alpha": float(args.demand_calibration_alpha),
         "radio_clock_derived": bool(args.radio_tick_seconds is None),
         "global_steps_per_episode": int(args.global_steps_per_episode),
         "upper_window_seconds": float(args.upper_window_seconds),
         "training_scenarios": str(args.training_scenarios),
+        "single_training_scenario": str(args.single_training_scenario),
+        "curriculum_training": bool(args.curriculum_training),
+        "block_curriculum_training": bool(args.block_curriculum_training),
+        "curriculum_block_episodes": int(args.curriculum_block_episodes),
+        "ppo_updates_per_scenario": int(args.ppo_updates_per_scenario),
+        "upper_training_regime": (
+            "block_curriculum" if bool(args.block_curriculum_training)
+            else "curriculum_pool" if bool(args.curriculum_training)
+            else "single_coherent_scenario"
+        ),
+        "center_gap_topology": str(
+            getattr(args, "center_gap_topology", "medium_270m")
+        ),
         "scenario_selection": str(args.scenario_selection),
         "fixed_stage_episodes": int(args.fixed_stage_episodes),
         "slow_stage_episodes": int(args.slow_stage_episodes),
@@ -994,7 +1541,15 @@ def main():
         "action_direction_reward_weight": float(args.action_direction_reward_weight),
         "load_balance_reward_weight": float(args.load_balance_reward_weight),
         "saturation_reward_weight": float(args.saturation_reward_weight),
+        "gnb_load_target": float(args.gnb_load_target),
+        "excess_load_reward_weight": float(args.excess_load_reward_weight),
+        "served_share_reward_weight": float(args.served_share_reward_weight),
+        "served_active_floor_reward_weight": float(
+            args.served_active_floor_reward_weight
+        ),
+        "served_active_floor": float(args.served_active_floor),
         "sla_reward_weight": float(args.sla_reward_weight),
+        "load_reward_scaling": "fraction_of_starting_imbalance_clipped_to_minus1_plus1",
         "global_neutral_bias_weight": float(args.global_neutral_bias_weight),
         "neutral_bias_eps": float(args.neutral_bias_eps),
         "wrong_bias_penalty_weight": float(args.wrong_bias_penalty_weight),
@@ -1015,6 +1570,9 @@ def main():
         "high_load_ues": int(args.high_load_ues),
         "terminal_reward_only": bool(not args.dense_window_reward),
         "use_progress_reward": bool(args.use_progress_reward),
+        "safe_admission": bool(args.safe_admission),
+        "warmup_steps": int(args.warmup_steps),
+        "post_handover_settle_steps": int(args.post_handover_settle_steps),
         "log_every": int(args.log_every),
         "log_flush_every": int(args.log_flush_every),
         "learning_rate": float(args.learning_rate),
@@ -1057,6 +1615,11 @@ def main():
     finally:
         env.close()
 
+    saved_learning_curve = save_learning_curve(
+        training_csv,
+        learning_curve_path,
+    )
+
     eval_env = make_env(args)
     try:
         validation = evaluate_upper_policy(
@@ -1073,6 +1636,10 @@ def main():
         "saved_final_model": str(final_model_path),
         "saved_best_model": str(best_model_path) if best_model_path.exists() else None,
         "training_csv": str(training_csv),
+        "learning_curve": (
+            None if saved_learning_curve is None
+            else str(saved_learning_curve)
+        ),
         "validation": validation,
     }
     config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

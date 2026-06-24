@@ -13,6 +13,11 @@ SAFE_EXTENDED_OFFSET_SET_DB = np.asarray(
     [-12.0, -10.0, -8.0, -6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0],
     dtype=float,
 )
+EXTENDED_1DB_OFFSET_SET_DB = np.asarray(
+    [-12.0, -11.0, -10.0, -9.0, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0,
+     -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    dtype=float,
+)
 DEFAULT_SLICE_TYPES = ("eMBB", "URLLC", "mMTC")
 EPS = 1e-9
 
@@ -294,6 +299,12 @@ def strong_heuristic_local_executor(
     return offsets
 
 
+def _snap_to_set(value: float, offset_set: np.ndarray) -> float:
+    """Return the element of offset_set nearest to value."""
+    distances = np.abs(offset_set - value)
+    return float(offset_set[np.argmin(distances)])
+
+
 def strong_directional_heuristic_local_executor(
     B: np.ndarray,
     prev_offsets: np.ndarray,
@@ -310,13 +321,30 @@ def strong_directional_heuristic_local_executor(
     max_target_rsrp_deficit_db: float = 8.0,
     slice_types: Sequence[str] = DEFAULT_SLICE_TYPES,
     allow_extended_negative_offsets: bool = True,
+    alpha_load: float = 12.0,
+    alpha_mobility: float = 3.0,
+    eta: float = 0.0,
     return_debug: bool = False,
 ):
     """Choose one A3 offset for every source-neighbor-slice direction.
 
-    The upper bias remains B[i, s]. Directionality is introduced only here:
-    every neighbor is scored independently using its own radio feasibility and
-    target load.
+    Uses a direct proportional mapping from bias to offset:
+        bias < 0  ->  raw_offset = bias * 6    (e.g. -0.1 -> -0.6, -1.0 -> -6)
+        bias > 0  ->  raw_offset = bias * 6    (e.g. +0.1 -> +0.6, +1.0 -> +6)
+        bias = 0  ->  raw_offset = 0
+
+    Safety corrections (load overload, mobility instability) add a positive
+    offset term that reduces aggressiveness. A hard veto forces the offset to
+    zero when the target is overloaded or no UE has a viable radio path.
+
+    The result is snapped to the nearest 1 dB step in EXTENDED_1DB_OFFSET_SET_DB
+    (or OFFSET_SET_DB when allow_extended_negative_offsets=False).
+
+    Parameters
+    ----------
+    alpha_load      : dB push per unit of load overload above l_safe (default 12.0)
+    alpha_mobility  : dB push per unit of combined HF+PP ratio (default 3.0)
+    eta             : EMA smoothing with previous offset in [0, 1) (default 0 = off)
     """
     B = np.asarray(B, dtype=float)
     load = np.asarray(load, dtype=float)
@@ -328,28 +356,36 @@ def strong_directional_heuristic_local_executor(
     ue_serving_gnb = np.asarray(ue_serving_gnb, dtype=int).reshape(-1)
     rsrp_matrix = np.asarray(rsrp_matrix, dtype=float)
 
-    if B.ndim != 2:
-        raise ValueError("B must have shape [num_gnbs, num_slices]")
-    num_gnbs, num_slices = B.shape
+    if B.ndim not in (2, 3):
+        raise ValueError(
+            "B must have shape [num_gnbs, num_slices] or "
+            "[num_gnbs, max_neighbors, num_slices]"
+        )
+    if B.ndim == 2:
+        num_gnbs, num_slices = B.shape
+    else:
+        num_gnbs, _bias_neighbors, num_slices = B.shape
     max_neighbors = max((len(neighbor_graph.get(i, ())) for i in range(num_gnbs)), default=0)
     expected_prev_shape = (num_gnbs, max_neighbors, num_slices)
+    if B.ndim == 3 and B.shape != expected_prev_shape:
+        raise ValueError(
+            f"Directional B must have shape {expected_prev_shape}, got {B.shape}"
+        )
     if prev_offsets.shape != expected_prev_shape:
         raise ValueError(
             f"prev_offsets must have shape {expected_prev_shape}, got {prev_offsets.shape}"
         )
-    for name, arr in {
-        "load": load,
-        "sla_violation": sla_violation,
-    }.items():
-        if arr.shape != B.shape:
-            raise ValueError(f"{name} must have shape {B.shape}, got {arr.shape}")
-    for name, arr in {
-        "ho_failure_ratio": ho_failure_ratio,
-        "pingpong_ratio": pingpong_ratio,
-    }.items():
-        if arr.shape not in (B.shape, expected_prev_shape):
+    source_slice_shape = (num_gnbs, num_slices)
+    for name, arr in {"load": load, "sla_violation": sla_violation}.items():
+        if arr.shape != source_slice_shape:
             raise ValueError(
-                f"{name} must have shape {B.shape} or {expected_prev_shape}, got {arr.shape}"
+                f"{name} must have shape {source_slice_shape}, got {arr.shape}"
+            )
+    for name, arr in {"ho_failure_ratio": ho_failure_ratio, "pingpong_ratio": pingpong_ratio}.items():
+        if arr.shape not in (source_slice_shape, expected_prev_shape):
+            raise ValueError(
+                f"{name} must have shape {source_slice_shape} or "
+                f"{expected_prev_shape}, got {arr.shape}"
             )
     if rsrp_matrix.shape != (ue_slice.size, num_gnbs):
         raise ValueError(
@@ -357,97 +393,102 @@ def strong_directional_heuristic_local_executor(
         )
 
     candidate_set = (
-        SAFE_EXTENDED_OFFSET_SET_DB
+        EXTENDED_1DB_OFFSET_SET_DB
         if allow_extended_negative_offsets
         else OFFSET_SET_DB
     )
+    min_offset = float(candidate_set[0])
+    max_offset = float(candidate_set[-1])
+
     offsets = np.zeros(expected_prev_shape, dtype=float)
     debug: Dict[Tuple[int, int, int], Dict[str, object]] = {}
 
     for gnb_idx in range(num_gnbs):
         for neighbor_slot, neighbor_idx in enumerate(neighbor_graph.get(gnb_idx, ())):
-            directional_graph = {idx: [] for idx in range(num_gnbs)}
-            directional_graph[gnb_idx] = [int(neighbor_idx)]
+            neighbor_idx = int(neighbor_idx)
             for slice_idx in range(num_slices):
-                bias = float(np.clip(B[gnb_idx, slice_idx], -1.0, 1.0))
-                target_is_safe = (
-                    float(load[int(neighbor_idx), slice_idx]) < float(l_safe)
-                )
+                bias = float(np.clip(
+                    B[gnb_idx, neighbor_slot, slice_idx]
+                    if B.ndim == 3
+                    else B[gnb_idx, slice_idx],
+                    -1.0,
+                    1.0,
+                ))
+                prev = float(prev_offsets[gnb_idx, neighbor_slot, slice_idx])
+
+                # Radio feasibility: at least one served UE can reach the neighbor.
                 source_ue_indices = np.flatnonzero(
                     (ue_serving_gnb == gnb_idx) & (ue_slice == slice_idx)
                 )
-                radio_feasible = any(
-                    float(rsrp_matrix[ue_idx, int(neighbor_idx)])
-                    >= float(rsrp_matrix[ue_idx, gnb_idx])
-                    - float(max_target_rsrp_deficit_db)
-                    for ue_idx in source_ue_indices
-                )
-                # The lower layer executes the upper instruction; it does not
-                # reinterpret its sign. Negative means make handover easier,
-                # positive means retain, and neutral means neutral. Target
-                # and radio safety may veto release, but never reverse a
-                # retain command.
-                #
-                # The bias MAGNITUDE controls how many UEs are admitted via
-                # begin_safe_admission_window (capacity = ceil(|bias| × n_ues)).
-                # That is the primary throttle. The offset set here determines
-                # which UEs are SINR-eligible; keeping the full signed range
-                # preserves a smooth learning gradient across all bias values.
-                if bias < -EPS and target_is_safe and radio_feasible:
-                    directional_candidates = candidate_set[candidate_set <= 0.0]
-                elif bias > EPS:
-                    directional_candidates = candidate_set[candidate_set >= 0.0]
+                if source_ue_indices.size == 0:
+                    radio_feasible = True
                 else:
-                    directional_candidates = np.asarray([0.0], dtype=float)
-                directional_prev = np.zeros_like(B)
-                directional_prev[gnb_idx, slice_idx] = prev_offsets[
-                    gnb_idx, neighbor_slot, slice_idx
-                ]
-                directional_hf = np.zeros_like(B)
-                directional_pp = np.zeros_like(B)
-                directional_hf[gnb_idx, slice_idx] = (
+                    rsrp_threshold = float(max_target_rsrp_deficit_db) - float(hysteresis_db)
+                    radio_feasible = any(
+                        float(rsrp_matrix[ue_idx, neighbor_idx])
+                        >= float(rsrp_matrix[ue_idx, gnb_idx]) - rsrp_threshold
+                        for ue_idx in source_ue_indices
+                    )
+
+                target_load = float(load[neighbor_idx, slice_idx])
+                target_is_safe = target_load < l_safe
+
+                # 1. Proportional mapping: bias -> raw offset
+                # Symmetric ±6 dB mapping. Safe admission, rather than offset
+                # magnitude alone, limits the number of executed handovers.
+                if abs(bias) <= EPS:
+                    raw_offset = 0.0
+                elif bias < 0.0:
+                    raw_offset = bias * 6.0
+                else:
+                    raw_offset = bias * 6.0
+
+                # 2. Safety corrections (push offset positive)
+                load_over = max(target_load - l_safe, 0.0)
+                load_safety = alpha_load * load_over
+
+                rhf = float(
                     ho_failure_ratio[gnb_idx, neighbor_slot, slice_idx]
                     if ho_failure_ratio.ndim == 3
                     else ho_failure_ratio[gnb_idx, slice_idx]
                 )
-                directional_pp[gnb_idx, slice_idx] = (
+                rpp = float(
                     pingpong_ratio[gnb_idx, neighbor_slot, slice_idx]
                     if pingpong_ratio.ndim == 3
                     else pingpong_ratio[gnb_idx, slice_idx]
                 )
-                best_score = -np.inf
-                best_offset = 0.0
-                candidates = []
+                mobility_safety = alpha_mobility * (max(rhf, 0.0) + max(rpp, 0.0))
 
-                for candidate_offset in directional_candidates:
-                    score, terms = evaluate_candidate_offset(
-                        gnb_idx=gnb_idx,
-                        slice_idx=slice_idx,
-                        candidate_offset_db=float(candidate_offset),
-                        B=B,
-                        prev_offsets=directional_prev,
-                        ue_slice=ue_slice,
-                        ue_serving_gnb=ue_serving_gnb,
-                        rsrp_matrix=rsrp_matrix,
-                        neighbor_graph=directional_graph,
-                        load=load,
-                        sla_violation=sla_violation,
-                        ho_failure_ratio=directional_hf,
-                        pingpong_ratio=directional_pp,
-                        hysteresis_db=hysteresis_db,
-                        l_safe=l_safe,
-                        slice_types=slice_types,
-                    )
-                    candidates.append(terms)
-                    if score > best_score + EPS:
-                        best_score = score
-                        best_offset = float(candidate_offset)
+                proto_offset = raw_offset + load_safety + mobility_safety
 
-                offsets[gnb_idx, neighbor_slot, slice_idx] = best_offset
-                debug[(gnb_idx, int(neighbor_idx), slice_idx)] = {
-                    "selected_offset_db": float(best_offset),
-                    "selected_score": float(best_score),
-                    "candidates": candidates,
+                # 3. Hard veto: never negative if target is unsafe or radio infeasible.
+                # Also veto if the target has no headroom for one more UE —
+                # prevents over-migration when multiple UEs are already in-flight.
+                # 0.15 = 1 typical eMBB UE (15 PRBs / 100 total).
+                target_has_headroom = (target_load + 0.15) < l_safe
+                if proto_offset < 0.0 and (not target_is_safe or not target_has_headroom or not radio_feasible):
+                    proto_offset = 0.0
+
+                # 4. Clip to valid range
+                proto_offset = float(np.clip(proto_offset, min_offset, max_offset))
+
+                # 5. Optional EMA smoothing with previous applied offset
+                if eta > 0.0:
+                    proto_offset = (1.0 - eta) * proto_offset + eta * prev
+
+                # 6. Snap to nearest 1 dB step
+                applied_offset = _snap_to_set(proto_offset, candidate_set)
+
+                offsets[gnb_idx, neighbor_slot, slice_idx] = applied_offset
+                debug[(gnb_idx, neighbor_idx, slice_idx)] = {
+                    "bias": bias,
+                    "raw_offset_db": raw_offset,
+                    "load_safety_db": load_safety,
+                    "mobility_safety_db": mobility_safety,
+                    "proto_offset_db": proto_offset,
+                    "applied_offset_db": applied_offset,
+                    "target_is_safe": target_is_safe,
+                    "radio_feasible": radio_feasible,
                 }
 
     if return_debug:

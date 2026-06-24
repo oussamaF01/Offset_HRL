@@ -553,29 +553,52 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             for slice_type in self.slice_types
         )
 
+    # Per-slice parameters for the proportional rule bias.
+    # scale:    load-difference that maps to ±1 bias (smaller = more sensitive)
+    # deadband: imbalances below this are ignored (outputs 0)
+    # min_src:  src load must exceed this before a negative (offload) bias fires
+    _RULE_BIAS_PARAMS = {
+        "eMBB":  {"scale": 0.35, "deadband": 0.10, "min_src": 0.40},
+        "URLLC": {"scale": 0.25, "deadband": 0.07, "min_src": 0.35},
+        "mMTC":  {"scale": 0.40, "deadband": 0.12, "min_src": 0.45},
+    }
+    _RULE_BIAS_DEFAULT_PARAMS = {"scale": 0.35, "deadband": 0.10, "min_src": 0.40}
+
     def _rule_bias(self):
-        # Pseudo-global bias used only for Stage-1 local TD3 pretraining.
-        # It is PRB-load based to match the upper/global-agent formulation:
-        # L_{i,s} = PRB_used_{i,s} / PRB_total_{i,s}.
-        # The fake policy now matches the clarified upper action space: a
-        # flattened per-gNB, per-slice bias matrix B = [b_i,s], not one scalar
-        # per gNB.
+        # Proportional directional rule bias b_{src,tgt,s}.
         #
-        # The local TD3 policy still does not observe PRB load directly. Its
-        # observation receives only this resulting bias plus UE counters, SLA,
-        # previous offset, and mobility counters from LocalA3OffsetEnv.
+        # raw = -(src_load - tgt_load) / scale
+        #   → large positive diff (src much more loaded) → strong negative bias (offload)
+        #   → large negative diff (tgt much more loaded) → strong positive bias (retain)
+        #
+        # Gating:
+        #   - Deadband suppresses noise from tiny imbalances.
+        #   - min_src prevents recommending offload from a lightly loaded cell.
+        #
+        # Slice-awareness: URLLC reacts faster (smaller scale & deadband),
+        # mMTC is more conservative (larger scale & deadband).
         bias = {}
-        for gnb in self.base_env.gnbs:
-            gnb_id = int(gnb.id)
-            for slice_type in self.slice_types:
-                local_load = self.base_env.estimate_slice_load(gnb_id, slice_type)
-                if local_load > 0.75:
-                    value = -1.0
-                elif local_load < 0.45:
-                    value = 1.0
-                else:
-                    value = 0.0
-                bias[(gnb_id, slice_type)] = value
+        gnb_ids = [int(gnb.id) for gnb in self.base_env.gnbs]
+        for src_id in gnb_ids:
+            for tgt_id in gnb_ids:
+                if src_id == tgt_id:
+                    continue
+                for slice_type in self.slice_types:
+                    p = self._RULE_BIAS_PARAMS.get(slice_type, self._RULE_BIAS_DEFAULT_PARAMS)
+                    src_load = self.base_env.estimate_slice_load(src_id, slice_type)
+                    tgt_load = self.base_env.estimate_slice_load(tgt_id, slice_type)
+                    diff = src_load - tgt_load
+
+                    if abs(diff) < p["deadband"]:
+                        value = 0.0
+                    else:
+                        raw = -diff / p["scale"]
+                        # Veto offload recommendation when src itself is lightly loaded
+                        if raw < 0.0 and src_load < p["min_src"]:
+                            raw = 0.0
+                        value = float(np.clip(raw, -1.0, 1.0))
+
+                    bias[(src_id, tgt_id, slice_type)] = value
         return bias
 
     def _empty_action_debug(self) -> Dict[str, object]:
@@ -755,9 +778,9 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             if slice_type in self.slice_types
         )
         bias_text = ", ".join(
-            f"g{gnb_id}:{slice_type}={float(value):+.0f}"
-            for (gnb_id, slice_type), value in sorted(biases.items())
-            if slice_type in self.slice_types
+            f"g{src}→g{tgt}:{st}={float(value):+.0f}"
+            for (src, tgt, st), value in sorted(biases.items())
+            if st in self.slice_types
         )
         print(
             "[LocalA3 scenario] "

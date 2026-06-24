@@ -79,3 +79,15 @@ def test_urllc_uses_dedicated_codeset_while_other_slices_use_default():
         assert ue.mcs == expected_mcs
         assert np.isclose(ue.spectral_efficiency, expected_rate)
         assert ue.mcs_codeset_name == expected_name
+
+
+def test_pf_window_is_constant_in_physical_time_across_radio_ticks():
+    codeset = MCSCodeset()
+    for step_dt, expected_ticks in ((0.010, 25), (0.005, 50), (0.001, 250)):
+        scheduler = ProportionalFair(
+            codeset,
+            slot_length=step_dt,
+            window_seconds=0.25,
+        )
+        assert scheduler.window_ticks == expected_ticks
+        assert np.isclose(scheduler.window_seconds, 0.25)

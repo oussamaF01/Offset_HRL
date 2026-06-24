@@ -12,6 +12,7 @@ from train_upper_ppo_3gnb import (
     QOS_SCALAR_FIELDS,
     UpperTrainingCsvCallback,
     make_env,
+    save_learning_curve,
 )
 
 
@@ -19,16 +20,16 @@ def test_upper_info_exposes_window_qos_matrices():
     env = GlobalPPO3GNBEnv(
         seed=9,
         scenario_mode="curriculum",
-        training_scenarios="mixed_g0_release",
+        training_scenarios="fixed_center_embb_left_right",
         upper_window_seconds=1.0,
-        local_steps_per_global=1,
+        local_steps_per_global=10,
         radio_substeps=2,
         terminal_reward_only=False,
     )
     try:
         obs, _info = env.reset()
         _obs, _reward, _terminated, _truncated, info = env.step(
-            np.zeros_like(obs[:9], dtype=np.float32)
+            np.zeros(env.action_space.shape, dtype=np.float32)
         )
         qos = info["qos"]
         for field in QOS_SCALAR_FIELDS:
@@ -37,11 +38,21 @@ def test_upper_info_exposes_window_qos_matrices():
             assert np.asarray(qos[key]).shape == (3, 3)
         assert qos["network_throughput_mbps"] >= 0.0
         assert qos["network_queue_kbits"] >= 0.0
+        assert np.asarray(info["load_matrix_start"]).shape == (3, 3)
+        assert np.asarray(info["load_matrix_end"]).shape == (3, 3)
+        assert np.isclose(
+            info["network_total_load_start"],
+            np.sum(info["load_matrix_start"]),
+        )
+        assert np.isclose(
+            info["network_total_load_end"],
+            np.sum(info["load_matrix_end"]),
+        )
     finally:
         env.close()
 
 
-def test_training_csv_contains_qos_columns():
+def test_training_csv_is_compact_and_contains_before_after_loads():
     args = argparse.Namespace(
         seed=2,
         n_gnbs=3,
@@ -49,7 +60,7 @@ def test_training_csv_contains_qos_columns():
         include_service_metrics=False,
         use_sumo_mobility=False,
         radio_substeps=1,
-        local_steps_per_global=1,
+        local_steps_per_global=10,
         global_steps_per_episode=2,
         scenario_mode="curriculum",
         snapshot_scenario="mixed",
@@ -67,7 +78,8 @@ def test_training_csv_contains_qos_columns():
         directional_global_action=False,
         sla_deadband=0.05,
         upper_window_seconds=2.0,
-        training_scenarios="balanced_mixed_hold",
+        post_handover_settle_steps=4,
+        training_scenarios="fixed_center_embb_left_right",
         scenario_selection="cycle",
     )
     env = make_env(args)
@@ -94,6 +106,83 @@ def test_training_csv_contains_qos_columns():
         with csv_path.open(newline="", encoding="utf-8") as fh:
             row = next(csv.DictReader(fh))
     assert "network_throughput_mbps" in row
-    assert "qos_completed_delay_ms_matrix" in row
-    assert "qos_throughput_mbps_g0_eMBB" in row
+    assert row["ppo_update_index"] == "0"
+    assert row["rollout_step_in_update"] == "1"
+    assert row["policy_has_updated"] == "False"
+    assert "qos_completed_delay_ms_matrix" not in row
+    assert "obs_0" not in row
+    assert "action_0" not in row
+    assert row["post_handover_settle_steps"] == "4"
+    assert row["radio_measurement_steps"] == "6"
+    assert row["load_measurement_mode"] == "post_settle_window_average_useful_prbs"
+    assert "load_start_g0_eMBB" not in row
+    assert "load_end_g0_eMBB" not in row
+    assert "demand_load_start_g0_eMBB" in row
+    assert "demand_load_end_g0_eMBB" in row
+    assert "useful_load_start_g0_eMBB" in row
+    assert "useful_load_end_g0_eMBB" in row
+    assert "gnb_demand_load_start_g0" in row
+    assert "gnb_demand_load_end_g0" in row
+    assert "gnb_useful_load_start_g0" in row
+    assert "gnb_useful_load_end_g0" in row
+    assert "slice_demand_load_start_eMBB" in row
+    assert "slice_demand_load_end_eMBB" in row
+    assert "slice_useful_load_start_eMBB" in row
+    assert "slice_useful_load_end_eMBB" in row
+    assert "network_total_load_start" not in row
+    assert "network_total_load_end" not in row
+    assert "ppo_network_demand_load_start" in row
+    assert "ppo_network_demand_load_end" in row
+    assert "radio_network_useful_load_end" not in row
+    assert "radio_network_total_useful_load_start" in row
+    assert "radio_network_total_useful_load_end" in row
+    assert "radio_mean_gnb_useful_load_start" in row
+    assert "radio_mean_gnb_useful_load_end" in row
+    assert "radio_max_gnb_useful_load_start" in row
+    assert "radio_max_gnb_useful_load_end" in row
+    assert "reward_served_share_improvement" in row
+    assert "reward_served_share_improvement_raw" in row
+    assert "served_share_cost_start" in row
+    assert "served_share_cost_end" in row
+    assert "reward_served_active_floor" in row
+    assert "reward_served_active_floor_raw" in row
+    assert "served_active_floor_cost_start" in row
+    assert "served_active_floor_cost_end" in row
+    assert "served_active_floor" in row
+    assert "served_active_floor_reference_g0" in row
+    assert "served_active_floor_reference_g1" in row
+    assert "served_active_floor_reference_g2" in row
+    assert float(row["radio_max_gnb_useful_load_start"]) <= 1.0 + 1e-9
+    assert float(row["radio_max_gnb_useful_load_end"]) <= 1.0 + 1e-9
     assert float(row["network_queue_kbits"]) >= 0.0
+
+
+def test_training_csv_generates_learning_curve():
+    with tempfile.TemporaryDirectory() as directory:
+        csv_path = Path(directory) / "training.csv"
+        graph_path = Path(directory) / "learning_curve.png"
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "step", "reward", "load_imbalance_end",
+                    "handover_count", "bias_g1_to_g0_eMBB",
+                    "bias_g1_to_g2_eMBB",
+                ],
+            )
+            writer.writeheader()
+            for step in range(1, 21):
+                writer.writerow({
+                    "step": step,
+                    "reward": step / 20.0,
+                    "load_imbalance_end": 1.0 - step / 20.0,
+                    "handover_count": min(step / 10.0, 3.0),
+                    "bias_g1_to_g0_eMBB": 0.2,
+                    "bias_g1_to_g2_eMBB": -step / 20.0,
+                })
+
+        result = save_learning_curve(csv_path, graph_path, rolling_window=5)
+
+        assert result == graph_path
+        assert graph_path.exists()
+        assert graph_path.stat().st_size > 0

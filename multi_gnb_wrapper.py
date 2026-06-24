@@ -12,6 +12,7 @@ import gymnasium as gym
 import numpy as np
 
 from slice_ran import UE, CBR
+from safe_admission_controller import SafeAdmissionController
 from traffic_generators import CbrSource, FixedPacketCbrSource
 
 
@@ -59,6 +60,7 @@ class MultiGNBWrapper(gym.Env):
         step_dt: float = 1e-3,
         mobility_dt: Optional[float] = None,
         radio_substeps: int = 1,
+        pf_averaging_window_s: float = 0.25,
         max_episode_steps: int = 100,
         disconnect_sinr_db: float = -100.0,
         degradation_zones=None,
@@ -88,6 +90,9 @@ class MultiGNBWrapper(gym.Env):
         max_handovers_per_episode: int = 20,
         safe_admission_enabled: bool = False,
         safe_admission_load_limits: Optional[Dict[str, float]] = None,
+        safe_admission_bias_deadband: float = 0.05,
+        safe_admission_max_target_sla_severity: float = 0.50,
+        neutralize_offsets_when_quota_exhausted: bool = False,
         embb_min_delivery_ratio: float = 0.80,
         urllc_max_failure_ratio: float = 0.01,
         mmtc_max_failure_ratio: float = 0.01,
@@ -121,6 +126,13 @@ class MultiGNBWrapper(gym.Env):
         self.step_dt = float(step_dt)
         self.mobility_dt = float(self.step_dt if mobility_dt is None else mobility_dt)
         self.radio_substeps = max(1, int(radio_substeps))
+        self.pf_averaging_window_s = max(
+            float(pf_averaging_window_s), float(self.step_dt)
+        )
+        # How many substeps between scheduler re-runs.
+        # stride=5 gives packets two scheduling rounds within the 10ms URLLC
+        # deadline (stride=10 caused 0.15% SLA failures under queue backlog).
+        self._radio_sched_stride = min(5, self.radio_substeps)
         self.max_episode_steps = int(max_episode_steps)
         self.disconnect_sinr_db = float(disconnect_sinr_db)
         self.degradation_zones = list(degradation_zones or [])
@@ -220,20 +232,19 @@ class MultiGNBWrapper(gym.Env):
         }
         for slice_type, value in dict(safe_admission_load_limits or {}).items():
             self.safe_admission_load_limits[self.normalize_slice_type(slice_type)] = float(value)
-        self._safe_admission_bias: Dict[Tuple[int, str], float] = {}
-        self._safe_admission_source_excess: Dict[Tuple[int, str], float] = {}
-        self._safe_admission_target_headroom: Dict[Tuple[int, int, str], float] = {}
-        self._safe_admission_capacities: Dict[Tuple[int, int, str], int] = {}
-        self._safe_admission_accepted: Dict[Tuple[int, int, str], int] = {}
-        self._safe_admission_source_capacities: Dict[Tuple[int, str], int] = {}
-        self._safe_admission_source_accepted: Dict[Tuple[int, str], int] = {}
-        self._safe_admission_stats: Dict[str, int] = {}
-        self._reset_safe_admission_stats()
+        self.neutralize_offsets_when_quota_exhausted = bool(
+            neutralize_offsets_when_quota_exhausted
+        )
+        self.safe_admission_controller = SafeAdmissionController(
+            bias_deadband=safe_admission_bias_deadband,
+            max_target_sla_severity=safe_admission_max_target_sla_severity,
+        )
         self.embb_min_delivery_ratio = float(np.clip(embb_min_delivery_ratio, 0.0, 1.0))
         self.urllc_max_failure_ratio = max(float(urllc_max_failure_ratio), 0.0)
         self.mmtc_max_failure_ratio = max(float(mmtc_max_failure_ratio), 0.0)
         self._sla_window_stats: Dict[Tuple[int, str], Dict[str, float]] = {}
         self.begin_sla_window()
+        self.begin_radio_measurement_window()
         self._metric_cache_token = 0
         self._link_metrics_cache: Dict[Tuple[int, int], Dict[str, float]] = {}
         self._gnb_load_cache: Dict[int, float] = {}
@@ -339,7 +350,7 @@ class MultiGNBWrapper(gym.Env):
                 continue
             if self.normalize_slice_type(getattr(ue, "slice_type", "eMBB")) != wanted:
                 continue
-            used_prbs += int(max(getattr(ue, "useful_prbs", getattr(ue, "prbs", 0)), 0))
+            used_prbs += int(max(getattr(ue, "prbs", 0), 0))
 
         return used_prbs
 
@@ -360,19 +371,24 @@ class MultiGNBWrapper(gym.Env):
 
     def estimate_slice_load(self, gnb_id: int, slice_type: str) -> float:
         """
-        Upper-agent HRL load definition:
-            L_{i,s} = PRB_used_{i,s} / PRB_total_{i,s}
+        Physical allocated-utilization contribution:
+            U_{i,s} = useful_allocated_PRBs_{i,s} / PRB_total_i
 
-        The numerator is the allocated PRBs of connected UEs served by gNB i
-        and belonging to slice s. The denominator prefers the matching L1
-        slice budget, falling back to the gNB-wide PRB count only when no
-        slice-level budget exists. UE count is deliberately not used here.
+        Every slice uses the same physical gNB-wide denominator, normally
+        100 PRBs. The numerator comes from the radio scheduler's useful PRB
+        allocation for connected UEs of the slice. Therefore:
+
+            total_utilization_i = sum_s U_{i,s} <= 1
+
+        Persistent ``upper_demand_prbs`` remains separate and is used only to
+        estimate the extra capacity required by a candidate handover.
         """
-        total_prbs = self.get_slice_prb_budget(gnb_id, slice_type)
+        gnb = self._get_gnb_by_id(gnb_id)
+        total_prbs = int(max(getattr(gnb, "n_prbs", 0), 0))
         if total_prbs <= 0:
             return 0.0
-        used_prbs = self.get_slice_used_prbs(gnb_id, slice_type)
-        return self._clip01(used_prbs / float(total_prbs))
+        useful_prbs = self.get_slice_used_prbs(gnb_id, slice_type)
+        return self._clip01(useful_prbs / float(total_prbs))
 
     def _estimate_bits_per_prb_for_ue(self, ue: UE) -> float:
         codeset = self._mcs_codeset_for_slice(getattr(ue, "slice_type", "eMBB"))
@@ -428,6 +444,72 @@ class MultiGNBWrapper(gym.Env):
         self._sla_window_stats = {
             key: self._empty_sla_window_counter()
             for key in self._global_agent_keys()
+        }
+
+    def begin_radio_measurement_window(self) -> None:
+        """Reset physical PRB/service accounting for one upper window."""
+        self._radio_window_samples = 0
+        self._radio_window_slice_useful_prbs = {
+            (int(gnb.id), slice_type): 0.0
+            for gnb in self.gnbs
+            for slice_type in self._configured_slice_types()
+        }
+        self._radio_window_ue_stats: Dict[int, Dict[str, float]] = {}
+
+    def _accumulate_radio_measurement_sample(self) -> None:
+        self._radio_window_samples += 1
+        for ue in self._ues.values():
+            if not ue.connected or ue.serving_gnb is None:
+                continue
+            ue_id = int(ue.id)
+            serving_id = int(ue.serving_gnb)
+            slice_type = self.normalize_slice_type(
+                getattr(ue, "slice_type", "eMBB")
+            )
+            allocated_prbs = max(float(getattr(ue, "prbs", 0.0)), 0.0)
+            useful_prbs = max(float(getattr(ue, "useful_prbs", 0.0)), 0.0)
+            scheduled_bits = max(
+                float(getattr(ue, "scheduled_bits", 0.0)), 0.0
+            )
+            served_bits = max(float(getattr(ue, "bits", 0.0)), 0.0)
+            key = (serving_id, slice_type)
+            self._radio_window_slice_useful_prbs[key] = (
+                self._radio_window_slice_useful_prbs.get(key, 0.0)
+                + allocated_prbs
+            )
+            stats = self._radio_window_ue_stats.setdefault(
+                ue_id,
+                {
+                    "useful_prbs": 0.0,
+                    "scheduled_bits": 0.0,
+                    "served_bits": 0.0,
+                    "samples": 0.0,
+                },
+            )
+            stats["useful_prbs"] += useful_prbs
+            stats["scheduled_bits"] += scheduled_bits
+            stats["served_bits"] += served_bits
+            stats["samples"] += 1.0
+
+    def get_window_average_slice_loads(self) -> Dict[Tuple[int, str], float]:
+        samples = max(int(self._radio_window_samples), 1)
+        loads = {}
+        for gnb in self.gnbs:
+            gnb_id = int(gnb.id)
+            capacity = max(float(getattr(gnb, "n_prbs", 0)), 1.0)
+            for slice_type in self._configured_slice_types():
+                useful_sum = self._radio_window_slice_useful_prbs.get(
+                    (gnb_id, slice_type), 0.0
+                )
+                loads[(gnb_id, slice_type)] = self._clip01(
+                    useful_sum / (samples * capacity)
+                )
+        return loads
+
+    def get_ue_radio_window_stats(self) -> Dict[int, Dict[str, float]]:
+        return {
+            int(ue_id): dict(values)
+            for ue_id, values in self._radio_window_ue_stats.items()
         }
 
     def _sla_window_metrics_for_key(self, key: Tuple[int, str]) -> Dict[str, float]:
@@ -661,6 +743,7 @@ class MultiGNBWrapper(gym.Env):
         self._last_ho_source = {}
         self._ue_episode_handovers = {}
         self._episode_handover_count = 0
+        self.safe_admission_controller.reset_window()
         self._invalidate_metric_caches()
 
         for gnb in self.gnbs:
@@ -758,101 +841,100 @@ class MultiGNBWrapper(gym.Env):
         self._a3_offsets[key] = float(offset_db)
 
     def _reset_safe_admission_stats(self) -> None:
-        self._safe_admission_stats = {
-            "eligible": 0,
-            "accepted": 0,
-            "rejected_no_pressure": 0,
-            "rejected_no_source_excess": 0,
-            "rejected_no_target_headroom": 0,
-            "rejected_capacity": 0,
-            "rejected_target_safety": 0,
-            "rejected_pingpong_guard": 0,
-            "rejected_ue_episode_budget": 0,
-            "rejected_episode_budget": 0,
-            "rejected_step_budget": 0,
-        }
+        self.safe_admission_controller.stats.clear()
 
     def begin_safe_admission_window(
         self,
-        bias_matrix,
+        directional_bias,
         slice_types: Tuple[str, ...] = SLICE_TYPE_ORDER,
     ) -> Dict[Tuple[int, int, str], int]:
-        """Freeze v15 admission capacities for one upper control window."""
-        bias = np.asarray(bias_matrix, dtype=float)
+        """Reset and freeze directional release quotas for one upper window."""
+        bias = np.asarray(directional_bias, dtype=float)
         normalized_slices = tuple(self.normalize_slice_type(s) for s in slice_types)
-        if bias.shape != (self.n_gnbs, len(normalized_slices)):
+        neighbor_graph = {
+            int(source.id): [
+                int(target.id) for target in self.gnbs
+                if int(target.id) != int(source.id)
+            ]
+            for source in self.gnbs
+        }
+        max_neighbors = max(map(len, neighbor_graph.values()), default=0)
+        if bias.shape == (self.n_gnbs, len(normalized_slices)):
+            bias = np.repeat(bias[:, None, :], max_neighbors, axis=1)
+        if bias.shape != (self.n_gnbs, max_neighbors, len(normalized_slices)):
             raise ValueError(
-                "bias_matrix must have shape "
-                f"{(self.n_gnbs, len(normalized_slices))}, got {bias.shape}"
+                "directional_bias must have shape "
+                f"{(self.n_gnbs, max_neighbors, len(normalized_slices))}, got {bias.shape}"
             )
 
         loads = self.get_slice_loads()
-        self._safe_admission_bias = {}
-        self._safe_admission_source_excess = {}
-        self._safe_admission_target_headroom = {}
-        self._safe_admission_capacities = {}
-        self._safe_admission_accepted = {}
-        self._safe_admission_source_capacities = {}
-        self._safe_admission_source_accepted = {}
-        self._reset_safe_admission_stats()
-
-        for s_idx, slice_type in enumerate(normalized_slices):
-            slice_average = float(np.mean([
-                loads.get((int(gnb.id), slice_type), 0.0) for gnb in self.gnbs
+        ue_counts = {
+            (int(gnb.id), slice_type): self.get_slice_ue_count(
+                int(gnb.id), slice_type
+            )
+            for gnb in self.gnbs
+            for slice_type in normalized_slices
+        }
+        balance_targets = {
+            slice_type: float(np.mean([
+                loads.get((int(gnb.id), slice_type), 0.0)
+                for gnb in self.gnbs
             ]))
-            for source_idx, source_gnb in enumerate(self.gnbs):
-                source_id = int(source_gnb.id)
-                source_load = float(loads.get((source_id, slice_type), 0.0))
-                source_excess = max(0.0, source_load - slice_average)
-                source_ues = self.get_slice_ue_count(source_id, slice_type)
-                source_bias = float(np.clip(bias[source_idx, s_idx], -1.0, 1.0))
-                pressure = max(0.0, -source_bias)
-                self._safe_admission_bias[(source_id, slice_type)] = source_bias
-                self._safe_admission_source_excess[(source_id, slice_type)] = source_excess
-                source_key = (source_id, slice_type)
-                # PPO actions arrive as float32. Values such as 0.2 may become
-                # 0.20000000298, and a raw ceil would incorrectly turn
-                # 0.2 * 10 UEs into a quota of 3 instead of 2.
-                raw_capacity = pressure * float(source_ues)
-                source_capacity = int(
-                    math.ceil(raw_capacity - 1e-7 * max(1.0, float(source_ues)))
-                )
-                source_capacity = max(0, min(source_capacity, source_ues))
-                self._safe_admission_source_capacities[source_key] = source_capacity
-                self._safe_admission_source_accepted[source_key] = 0
-
-                for target_gnb in self.gnbs:
-                    target_id = int(target_gnb.id)
-                    if target_id == source_id:
-                        continue
-                    target_load = float(loads.get((target_id, slice_type), 0.0))
-                    safe_limit = float(
-                        self.safe_admission_load_limits.get(slice_type, 0.80)
-                    )
-                    target_headroom = max(0.0, safe_limit - target_load)
-                    # The upper bias is the admission strategy.  Its sign says
-                    # release/retain and its magnitude directly controls the
-                    # fraction of source UEs that may be admitted:
-                    #   -1.0 -> up to 100%, -0.5 -> up to 50%.
-                    # The safe layer does not reinterpret whether the source
-                    # "should" release based on average load. Radio feasibility
-                    # and target choice remain lower-layer responsibilities;
-                    # target load safety is checked again for every candidate.
-                    key = (source_id, target_id, slice_type.upper())
-                    self._safe_admission_target_headroom[key] = target_headroom
-                    self._safe_admission_capacities[key] = source_capacity
-                    self._safe_admission_accepted[key] = 0
-
-        return dict(self._safe_admission_capacities)
+            for slice_type in normalized_slices
+        }
+        self.safe_admission_controller.begin_upper_window(
+            directional_bias=bias,
+            neighbor_graph=neighbor_graph,
+            gnb_ids=[int(gnb.id) for gnb in self.gnbs],
+            slice_types=normalized_slices,
+            loads=loads,
+            ue_counts=ue_counts,
+            balance_targets=balance_targets,
+            remaining_handover_budget=max(
+                self.max_handovers_per_episode - self._episode_handover_count,
+                0,
+            ),
+        )
+        return {
+            (source_id, target_id, slice_type.upper()):
+            self.safe_admission_controller.direction_quota.get(
+                (source_id, target_id, slice_type), 0
+            )
+            for source_id, targets in neighbor_graph.items()
+            for target_id in targets
+            for slice_type in normalized_slices
+        }
 
     def get_safe_admission_state(self) -> Dict:
+        state = self.safe_admission_controller.get_state()
+        direction_capacities = {}
+        direction_accepted = {}
+        for source in self.gnbs:
+            for target in self.gnbs:
+                if int(source.id) == int(target.id):
+                    continue
+                for slice_type in SLICE_TYPE_ORDER:
+                    source_key = (int(source.id), slice_type)
+                    direction_key = (
+                        int(source.id),
+                        int(target.id),
+                        slice_type.upper(),
+                    )
+                    direction_capacities[direction_key] = state[
+                        "direction_quota"
+                    ].get(
+                        (int(source.id), int(target.id), slice_type), 0
+                    )
+                    direction_accepted[direction_key] = state[
+                        "direction_used"
+                    ].get((int(source.id), int(target.id), slice_type), 0)
         return {
             "enabled": bool(self.safe_admission_enabled),
-            "capacities": dict(self._safe_admission_capacities),
-            "accepted": dict(self._safe_admission_accepted),
-            "source_capacities": dict(self._safe_admission_source_capacities),
-            "source_accepted": dict(self._safe_admission_source_accepted),
-            "stats": dict(self._safe_admission_stats),
+            **state,
+            "capacities": direction_capacities,
+            "accepted": direction_accepted,
+            "source_capacities": dict(state["quota"]),
+            "source_accepted": dict(state["used"]),
         }
 
     def _safe_admission_allows(
@@ -866,61 +948,93 @@ class MultiGNBWrapper(gym.Env):
             return True
 
         normalized_slice = self.normalize_slice_type(slice_type)
-        key = (int(source_id), int(target_id), normalized_slice.upper())
-        bias = float(self._safe_admission_bias.get((int(source_id), normalized_slice), 0.0))
-        pressure = max(0.0, -bias)
-        if pressure <= 0.0:
-            self._safe_admission_stats["rejected_no_pressure"] += 1
-            return False
-
-        target_headroom = float(self._safe_admission_target_headroom.get(key, 0.0))
-        if target_headroom <= 0.0:
-            self._safe_admission_stats["rejected_no_target_headroom"] += 1
-            return False
-
-        source_key = (int(source_id), normalized_slice)
-        if self._safe_admission_source_accepted.get(
-            source_key, 0
-        ) >= self._safe_admission_source_capacities.get(source_key, 0):
-            self._safe_admission_stats["rejected_capacity"] += 1
-            return False
-
         loads = self.get_slice_loads()
         target_load = float(loads.get((int(target_id), normalized_slice), 0.0))
-        target_budget = max(self.get_slice_prb_budget(target_id, normalized_slice), 1)
-        ue_prbs = max(
-            int(getattr(ue, "useful_prbs", 0)),
-            int(getattr(ue, "prbs", 0)),
+        target_total_load = float(sum(
+            loads.get((int(target_id), slice_name), 0.0)
+            for slice_name in SLICE_TYPE_ORDER
+        ))
+        target_gnb = self._get_gnb_by_id(target_id)
+        source_gnb = self._get_gnb_by_id(source_id)
+        target_budget = max(
+            int(getattr(
+                target_gnb,
+                "n_prbs",
+                self.get_slice_prb_budget(target_id, normalized_slice),
+            )),
             1,
         )
-        load_after = target_load + ue_prbs / float(target_budget)
-        safe_limit = float(self.safe_admission_load_limits.get(normalized_slice, 0.80))
-        if load_after > safe_limit + 1e-12:
-            self._safe_admission_stats["rejected_target_safety"] += 1
-            return False
-
-        # This method is intentionally a read-only eligibility check. Quota is
-        # consumed only after _perform_handover() confirms success.
-        return True
+        source_budget = max(
+            int(getattr(
+                source_gnb,
+                "n_prbs",
+                self.get_slice_prb_budget(source_id, normalized_slice),
+            )),
+            1,
+        )
+        persistent_demand = int(getattr(ue, "upper_demand_prbs", 0))
+        ue_prbs = (
+            max(persistent_demand, 1)
+            if persistent_demand > 0
+            else max(
+                int(getattr(ue, "useful_prbs", 0)),
+                int(getattr(ue, "prbs", 0)),
+                1,
+            )
+        )
+        candidate = {
+            "ue_id": int(getattr(ue, "id", -1)),
+            "source_id": int(source_id),
+            "target_id": int(target_id),
+            "slice_type": normalized_slice,
+            "a3_margin": 0.0,
+            "target_load": target_load,
+            "target_total_load": target_total_load,
+            "target_load_increment": ue_prbs / float(target_budget),
+            "source_load_contribution": ue_prbs / float(source_budget),
+            "target_safe_limit": float(
+                self.safe_admission_load_limits.get(normalized_slice, 0.80)
+            ),
+            "target_total_safe_limit": 1.0,
+            "target_sla_severity": self.get_slice_sla_severity().get(
+                (int(target_id), normalized_slice), 0.0
+            ),
+        }
+        accepted, _rejected, _debug = (
+            self.safe_admission_controller.admit_candidates([candidate])
+        )
+        return bool(accepted)
 
     def _commit_safe_admission(
         self,
         source_id: int,
         target_id: int,
         slice_type: str,
+        candidate: Optional[Dict] = None,
     ) -> None:
         """Consume one admission slot after a successful handover."""
         if not self.safe_admission_enabled:
             return
 
         normalized_slice = self.normalize_slice_type(slice_type)
-        key = (int(source_id), int(target_id), normalized_slice.upper())
-        source_key = (int(source_id), normalized_slice)
-        self._safe_admission_accepted[key] = self._safe_admission_accepted.get(key, 0) + 1
-        self._safe_admission_source_accepted[source_key] = (
-            self._safe_admission_source_accepted.get(source_key, 0) + 1
-        )
-        self._safe_admission_stats["accepted"] += 1
+        decision = dict(candidate or {})
+        decision.update({
+            "source_id": int(source_id),
+            "target_id": int(target_id),
+            "slice_type": normalized_slice,
+        })
+        self.safe_admission_controller.commit(decision)
+        if (
+            self.neutralize_offsets_when_quota_exhausted
+            and self.safe_admission_controller.quota_exhausted(
+                source_id, normalized_slice
+            )
+        ):
+            for target in self.gnbs:
+                if int(target.id) != int(source_id):
+                    self.set_a3_offset(
+                        source_id, int(target.id), normalized_slice, 0.0
+                    )
 
     def _handover_stability_allows(
         self,
@@ -931,13 +1045,28 @@ class MultiGNBWrapper(gym.Env):
         tick: int,
     ) -> bool:
         """Apply persistent per-UE and per-episode guards before admission."""
+        reason = self._handover_stability_rejection_reason(
+            ue, source_id, target_id, serving_gnb, tick
+        )
+        if reason is not None:
+            self.safe_admission_controller.stats[f"rejected_{reason}"] += 1
+            return False
+        return True
+
+    def _handover_stability_rejection_reason(
+        self,
+        ue: UE,
+        source_id: int,
+        target_id: int,
+        serving_gnb,
+        tick: int,
+    ) -> Optional[str]:
+        """Return a stable machine-readable guard reason, or ``None``."""
         ue_id = int(ue.id)
         if self._episode_handover_count >= self.max_handovers_per_episode:
-            self._safe_admission_stats["rejected_episode_budget"] += 1
-            return False
+            return "episode_budget"
         if self._ue_episode_handovers.get(ue_id, 0) >= self.max_handovers_per_ue_episode:
-            self._safe_admission_stats["rejected_ue_episode_budget"] += 1
-            return False
+            return "ue_episode_budget"
 
         last = self._last_ho.get(ue_id)
         previous_source = self._last_ho_source.get(ue_id)
@@ -953,9 +1082,8 @@ class MultiGNBWrapper(gym.Env):
                     )
                 )
                 if serving_sinr_db > self.a3_emergency_sinr_db:
-                    self._safe_admission_stats["rejected_pingpong_guard"] += 1
-                    return False
-        return True
+                    return "pingpong_guard"
+        return None
 
     def get_a3_offset(self, serving_id: int, neighbor_id: int, slice_type: str) -> float:
         key = (int(serving_id), int(neighbor_id), self.normalize_slice_type(slice_type).upper())
@@ -1123,7 +1251,22 @@ class MultiGNBWrapper(gym.Env):
 
     def _run_radio_substeps(self):
         self._sync_ue_step_counters()
-        for _ in range(self.radio_substeps):
+        # UE positions are fixed within a local step (mobility advances once before
+        # this call), so SINR and the fading vector do not change between substeps.
+        # The scheduler is re-run every _radio_sched_stride ticks instead of every
+        # tick, avoiding redundant fading + PF computation while still serving
+        # newly-arrived packets within the URLLC SLA deadline window.
+        #
+        # Handover safety: _evaluate_a3_handovers() always runs before this method.
+        # Substep i=0 (which satisfies i % stride == 0) always fires the full
+        # scheduler, so any handover that completed before this call is immediately
+        # reflected in the cached PRB allocation for the new gNB.
+        sched_stride = self._radio_sched_stride
+        _sched_capacity: Dict[int, float] = {}
+        _rx_probs: Dict[int, float] = {}
+        _allocated_prbs: Dict[int, int] = {}
+
+        for i in range(self.radio_substeps):
             before = {
                 int(ue.id): (
                     int(ue.serving_gnb) if ue.serving_gnb is not None else None,
@@ -1133,8 +1276,33 @@ class MultiGNBWrapper(gym.Env):
                 for ue in self._ues.values()
             }
             self._advance_traffic_one_substep()
-            self._simulate_radio_and_service()
+
+            if i % sched_stride == 0:
+                # Full channel + scheduler: runs on substep 0 and every
+                # sched_stride ticks thereafter.  Refreshes the cache so that
+                # packets that arrived since the last scheduler run are served.
+                self._simulate_radio_and_service()
+                for ue in self._ues.values():
+                    uid = int(ue.id)
+                    _sched_capacity[uid] = float(getattr(ue, "scheduled_bits", 0.0))
+                    _rx_probs[uid] = self._scalar_rx_probability(getattr(ue, "p", 0.0))
+                    _allocated_prbs[uid] = int(getattr(ue, "prbs", 0))
+            else:
+                # Replay: restore cached capacity, let transmission_step cap it
+                # against the current queue and update the PF history.
+                for ue in self._ues.values():
+                    if not ue.connected or ue.serving_gnb is None:
+                        continue
+                    uid = int(ue.id)
+                    ue.bits = _sched_capacity.get(uid, 0.0)
+                    received = bool(
+                        _allocated_prbs.get(uid, 0)
+                        and self._rng.random() < _rx_probs.get(uid, 0.0)
+                    )
+                    ue.transmission_step(received)
+
             self._update_delay_after_service()
+            self._accumulate_radio_measurement_sample()
             for ue in self._ues.values():
                 if hasattr(ue, "update_sla_expirations"):
                     ue.update_sla_expirations()
@@ -1190,6 +1358,9 @@ class MultiGNBWrapper(gym.Env):
         t = int(self._step_count)
 
         candidates = []
+        failure_ratios = self.get_handover_failure_ratios()
+        pingpong_ratios = self.get_ping_pong_ratios()
+        target_sla = self.get_slice_sla_severity()
         for ue in list(self._ues.values()):
             if not ue.connected or ue.serving_gnb is None:
                 continue
@@ -1246,53 +1417,130 @@ class MultiGNBWrapper(gym.Env):
                             - float(offset)
                             - self.a3_hysteresis_db
                         )
-                        candidates.append((
-                            float(margin),
-                            ue,
-                            serving_gnb,
-                            neighbor_gnb,
+                        normalized_slice = self.normalize_slice_type(slice_type)
+                        source_budget = max(
+                            int(getattr(serving_gnb, "n_prbs", 0)),
+                            1,
+                        )
+                        target_budget = max(
+                            int(getattr(neighbor_gnb, "n_prbs", 0)),
+                            1,
+                        )
+                        persistent_demand = int(
+                            getattr(ue, "upper_demand_prbs", 0)
+                        )
+                        ue_prbs = (
+                            max(persistent_demand, 1)
+                            if persistent_demand > 0
+                            else max(
+                                int(getattr(ue, "useful_prbs", 0)),
+                                int(getattr(ue, "prbs", 0)),
+                                1,
+                            )
+                        )
+                        direction_key = (
                             serving_id,
                             neighbor_id,
-                            slice_type,
-                            float(rsrp_serving),
-                            float(rsrp_neighbor),
-                        ))
+                            normalized_slice.upper(),
+                        )
+                        candidates.append({
+                            "ue_id": ue_id,
+                            "source_id": serving_id,
+                            "target_id": neighbor_id,
+                            "slice_type": normalized_slice,
+                            "a3_margin": float(margin),
+                            "radio_delta_db": float(rsrp_neighbor)
+                            - float(rsrp_serving),
+                            "rsrp_serving_dbm": float(rsrp_serving),
+                            "rsrp_target_dbm": float(rsrp_neighbor),
+                            "handover_failure_ratio": float(
+                                failure_ratios.get(direction_key, 0.0)
+                            ),
+                            "pingpong_ratio": float(
+                                pingpong_ratios.get(direction_key, 0.0)
+                            ),
+                            "target_sla_severity": float(
+                                target_sla.get(
+                                    (neighbor_id, normalized_slice), 0.0
+                                )
+                            ),
+                            "target_load": float(
+                                self.estimate_slice_load(
+                                    neighbor_id, normalized_slice
+                                )
+                            ),
+                            "target_total_load": float(sum(
+                                self.estimate_slice_load(
+                                    neighbor_id, slice_name
+                                )
+                                for slice_name in SLICE_TYPE_ORDER
+                            )),
+                            "target_load_increment": ue_prbs
+                            / float(target_budget),
+                            "source_load_contribution": ue_prbs
+                            / float(source_budget),
+                            "target_safe_limit": float(
+                                self.safe_admission_load_limits.get(
+                                    normalized_slice, 0.80
+                                )
+                            ),
+                            "target_total_safe_limit": 1.0,
+                            "_ue": ue,
+                            "_serving_gnb": serving_gnb,
+                            "_target_gnb": neighbor_gnb,
+                        })
                 elif hasattr(serving_gnb, "reset_a3_counter"):
                     serving_gnb.reset_a3_counter(ue_id, neighbor_id)
 
-        for (
-            _margin,
-            ue,
-            serving_gnb,
-            best_neighbor,
-            serving_id,
-            best_neighbor_id,
-            slice_type,
-            rsrp_serving,
-            best_neighbor_rsrp,
-        ) in sorted(candidates, key=lambda item: item[0], reverse=True):
+        for candidate in candidates:
+            candidate["guard_rejection_reason"] = (
+                self._handover_stability_rejection_reason(
+                    candidate["_ue"],
+                    candidate["source_id"],
+                    candidate["target_id"],
+                    candidate["_serving_gnb"],
+                    t,
+                )
+            )
+
+        if self.safe_admission_enabled:
+            selected, _rejected, _admission_debug = (
+                self.safe_admission_controller.admit_candidates(
+                    candidates,
+                    max_acceptances=self.max_handovers_per_step,
+                    remaining_handover_budget=max(
+                        self.max_handovers_per_episode
+                        - self._episode_handover_count,
+                        0,
+                    ),
+                    current_tick=t,
+                )
+            )
+        else:
+            selected = sorted(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate["guard_rejection_reason"] is None
+                ),
+                key=lambda item: item["a3_margin"],
+                reverse=True,
+            )[: self.max_handovers_per_step]
+
+        for candidate in selected:
+            ue = candidate["_ue"]
+            serving_gnb = candidate["_serving_gnb"]
+            best_neighbor = candidate["_target_gnb"]
+            serving_id = int(candidate["source_id"])
+            best_neighbor_id = int(candidate["target_id"])
+            slice_type = self.normalize_slice_type(candidate["slice_type"]).upper()
+            rsrp_serving = float(candidate["rsrp_serving_dbm"])
+            best_neighbor_rsrp = float(candidate["rsrp_target_dbm"])
             if ue.serving_gnb is None or int(ue.serving_gnb) != int(serving_id):
                 continue
             ue_id = int(ue.id)
 
-            self._safe_admission_stats["eligible"] += 1
             if handovers >= self.max_handovers_per_step:
-                self._safe_admission_stats["rejected_step_budget"] += 1
-                continue
-            if not self._handover_stability_allows(
-                ue,
-                serving_id,
-                best_neighbor_id,
-                serving_gnb,
-                t,
-            ):
-                continue
-            if not self._safe_admission_allows(
-                ue,
-                serving_id,
-                best_neighbor_id,
-                slice_type,
-            ):
                 continue
 
             key = (serving_id, int(best_neighbor_id), slice_type)
@@ -1308,6 +1556,7 @@ class MultiGNBWrapper(gym.Env):
                 serving_id,
                 best_neighbor_id,
                 slice_type,
+                candidate=candidate,
             )
             self._ho_successes.setdefault(key, []).append(t)
             last = self._last_ho.get(ue_id)
@@ -1812,6 +2061,7 @@ class MultiGNBWrapper(gym.Env):
             self._mcs_codeset,
             granularity=2,
             slot_length=self.step_dt,
+            window_seconds=self.pf_averaging_window_s,
             mcs_codesets_by_slice={"URLLC": self._mcs_codeset_urllc},
         )
         self._last_scheduler_mode = "slice_aware_mcs_pf_csv_fading"
@@ -2255,7 +2505,18 @@ class MultiGNBWrapper(gym.Env):
     def _get_gnb_by_id(self, gnb_id: Optional[int]):
         if gnb_id is None:
             return None
-        return self._gnb_by_id.get(int(gnb_id))
+        lookup = getattr(self, "_gnb_by_id", None)
+        if lookup is not None:
+            return lookup.get(int(gnb_id))
+        # Keep lightweight diagnostic/test wrappers usable without requiring
+        # the full constructor-owned lookup cache.
+        return next(
+            (
+                gnb for gnb in getattr(self, "gnbs", [])
+                if int(getattr(gnb, "id", -1)) == int(gnb_id)
+            ),
+            None,
+        )
 
     def _is_in_coverage(self, gnb, ue: UE) -> bool:
         if hasattr(gnb, "is_point_in_coverage"):

@@ -16,6 +16,7 @@ class ProportionalFair:
         granularity=2,
         slot_length=1e-3,
         window=50,
+        window_seconds=None,
         sym_per_prb=158,
         mcs_codesets_by_slice=None,
     ):
@@ -25,7 +26,14 @@ class ProportionalFair:
             self._slice_key(slice_type): codeset
             for slice_type, codeset in dict(mcs_codesets_by_slice or {}).items()
         }
-        self.b = 1/window
+        if window_seconds is not None:
+            window = max(
+                int(round(float(window_seconds) / max(float(slot_length), 1e-12))),
+                1,
+            )
+        self.window_ticks = max(int(window), 1)
+        self.window_seconds = self.window_ticks * float(slot_length)
+        self.b = 1 / self.window_ticks
         self.a = 1 - self.b
         self.sym_per_prb = sym_per_prb
         self.slot_length = slot_length

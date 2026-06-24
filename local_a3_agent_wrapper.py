@@ -37,12 +37,13 @@ class LocalA3OffsetEnv(gym.Env):
     The wrapped base environment remains the radio/mobility simulator. This
     class owns the local-agent interface described in the HRL design:
 
-    observation block for each neighbor j and slice s:
-        [b_i,s, b_j,s, tau_i,j,s, K_i,s, K_j,s, v_i,s, v_j,s,
+    observation block for each neighbor j and slice k:
+        [B_i,j,k, B_j,i,k, K_i,k, K_j,k, v_i,k, v_j,k,
          prev_offset_i,j,s, HF_i,j,s, PP_i,j,s]
 
-    where tau_i,j,s = 0.5 * (b_i,s - b_j,s).
-    Negative tau encourages i -> j handover; positive tau discourages it.
+    where B_i,j,k is the upper agent's directional source-target-slice bias.
+    Negative B_i,j,k encourages i -> j handover; positive B_i,j,k retains
+    traffic at i. B_j,i,k is included only as reverse-direction context.
 
     action:
         continuous proto-offsets in [-6, 6] dB, one per neighbor/slice pair.
@@ -67,15 +68,15 @@ class LocalA3OffsetEnv(gym.Env):
         gnb_id: int,
         neighbor_ids: Optional[Sequence[int]] = None,
         slice_types: Sequence[str] = SLICE_TYPES,
-        global_bias: Optional[Dict[Tuple[int, str], float]] = None,
+        global_bias: Optional[Dict[Tuple[int, int, str], float]] = None,
         k_ref: Optional[Dict[str, float]] = None,
         k_target: Optional[Dict[str, float]] = None,
         alpha_k: float = 2.0,
-        lambda_track: float = 1.0,
-        lambda_delta: float = 0.10,
+        lambda_delta: float = 0.05,
         w_hf: float = 1.0,
-        w_pp: float = 0.3,
+        w_pp: float = 0.5,
         w_sla: float = 1.0,
+        w_balance: float = 3.0,
         alpha_hf: float = 2.0,
         alpha_pp: float = 1.0,
         alpha_sla_target: float = 2.0,
@@ -101,11 +102,11 @@ class LocalA3OffsetEnv(gym.Env):
         }
 
         self.alpha_k = float(alpha_k)
-        self.lambda_track = float(lambda_track)
         self.lambda_delta = float(lambda_delta)
         self.w_hf = float(w_hf)
         self.w_pp = float(w_pp)
         self.w_sla = float(w_sla)
+        self.w_balance = float(w_balance)
         self.alpha_hf = float(alpha_hf)
         self.alpha_pp = float(alpha_pp)
         self.alpha_sla_target = float(alpha_sla_target)
@@ -130,18 +131,21 @@ class LocalA3OffsetEnv(gym.Env):
         self._last_reward_breakdown = {}
 
         n_blocks = len(self.neighbor_ids) * len(self.slice_types)
+        n_gnbs = len([g for g in self.base_env.gnbs])
         self.action_space = gym.spaces.Box(
             low=-6.0,
             high=6.0,
             shape=(n_blocks,),
             dtype=np.float32,
         )
-        # 10 values per neighbor-slice block:
-        # [b_i, b_j, tau, K_i, K_j, v_i, v_j, prev_offset, HF, PP]
+        # Per neighbor-slice block (9 values each):
+        #   [B_{i,j,k}, B_{j,i,k}, K_i, K_j, v_i, v_j, prev_offset, HF, PP]
+        # Global context suffix (2 values per gNB per slice):
+        #   [load_g, sla_g]  for every gNB g and every slice — coordination signal
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(n_blocks * 10,),
+            shape=(n_blocks * 9 + n_gnbs * len(self.slice_types) * 2,),
             dtype=np.float32,
         )
 
@@ -161,10 +165,10 @@ class LocalA3OffsetEnv(gym.Env):
             selected.append(neighbor_id)
         return selected
 
-    def set_global_bias(self, bias: Dict[Tuple[int, str], float]):
+    def set_global_bias(self, bias: Dict[Tuple[int, int, str], float]):
         self.global_bias = {
-            (int(gnb_id), normalize_slice_type(slice_type)): float(value)
-            for (gnb_id, slice_type), value in dict(bias).items()
+            (int(src), int(tgt), normalize_slice_type(st)): float(v)
+            for (src, tgt, st), v in dict(bias).items()
         }
 
     def reset(self, *, seed=None, options=None):
@@ -443,37 +447,32 @@ class LocalA3OffsetEnv(gym.Env):
         pp = float(counters["ping_pongs"]) / successes
         return hf, pp
 
-    def _bias_for(self, gnb_id: int, slice_type: str) -> float:
-        """Return clipped global/upper bias b_{gnb,s}."""
-        key = (int(gnb_id), normalize_slice_type(slice_type))
+    def _bias_for(self, source_id: int, target_id: int, slice_type: str) -> float:
+        """Return clipped directional bias b_{source→target,s}."""
+        key = (int(source_id), int(target_id), normalize_slice_type(slice_type))
         return float(np.clip(self.global_bias.get(key, 0.0), -1.0, 1.0))
 
-    def _bias(self, slice_type: str) -> float:
-        """Backward-compatible serving-gNB bias b_{i,s}."""
-        return self._bias_for(self.gnb_id, slice_type)
+    def _directional_bias_pair(self, neighbor_id: int, slice_type: str) -> Tuple[float, float]:
+        """Return (B_{i,j,k}, B_{j,i,k}) for this local-neighbor-slice pair.
 
-    def _pairwise_transfer(self, neighbor_id: int, slice_type: str) -> Tuple[float, float, float]:
-        """Return (b_i,s, b_j,s, tau_i,j,s).
-
-        tau_i,j,s = 0.5 * (b_i,s - b_j,s).
-        tau < 0 encourages i -> j handover.
-        tau > 0 discourages i -> j handover.
+        B_{i,j,k} is the active control signal for offset i→j on slice k.
+        B_{j,i,k} is reverse-direction context; it does not weaken B_{i,j,k}.
         """
-        b_i = self._bias_for(self.gnb_id, slice_type)
-        b_j = self._bias_for(neighbor_id, slice_type)
-        tau = float(np.clip(0.5 * (b_i - b_j), -1.0, 1.0))
-        return b_i, b_j, tau
+        b_ij = self._bias_for(self.gnb_id, neighbor_id, slice_type)
+        b_ji = self._bias_for(neighbor_id, self.gnb_id, slice_type)
+        return b_ij, b_ji
 
     def _desired_offset(self, neighbor_id: int, slice_type: str) -> float:
         """Pairwise desired offset for direction self.gnb_id -> neighbor_id.
 
-        Uses the corrected formulation:
-            desired = 6*tau + neighbor pressure + target SLA/mobility safety terms
-        where tau = (b_i,s - b_j,s)/2.
+        desired = 6*B_i,j,k + neighbor load pressure + target SLA/mobility
+        safety terms. The upper tensor entry B_i,j,k directly controls the
+        source-target-slice intent: -1 maps to the strongest offload offset,
+        +1 maps to the strongest retain offset before safety terms.
         """
         counts = self._slice_counts()
         sla_flags_by_gnb = self._slice_sla_flags_by_gnb()
-        _, _, tau = self._pairwise_transfer(neighbor_id, slice_type)
+        b_ijk, _ = self._directional_bias_pair(neighbor_id, slice_type)
 
         neighbor_count = counts.get((int(neighbor_id), slice_type), 0)
         kappa_j = float(neighbor_count) / max(float(self.k_ref[slice_type]), 1e-9)
@@ -481,7 +480,7 @@ class LocalA3OffsetEnv(gym.Env):
         v_j = float(sla_flags_by_gnb.get((int(neighbor_id), slice_type), 0.0))
 
         desired = (
-            6.0 * tau
+            6.0 * b_ijk
             + self.alpha_k * (kappa_j - self.k_target[slice_type])
             + self.alpha_hf * hf
             + self.alpha_pp * pp
@@ -499,7 +498,7 @@ class LocalA3OffsetEnv(gym.Env):
             neighbor_count = counts.get((neighbor_id, slice_type), 0)
             offset = self._offsets[(neighbor_id, slice_type)]
             hf, pp = self._mobility_ratios((neighbor_id, slice_type))
-            b_i, b_j, tau = self._pairwise_transfer(neighbor_id, slice_type)
+            b_ijk, b_jik = self._directional_bias_pair(neighbor_id, slice_type)
             v_i = float(sla_flags_by_gnb.get((self.gnb_id, slice_type), 0.0))
             v_j = float(sla_flags_by_gnb.get((neighbor_id, slice_type), 0.0))
 
@@ -513,9 +512,8 @@ class LocalA3OffsetEnv(gym.Env):
                 offset_value = offset
 
             obs.extend([
-                float(b_i),
-                float(b_j),
-                float(tau),
+                float(b_ijk),      # upper tensor B[i,j,k]
+                float(b_jik),      # reverse-direction context B[j,i,k]
                 float(local_value),
                 float(neighbor_value),
                 float(v_i),
@@ -525,41 +523,64 @@ class LocalA3OffsetEnv(gym.Env):
                 float(pp),
             ])
 
+        # Global context: load and SLA severity for every gNB × slice.
+        # Gives each agent a network-wide view so it can coordinate with peers.
+        for gnb in self.base_env.gnbs:
+            gid = int(gnb.id)
+            for slice_type in self.slice_types:
+                load_g = self.base_env.estimate_slice_load(gid, slice_type)
+                sla_g = float(sla_flags_by_gnb.get((gid, slice_type), 0.0))
+                obs.extend([float(load_g), float(sla_g)])
+
         arr = np.asarray(obs, dtype=np.float32)
         return np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
 
     def _compute_local_reward(self, proto_offsets: np.ndarray, handover_stats: Dict[str, int]) -> float:
-        sla_flags = self._slice_sla_flags()
-        reward = 0.0
-        breakdown = {
-            "tracking_penalty": 0.0,
-            "sla_penalty": 0.0,
-            "mobility_penalty": 0.0,
-            "smoothness_penalty": 0.0,
-        }
+        # 1. Global SLA penalty — all gNBs, all slices, equal weight per slice type.
+        #    URLLC counts the same as eMBB and mMTC: no special multiplier.
+        sla_flags_by_gnb = self._slice_sla_flags_by_gnb()
+        sla_penalty = -self.w_sla * sum(sla_flags_by_gnb.values())
 
+        # 2. Network load-balance penalty — per-slice variance across ALL gNBs.
+        #    Agents at different gNBs share the same physical loads, so this
+        #    term naturally coordinates them: all agents benefit when variance drops.
+        gnb_ids = [int(gnb.id) for gnb in self.base_env.gnbs]
+        balance_penalty = 0.0
+        for slice_type in self.slice_types:
+            loads = [self.base_env.estimate_slice_load(g, slice_type) for g in gnb_ids]
+            balance_penalty -= self.w_balance * float(np.var(loads))
+
+        # 3. Step-level handover quality (not cumulative episode counters).
+        #    Uses the fresh stats from this step's _execute_a3_handovers() call.
+        step_attempts = int(handover_stats.get("attempts", 0))
+        step_failures = int(handover_stats.get("failures", 0))
+        step_successes = int(handover_stats.get("successes", 0))
+        step_pingpongs = int(handover_stats.get("ping_pongs", 0))
+        hf_rate = step_failures / max(step_attempts, 1)
+        pp_rate = step_pingpongs / max(step_successes, 1)
+        mobility_penalty = -(self.w_hf * hf_rate + self.w_pp * pp_rate)
+
+        # 4. Smoothness — penalise large per-step offset jumps (action jitter).
+        smoothness_penalty = 0.0
         for (neighbor_id, slice_type), proto in zip(self._iter_keys(), proto_offsets):
-            desired = self._desired_offset(neighbor_id, slice_type)
-            tracking = ((float(proto) - desired) / 12.0) ** 2
             previous = self._prev_proto_offsets[(neighbor_id, slice_type)]
-            smoothness = ((float(proto) - previous) / 12.0) ** 2
-            hf, pp = self._mobility_ratios((neighbor_id, slice_type))
-
-            breakdown["tracking_penalty"] -= self.lambda_track * tracking
-            breakdown["smoothness_penalty"] -= self.lambda_delta * smoothness
-            breakdown["mobility_penalty"] -= self.w_hf * hf + self.w_pp * pp
+            delta = (float(proto) - previous) / 12.0
+            smoothness_penalty -= self.lambda_delta * delta ** 2
             self._prev_proto_offsets[(neighbor_id, slice_type)] = float(proto)
 
-        for slice_type, violation in sla_flags.items():
-            breakdown["sla_penalty"] -= self.w_sla * float(violation)
-
+        breakdown = {
+            "sla_penalty": sla_penalty,
+            "balance_penalty": balance_penalty,
+            "mobility_penalty": mobility_penalty,
+            "smoothness_penalty": smoothness_penalty,
+        }
         reward = sum(breakdown.values())
         self._last_reward_breakdown = {
             **breakdown,
-            "handover_attempts": int(handover_stats.get("attempts", 0)),
-            "handover_successes": int(handover_stats.get("successes", 0)),
-            "handover_failures": int(handover_stats.get("failures", 0)),
-            "handover_ping_pongs": int(handover_stats.get("ping_pongs", 0)),
+            "handover_attempts": step_attempts,
+            "handover_successes": step_successes,
+            "handover_failures": step_failures,
+            "handover_ping_pongs": step_pingpongs,
             "total": float(reward),
         }
         return float(reward)
@@ -567,19 +588,19 @@ class LocalA3OffsetEnv(gym.Env):
     def _pairwise_debug(self) -> Dict[str, Dict[Tuple[int, str], float]]:
         serving_bias = {}
         target_bias = {}
-        pairwise_tau = {}
+        reverse_bias = {}
         desired_offsets = {}
         for neighbor_id, slice_type in self._iter_keys():
             key = (neighbor_id, slice_type)
-            b_i, b_j, tau = self._pairwise_transfer(neighbor_id, slice_type)
-            serving_bias[key] = float(b_i)
-            target_bias[key] = float(b_j)
-            pairwise_tau[key] = float(tau)
+            b_ijk, b_jik = self._directional_bias_pair(neighbor_id, slice_type)
+            serving_bias[key] = float(b_ijk)
+            target_bias[key] = float(b_jik)
+            reverse_bias[key] = float(b_jik)
             desired_offsets[key] = float(self._desired_offset(neighbor_id, slice_type))
         return {
             "serving_bias": serving_bias,
             "target_bias": target_bias,
-            "pairwise_tau": pairwise_tau,
+            "reverse_bias": reverse_bias,
             "desired_offsets": desired_offsets,
         }
 
@@ -595,7 +616,7 @@ class LocalA3OffsetEnv(gym.Env):
             "reward_breakdown": dict(self._last_reward_breakdown),
             "serving_bias": pairwise["serving_bias"],
             "target_bias": pairwise["target_bias"],
-            "pairwise_tau": pairwise["pairwise_tau"],
+            "reverse_bias": pairwise["reverse_bias"],
             "desired_offsets": pairwise["desired_offsets"],
             "base_info": dict(base_info or {}),
         }

@@ -75,9 +75,8 @@ TRACE_PAIRWISE_FIELDS = [
     field
     for slice_type in TRACE_SLICE_TYPES
     for field in (
-        f"serving_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}",
-        f"target_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}",
-        f"tau_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}",
+        f"upper_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}",
+        f"reverse_bias_{TRACE_NEIGHBOR_ID}_to_0_{slice_type}",
     )
 ]
 EVAL_SLICE_OFFSET_FIELDS = [
@@ -191,8 +190,8 @@ def _lookup_tuple_dict(data: Dict[Any, Any], key, default=0.0):
 def _desired_offset_from_info(env, info: Dict[str, Any], neighbor_id: int = 1, slice_type: str = "eMBB") -> float:
     """Read pairwise desired offset from info, or compute fallback.
 
-    New formulation uses B=[b_i,s], target bias b_j,s and
-    tau_i,j,s = 0.5*(b_i,s - b_j,s).
+    Directional formulation uses B[src,target,slice] directly. B[0,j,s] is
+    the active source-target-slice intent for the local offset 0->j.
     """
     key = (neighbor_id, slice_type)
     desired_offsets = dict(info.get("desired_offsets", {}))
@@ -206,37 +205,32 @@ def _desired_offset_from_info(env, info: Dict[str, Any], neighbor_id: int = 1, s
 
     rule_bias = dict(info.get("rule_bias", {}))
     spawn_counts = dict(info.get("spawn_counts", {}))
-    b_i = float(_lookup_tuple_dict(rule_bias, (0, slice_type), 0.0))
-    b_j = float(_lookup_tuple_dict(rule_bias, (neighbor_id, slice_type), 0.0))
-    tau = float(np.clip(0.5 * (b_i - b_j), -1.0, 1.0))
+    b_ijk = float(_lookup_tuple_dict(rule_bias, (0, neighbor_id, slice_type), 0.0))
     neighbor_count = int(_lookup_tuple_dict(spawn_counts, (neighbor_id, slice_type), 0))
     alpha_k = float(getattr(local_env, "alpha_k", 2.0))
     k_ref = float(getattr(local_env, "k_ref", {}).get(slice_type, 20.0))
     k_target = float(getattr(local_env, "k_target", {}).get(slice_type, 0.5))
-    desired = 6.0 * tau + alpha_k * (neighbor_count / max(k_ref, 1e-9) - k_target)
+    desired = 6.0 * b_ijk + alpha_k * (neighbor_count / max(k_ref, 1e-9) - k_target)
     return float(np.clip(desired, -6.0, 6.0))
 
 
 def _pairwise_trace_values(info: Dict[str, Any]) -> Dict[str, float]:
     serving_bias = dict(info.get("serving_bias", {}))
-    target_bias = dict(info.get("target_bias", {}))
-    pairwise_tau = dict(info.get("pairwise_tau", {}))
+    reverse_bias = dict(info.get("reverse_bias", info.get("target_bias", {})))
     rule_bias = dict(info.get("rule_bias", {}))
 
     values = {}
     for slice_type in TRACE_SLICE_TYPES:
         key = (TRACE_NEIGHBOR_ID, slice_type)
-        b_i = float(_lookup_tuple_dict(
-            serving_bias, key, _lookup_tuple_dict(rule_bias, (0, slice_type), 0.0)
+        b_ijk = float(_lookup_tuple_dict(
+            serving_bias, key, _lookup_tuple_dict(rule_bias, (0, TRACE_NEIGHBOR_ID, slice_type), 0.0)
         ))
-        b_j = float(_lookup_tuple_dict(
-            target_bias, key, _lookup_tuple_dict(rule_bias, (TRACE_NEIGHBOR_ID, slice_type), 0.0)
+        b_jik = float(_lookup_tuple_dict(
+            reverse_bias, key, _lookup_tuple_dict(rule_bias, (TRACE_NEIGHBOR_ID, 0, slice_type), 0.0)
         ))
-        tau = float(_lookup_tuple_dict(pairwise_tau, key, 0.5 * (b_i - b_j)))
         values.update({
-            f"serving_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}": b_i,
-            f"target_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}": b_j,
-            f"tau_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}": tau,
+            f"upper_bias_0_to_{TRACE_NEIGHBOR_ID}_{slice_type}": b_ijk,
+            f"reverse_bias_{TRACE_NEIGHBOR_ID}_to_0_{slice_type}": b_jik,
         })
     return values
 
@@ -297,7 +291,8 @@ def _rule_bias_trace_values(
     values = {}
     for gnb_id in TRACE_GNB_IDS:
         for slice_type in TRACE_SLICE_TYPES:
-            key = (gnb_id, slice_type)
+            target_id = TRACE_NEIGHBOR_ID if int(gnb_id) == 0 else 0
+            key = (gnb_id, target_id, slice_type)
             values.update({
                 f"rule_bias_{gnb_id}_{slice_type}": float(_lookup_tuple_dict(rule_bias, key, 0.0)),
                 f"held_rule_bias_{gnb_id}_{slice_type}": float(_lookup_tuple_dict(held_rule_bias, key, 0.0)),
@@ -645,7 +640,11 @@ def evaluate(
                     applied_offset = float(
                         _lookup_tuple_dict(applied_offsets, (TRACE_NEIGHBOR_ID, slice_type), 0.0)
                     )
-                    bias = float(_lookup_tuple_dict(rule_bias, (0, slice_type), 0.0))
+                    bias = float(_lookup_tuple_dict(
+                        rule_bias,
+                        (0, TRACE_NEIGHBOR_ID, slice_type),
+                        0.0,
+                    ))
                     desired_offset = _desired_offset_from_info(
                         env,
                         info,
