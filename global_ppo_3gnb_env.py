@@ -760,15 +760,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         # SLA remains observable for diagnostics and admission safety, but it
         # is deliberately excluded from the upper routing-agent objective.
         sla_reward = 0.0
-        # State-based Jain fairness reward on persistent PRB demand.
-        # Range [0, 1]: 1.0 when demand is equally distributed across all gNBs,
-        # 0.0 when all demand is concentrated in one gNB. This signal is
-        # independent of history — the agent is rewarded for BEING in a fair
-        # state, not just for improving from the previous step.
-        jain_raw = self._demand_jain_fairness()
+        # State-based Jain fairness on window-average useful PRB load per gNB.
+        # This uses the same load metric as the paper (KPM PRB utilization):
+        #   gnb_load[g] = Σ_s window_avg_useful_prbs[g,s] / n_prbs[g]
+        # Range [0, 1]: 1.0 → load equal across gNBs; 1/n → all on one gNB.
+        jain_raw = self._useful_jain_fairness(end_loads)
         n = float(self.n_gnbs)
         jain_normalized = (jain_raw - 1.0 / n) / max(1.0 - 1.0 / n, 1e-9)
         jain_reward = self.jain_fairness_weight * jain_normalized
+        # Keep demand-based Jain for logging only (diagnostic, not in reward).
+        jain_demand_raw = self._demand_jain_fairness()
         # Upper PPO reward uses the post-settle radio window useful PRB load.
         # Demand PRBs remain logged separately as a conserved routing diagnostic.
         window_reward = float(
@@ -858,9 +859,22 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["useful_load_matrix_end"] = useful_window_loads.copy()
         info["demand_load_matrix_start"] = start_demand_loads.copy()
         info["demand_load_matrix_end"] = end_demand_loads.copy()
+        # Per-gNB total useful PRB load (paper's KPM metric): Σ_s useful_prbs[g,s] / n_prbs[g]
+        gnb_useful_load_end = self._gnb_total_useful_load_vector(end_loads)
+        gnb_useful_load_start = self._gnb_total_useful_load_vector(
+            self._previous_window_average_loads
+            if self._previous_window_average_loads is not None
+            else end_loads
+        )
+        info["gnb_total_useful_load_end"] = gnb_useful_load_end.copy()
+        info["gnb_total_useful_load_start"] = gnb_useful_load_start.copy()
+        info["gnb_total_useful_load_std_end"] = float(np.std(gnb_useful_load_end))
+        info["gnb_total_useful_load_std_start"] = float(np.std(gnb_useful_load_start))
         info["reward_jain_fairness"] = float(jain_reward)
         info["jain_fairness_raw"] = float(jain_raw)
         info["jain_fairness_normalized"] = float(jain_normalized)
+        # Demand-based Jain kept as a diagnostic (not part of reward).
+        info["jain_demand_raw"] = float(jain_demand_raw)
         info["jain_per_gnb_demand_prbs"] = np.asarray(
             [
                 sum(
@@ -936,28 +950,20 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=float,
         )
         sla = np.clip(self._sla_matrix(), 0.0, 1.0).reshape(-1)
-        # Per-gNB normalized demand: sum of upper_demand_prbs / gNB capacity.
-        # Gives the agent a noise-free view of the demand distribution it is
-        # rewarded on (Jain fairness), independent of scheduler saturation.
-        capacities = self._gnb_prb_capacities()
-        demand_load = np.asarray(
-            [
-                sum(
-                    int(getattr(ue, "upper_demand_prbs", 0))
-                    for ue in self.base_env.get_all_ues()
-                    if ue.connected
-                    and ue.serving_gnb is not None
-                    and int(ue.serving_gnb) == gnb_id
-                ) / max(float(capacities[gnb_id]), 1.0)
-                for gnb_id in range(self.n_gnbs)
-            ],
-            dtype=float,
+        # Per-gNB total useful PRB load: sum of window-avg useful load across
+        # all slices, divided by gNB capacity.  Equivalent to the KPM PRB
+        # load % in a real ORAN DU — the paper's load metric.
+        window_loads = (
+            self._previous_window_average_loads
+            if self._previous_window_average_loads is not None
+            else self._current_useful_load_matrix()
         )
+        gnb_useful_load = self._gnb_total_useful_load_vector(window_loads)
         obs = np.concatenate((
             loads,
             counts,
             sla,
-            demand_load,
+            gnb_useful_load,
             self._last_directional_bias_tensor.reshape(-1),
         ))
         return np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
@@ -1517,11 +1523,9 @@ class GlobalPPO3GNBEnv(gym.Env):
     def _demand_jain_fairness(self) -> float:
         """Jain's fairness index on per-gNB sum of upper_demand_prbs.
 
-        Returns a value in [1/n_gnbs, 1.0]:
-          1.0  → PRB demand perfectly equal across all gNBs
-          1/n  → all demand concentrated in a single gNB
-        Uses upper_demand_prbs (conserved UE property) so the signal is
-        noise-free and does not depend on the radio scheduler output.
+        Kept for backward-compatible logging only.  The active reward signal
+        uses _useful_jain_fairness() which operates on window-average useful
+        PRBs — the same metric as the paper's KPM load.
         """
         demands = np.asarray(
             [
@@ -1540,6 +1544,22 @@ class GlobalPPO3GNBEnv(gym.Env):
         if sum_sq <= 0.0:
             return 1.0
         return float(np.sum(demands) ** 2) / (self.n_gnbs * sum_sq)
+
+    def _useful_jain_fairness(self, loads: np.ndarray | None = None) -> float:
+        """Jain's fairness index on per-gNB total useful PRB load.
+
+        Returns a value in [1/n_gnbs, 1.0]:
+          1.0  → useful PRB load perfectly equal across all gNBs
+          1/n  → all load concentrated in one gNB
+
+        Uses window-average useful PRBs (scheduler output), not demand PRBs.
+        This matches the load metric used in the paper (KPM PRB utilization).
+        """
+        gnb_loads = self._gnb_total_useful_load_vector(loads)
+        sum_sq = float(np.sum(gnb_loads ** 2))
+        if sum_sq <= 0.0:
+            return 1.0
+        return float(np.sum(gnb_loads) ** 2) / (self.n_gnbs * sum_sq)
 
     def _served_active_floor_cost(
         self,
@@ -1769,6 +1789,26 @@ class GlobalPPO3GNBEnv(gym.Env):
                 for gnb_id in range(self.n_gnbs)
             ],
             dtype=float,
+        )
+
+    def _gnb_total_useful_load_vector(self, loads: np.ndarray | None = None) -> np.ndarray:
+        """Per-gNB total useful PRB utilization in [0, 1].
+
+        Sums window-average useful load across all slices for each gNB.
+        This is the direct equivalent of the KPM PRB load % reported by a
+        real ORAN DU: total_useful_prbs / n_prbs.  All reward and observation
+        signals that represent gNB load should derive from this method.
+        """
+        if loads is None:
+            loads = (
+                self._previous_window_average_loads
+                if self._previous_window_average_loads is not None
+                else self._current_useful_load_matrix()
+            )
+        return np.clip(
+            np.sum(np.maximum(np.asarray(loads, dtype=float), 0.0), axis=1),
+            0.0,
+            1.0,
         )
 
     def _calibrate_demand_from_radio_window(self) -> None:

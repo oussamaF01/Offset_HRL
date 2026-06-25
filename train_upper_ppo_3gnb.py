@@ -148,6 +148,11 @@ TRAINING_FIELDS = [
     "reward_jain_fairness",
     "jain_fairness_raw",
     "jain_fairness_normalized",
+    "jain_demand_raw",
+    "gnb_total_useful_load_std_end",
+    "gnb_total_useful_load_std_start",
+    *[f"gnb_total_useful_load_end_g{g}" for g in GNB_IDS],
+    *[f"gnb_total_useful_load_start_g{g}" for g in GNB_IDS],
     "gnb_excess_load_cost_start",
     "gnb_excess_load_cost_end",
     "gnb_load_target_requested",
@@ -430,6 +435,27 @@ class UpperTrainingCsvCallback(BaseCallback):
             "jain_fairness_normalized": float(
                 info.get("jain_fairness_normalized", 0.0)
             ),
+            "jain_demand_raw": float(
+                info.get("jain_demand_raw", 0.0)
+            ),
+            "gnb_total_useful_load_std_end": float(
+                info.get("gnb_total_useful_load_std_end", 0.0)
+            ),
+            "gnb_total_useful_load_std_start": float(
+                info.get("gnb_total_useful_load_std_start", 0.0)
+            ),
+            **{
+                f"gnb_total_useful_load_end_g{g}": float(
+                    np.asarray(info.get("gnb_total_useful_load_end", [0.0, 0.0, 0.0]))[g]
+                )
+                for g in GNB_IDS
+            },
+            **{
+                f"gnb_total_useful_load_start_g{g}": float(
+                    np.asarray(info.get("gnb_total_useful_load_start", [0.0, 0.0, 0.0]))[g]
+                )
+                for g in GNB_IDS
+            },
             "gnb_excess_load_cost_start": float(
                 info.get("gnb_excess_load_cost_start", 0.0)
             ),
