@@ -475,7 +475,7 @@ class MultiGNBWrapper(gym.Env):
             key = (serving_id, slice_type)
             self._radio_window_slice_useful_prbs[key] = (
                 self._radio_window_slice_useful_prbs.get(key, 0.0)
-                + allocated_prbs
+                + useful_prbs
             )
             stats = self._radio_window_ue_stats.setdefault(
                 ue_id,

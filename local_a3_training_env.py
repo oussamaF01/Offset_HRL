@@ -28,6 +28,12 @@ DEFAULT_GNB_CONFIGS = [
     {"id": 1, "x": 450.0, "y": 0.0, "coverage_radius": 500.0, "carrier_id": 0, "n_prbs": 100},
 ]
 
+THREE_GNB_LOCAL_CONFIGS = [
+    {"id": 0, "x": 0.0, "y": 0.0, "coverage_radius": 500.0, "carrier_id": 0, "n_prbs": 100},
+    {"id": 1, "x": -450.0, "y": 0.0, "coverage_radius": 500.0, "carrier_id": 0, "n_prbs": 100},
+    {"id": 2, "x": 450.0, "y": 0.0, "coverage_radius": 500.0, "carrier_id": 0, "n_prbs": 100},
+]
+
 DEFAULT_BIAS_CASE_PROBS = {
     "offload": 0.30,
     "neutral": 0.25,
@@ -509,24 +515,20 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             return
 
         self._last_demand_profile = {}
-        neighbor_id = self.neighbor_ids[0] if self.neighbor_ids else None
-
         for slice_type in self.slice_types:
             spec = self._slice_scenario(slice_type)
             self._set_slice_offered_load(self.gnb_id, slice_type, spec.local_load)
-            if neighbor_id is not None:
+            for neighbor_id in self.neighbor_ids:
                 self._set_slice_offered_load(neighbor_id, slice_type, spec.neighbor_load)
 
     def _seed_case_prbs(self):
         if not self.balance_bias_cases or not self.slice_types:
             return
 
-        neighbor_id = self.neighbor_ids[0] if self.neighbor_ids else None
-
         for slice_type in self.slice_types:
             spec = self._slice_scenario(slice_type)
             self._set_slice_prb_load(self.gnb_id, slice_type, spec.local_load)
-            if neighbor_id is not None:
+            for neighbor_id in self.neighbor_ids:
                 self._set_slice_prb_load(neighbor_id, slice_type, spec.neighbor_load)
 
     def _case_matches_loads(self, case_name: str, slice_type: str = "eMBB") -> bool:
@@ -725,6 +727,11 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
     ) -> Dict:
         info = dict(info or {})
         info["rule_bias"] = dict(self.local_env.global_bias)
+        pairwise = self.local_env._pairwise_debug()
+        info["serving_bias"] = pairwise["serving_bias"]
+        info["target_bias"] = pairwise["target_bias"]
+        info["reverse_bias"] = pairwise["reverse_bias"]
+        info["desired_offsets"] = pairwise["desired_offsets"]
         info["action_temporal"] = dict(self._last_action_debug)
         info["bias_temporal"] = {
             "bias_hold_counter": int(self._bias_hold_counter),

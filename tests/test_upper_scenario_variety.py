@@ -25,11 +25,20 @@ def test_scenario_catalog_is_slice_aware_and_uses_explicit_regions():
         "high_load_inner_embb",
         "high_load_inner_mixed",
         "high_load_inner_asymmetric",
+        "jain_balance_controllable",
+        "jain_control_urllc",
+        "jain_control_mmtc",
+        "jain_control_mixed",
     ]
     assert all(scenario.tier == "fixed" for scenario in UPPER_TRAINING_SCENARIOS)
     assert all(
         scenario.duration_s == (
-            1.0 if scenario.name.startswith("high_load_inner_") else 20.0
+            1.0
+            if (
+                scenario.name.startswith("high_load_inner_")
+                or scenario.name.startswith("jain_")
+            )
+            else 20.0
         )
         for scenario in UPPER_TRAINING_SCENARIOS
     )
@@ -172,6 +181,44 @@ def test_inner_training_ues_use_learnable_132m_overlap_placement():
         )
     finally:
         env.close()
+
+
+def test_controlled_jain_scenarios_balance_with_symmetric_safe_release():
+    for scenario_name, active_slice_indices, min_jain in (
+        ("jain_balance_controllable", (0,), 0.99),
+        ("jain_control_urllc", (1,), 0.85),
+        ("jain_control_mmtc", (2,), 0.99),
+        ("jain_control_mixed", (0, 1, 2), 0.95),
+    ):
+        env = GlobalPPO3GNBEnv(
+            seed=123,
+            gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
+            scenario_mode="curriculum",
+            training_scenarios=scenario_name,
+            upper_window_seconds=1.0,
+            local_steps_per_global=10,
+            radio_substeps=2,
+            terminal_reward_only=False,
+            max_handovers_per_local_step=3,
+            safe_admission_enabled=True,
+            a3_handover_cooldown_s=2.0,
+            a3_min_residence_s=2.0,
+        )
+        try:
+            env.reset(seed=123)
+            action = np.zeros(env.action_space.shape, dtype=np.float32)
+            action_3d = action.reshape(3, 2, 3)
+            for slice_idx in active_slice_indices:
+                action_3d[1, :, slice_idx] = -1.0
+
+            _obs, _reward, _terminated, _truncated, info = env.step(action)
+            assert info["handover_count"] >= 3
+            assert info["jain_fairness_raw"] >= min_jain
+            assert np.all(
+                np.sum(np.asarray(info["used_prb_matrix_end"]), axis=1) > 0.0
+            )
+        finally:
+            env.close()
 
 
 def test_center_gap_catalog_keeps_ue_placement_and_three_cell_coverage():

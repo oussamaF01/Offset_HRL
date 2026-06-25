@@ -19,7 +19,10 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.noise import NormalActionNoise
 
-from local_a3_training_env import LocalA3RuleBiasTrainingEnv
+from local_a3_training_env import (
+    LocalA3RuleBiasTrainingEnv,
+    THREE_GNB_LOCAL_CONFIGS,
+)
 from local_a3_agent_wrapper import LocalA3OffsetEnv
 from local_a3_training_scenarios import (
     EpisodeTrainingScenario,
@@ -515,15 +518,19 @@ def make_env(
     max_offset_change_db: float = 2.0,
     slice_types=TRACE_SLICE_TYPES,
     training_scenarios: Sequence[EpisodeTrainingScenario] | None = None,
+    gnb_id: int = 0,
+    neighbor_ids: Sequence[int] = (1,),
+    gnb_configs: Sequence[Dict[str, Any]] | None = None,
 ) -> Monitor:
     env = LocalA3RuleBiasTrainingEnv(
         seed=seed,
-        gnb_id=0,
-        neighbor_ids=(1,),
+        gnb_id=int(gnb_id),
+        neighbor_ids=tuple(int(neighbor_id) for neighbor_id in neighbor_ids),
         slice_types=tuple(slice_types),
         episode_steps=episode_steps,
         local_ues_range=(2, 3),
         neighbor_ues_range=(2, 3),
+        gnb_configs=gnb_configs,
         steps_per_action=1,
         radio_substeps=10,
         balance_bias_cases=True,
@@ -559,6 +566,9 @@ def evaluate(
     max_offset_change_db: float = 2.0,
     slice_types=TRACE_SLICE_TYPES,
     training_scenarios: Sequence[EpisodeTrainingScenario] | None = None,
+    gnb_id: int = 0,
+    neighbor_ids: Sequence[int] = (1,),
+    gnb_configs: Sequence[Dict[str, Any]] | None = None,
     logger: StepCsvLogger | None = None,
     eval_csv: Path | None = None,
 ) -> Dict[str, Any]:
@@ -570,6 +580,9 @@ def evaluate(
         max_offset_change_db=max_offset_change_db,
         slice_types=slice_types,
         training_scenarios=training_scenarios,
+        gnb_id=gnb_id,
+        neighbor_ids=neighbor_ids,
+        gnb_configs=gnb_configs,
     )
     returns = []
     lengths = []
@@ -840,10 +853,31 @@ def main():
     parser.add_argument("--eval-csv", type=Path, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--action-noise-sigma", type=float, default=0.25)
-    parser.add_argument("--action-hold-steps", type=int, default=5)
+    parser.add_argument(
+        "--action-hold-steps",
+        type=int,
+        default=1,
+        help=(
+            "TD3 decisions per applied action. Keep at 1 for coherent replay: "
+            "larger values make the env ignore intermediate TD3 actions."
+        ),
+    )
     parser.add_argument("--bias-hold-steps", type=int, default=20)
     parser.add_argument("--max-offset-change-db", type=float, default=2.0)
     parser.add_argument("--slice-types", type=str, default=",".join(TRACE_SLICE_TYPES))
+    parser.add_argument("--controlled-gnb-id", type=int, default=0)
+    parser.add_argument(
+        "--neighbor-ids",
+        type=str,
+        default="1",
+        help="Comma-separated simulated neighbor gNB ids for the one TD3-controlled gNB.",
+    )
+    parser.add_argument(
+        "--gnb-topology",
+        choices=("two_gnb", "three_gnb_line"),
+        default="two_gnb",
+        help="Use three_gnb_line for one controlled gNB with two simulated neighbors.",
+    )
     parser.add_argument(
         "--scenario-set",
         choices=("default", "feasible_mixed"),
@@ -862,6 +896,18 @@ def main():
         for item in str(args.slice_types).split(",")
         if item.strip()
     ) or TRACE_SLICE_TYPES
+    neighbor_ids = tuple(
+        int(item.strip())
+        for item in str(args.neighbor_ids).split(",")
+        if item.strip()
+    )
+    if args.gnb_topology == "three_gnb_line" and str(args.neighbor_ids).strip() == "1":
+        neighbor_ids = (1, 2)
+    gnb_configs = (
+        THREE_GNB_LOCAL_CONFIGS
+        if args.gnb_topology == "three_gnb_line"
+        else None
+    )
     training_scenarios = local_a3_training_scenario_set(args.scenario_set)
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -885,6 +931,9 @@ def main():
             max_offset_change_db=args.max_offset_change_db,
             slice_types=slice_types,
             training_scenarios=training_scenarios,
+            gnb_id=args.controlled_gnb_id,
+            neighbor_ids=neighbor_ids,
+            gnb_configs=gnb_configs,
         )
         n_actions = env.action_space.shape[-1]
         action_noise = NormalActionNoise(
@@ -931,6 +980,9 @@ def main():
             max_offset_change_db=args.max_offset_change_db,
             slice_types=slice_types,
             training_scenarios=training_scenarios,
+            gnb_id=args.controlled_gnb_id,
+            neighbor_ids=neighbor_ids,
+            gnb_configs=gnb_configs,
             logger=step_logger,
             eval_csv=eval_csv,
         )
@@ -943,6 +995,10 @@ def main():
         metrics["bias_hold_steps"] = int(args.bias_hold_steps)
         metrics["max_offset_change_db"] = float(args.max_offset_change_db)
         metrics["slice_types"] = list(slice_types)
+        metrics["controlled_gnb_id"] = int(args.controlled_gnb_id)
+        metrics["neighbor_ids"] = list(map(int, neighbor_ids))
+        metrics["gnb_topology"] = str(args.gnb_topology)
+        metrics["action_dim"] = int(n_actions)
         metrics["scenario_set"] = str(args.scenario_set)
         metrics["training_scenarios"] = [
             scenario.name for scenario in training_scenarios

@@ -50,26 +50,23 @@ DIRECTIONAL_BIAS_FIELDS = [
 MATRIX_FIELDS = [
     f"{prefix}_g{gnb_id}_{slice_type}"
     for prefix in (
-        "target_load", "balance_target",
-        "demand_load_start", "demand_load_end",
-        "useful_load_start", "useful_load_end",
+        "used_prb_start", "used_prb_end",
         "sla", "ue_count",
     )
     for gnb_id in GNB_IDS
     for slice_type in SLICE_TYPES
 ]
-DEMAND_LOAD_TOTAL_FIELDS = (
-    [f"gnb_demand_load_{phase}_g{gnb_id}" for phase in ("start", "end") for gnb_id in GNB_IDS]
+USED_PRB_TOTAL_FIELDS = (
+    [f"network_used_prb_{phase}" for phase in ("start", "end")]
+    + [f"mean_gnb_used_prb_{phase}" for phase in ("start", "end")]
+    + [f"max_gnb_used_prb_{phase}" for phase in ("start", "end")]
     + [
-        f"slice_demand_load_{phase}_{slice_type}"
+        f"gnb_used_prb_{phase}_g{gnb_id}"
         for phase in ("start", "end")
-        for slice_type in SLICE_TYPES
+        for gnb_id in GNB_IDS
     ]
-)
-USEFUL_LOAD_TOTAL_FIELDS = (
-    [f"gnb_useful_load_{phase}_g{gnb_id}" for phase in ("start", "end") for gnb_id in GNB_IDS]
     + [
-        f"slice_useful_load_{phase}_{slice_type}"
+        f"slice_used_prb_{phase}_{slice_type}"
         for phase in ("start", "end")
         for slice_type in SLICE_TYPES
     ]
@@ -120,28 +117,21 @@ TRAINING_FIELDS = [
     "radio_service_seconds_per_upper_window",
     "post_handover_settle_steps",
     "radio_measurement_steps",
-    "load_measurement_mode",
-    "ppo_network_demand_load_start",
-    "ppo_network_demand_load_end",
-    "radio_network_total_useful_load_start",
-    "radio_network_total_useful_load_end",
-    "radio_mean_gnb_useful_load_start",
-    "radio_mean_gnb_useful_load_end",
-    "radio_max_gnb_useful_load_start",
-    "radio_max_gnb_useful_load_end",
+    "prb_measurement_mode",
+    *USED_PRB_TOTAL_FIELDS,
     "overload_ratio",
     "sla_count",
     "sla_severity",
     "handover_count",
-    "load_imbalance_start",
-    "load_imbalance_end",
+    "used_prb_balance_cost_start",
+    "used_prb_balance_cost_end",
     "global_cost_start",
     "global_cost_end",
     "global_cost_improvement",
     "global_action_penalty",
     "global_negative_bias_penalty",
-    "reward_load_improvement",
-    "reward_load_improvement_raw",
+    "reward_used_prb_balance_improvement",
+    "reward_used_prb_balance_improvement_raw",
     "reward_active_slice_count",
     "reward_saturation_improvement",
     "reward_excess_load_improvement",
@@ -155,6 +145,9 @@ TRAINING_FIELDS = [
     "served_active_floor_cost_start",
     "served_active_floor_cost_end",
     "served_active_floor",
+    "reward_jain_fairness",
+    "jain_fairness_raw",
+    "jain_fairness_normalized",
     "gnb_excess_load_cost_start",
     "gnb_excess_load_cost_end",
     "gnb_load_target_requested",
@@ -173,8 +166,6 @@ TRAINING_FIELDS = [
     "safe_admission_source_accepted",
     "safe_admission_stats",
     *QOS_SCALAR_FIELDS,
-    *DEMAND_LOAD_TOTAL_FIELDS,
-    *USEFUL_LOAD_TOTAL_FIELDS,
     *SERVED_FLOOR_REFERENCE_FIELDS,
 ] + DIRECTIONAL_BIAS_FIELDS + MATRIX_FIELDS
 
@@ -306,7 +297,11 @@ class UpperTrainingCsvCallback(BaseCallback):
     def _on_training_start(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.log_path.open("w", newline="", encoding="utf-8")
-        self.writer = csv.DictWriter(self.file, fieldnames=TRAINING_FIELDS)
+        self.writer = csv.DictWriter(
+            self.file,
+            fieldnames=TRAINING_FIELDS,
+            extrasaction="ignore",
+        )
         self.writer.writeheader()
 
     def _on_step(self) -> bool:
@@ -325,16 +320,8 @@ class UpperTrainingCsvCallback(BaseCallback):
         ppo_n_steps = max(int(getattr(self.model, "n_steps", 1)), 1)
         ppo_update_index = max((int(self.num_timesteps) - 1) // ppo_n_steps, 0)
         rollout_step_in_update = ((int(self.num_timesteps) - 1) % ppo_n_steps) + 1
-        demand_load_start = info.get(
-            "demand_load_matrix_start",
-            info.get("load_matrix_start", []),
-        )
-        demand_load_end = info.get(
-            "demand_load_matrix_end",
-            info.get("load_matrix_end", []),
-        )
-        useful_load_start = info.get("load_matrix_start", [])
-        useful_load_end = info.get("useful_load_matrix_end", [])
+        used_prb_start = info.get("used_prb_matrix_start", [])
+        used_prb_end = info.get("used_prb_matrix_end", [])
         overloaded_negative, light_nonnegative = _bias_quality_scores(
             info.get("directional_bias_tensor", []),
             info.get("load_matrix", []),
@@ -363,23 +350,25 @@ class UpperTrainingCsvCallback(BaseCallback):
             "radio_measurement_steps": int(
                 info.get("radio_measurement_steps", 0)
             ),
-            "load_measurement_mode": str(
+            "prb_measurement_mode": str(
                 info.get("load_measurement_mode", "")
             ),
-            "ppo_network_demand_load_start": _matrix_sum(demand_load_start),
-            "ppo_network_demand_load_end": _matrix_sum(demand_load_end),
-            "radio_network_total_useful_load_start": _matrix_sum(useful_load_start),
-            "radio_network_total_useful_load_end": _matrix_sum(useful_load_end),
-            "radio_mean_gnb_useful_load_start": _row_sum_mean(useful_load_start),
-            "radio_mean_gnb_useful_load_end": _row_sum_mean(useful_load_end),
-            "radio_max_gnb_useful_load_start": _row_sum_max(useful_load_start),
-            "radio_max_gnb_useful_load_end": _row_sum_max(useful_load_end),
+            "network_used_prb_start": _matrix_sum(used_prb_start),
+            "network_used_prb_end": _matrix_sum(used_prb_end),
+            "mean_gnb_used_prb_start": _row_sum_mean(used_prb_start),
+            "mean_gnb_used_prb_end": _row_sum_mean(used_prb_end),
+            "max_gnb_used_prb_start": _row_sum_max(used_prb_start),
+            "max_gnb_used_prb_end": _row_sum_max(used_prb_end),
             "overload_ratio": float(info.get("overload_ratio", 0.0)),
             "sla_count": float(info.get("sla_count", 0.0)),
             "sla_severity": float(info.get("sla_severity", 0.0)),
             "handover_count": int(info.get("handover_count", 0)),
-            "load_imbalance_start": float(info.get("load_imbalance_start", 0.0)),
-            "load_imbalance_end": float(info.get("load_imbalance_end", 0.0)),
+            "used_prb_balance_cost_start": float(
+                info.get("used_prb_balance_cost_start", 0.0)
+            ),
+            "used_prb_balance_cost_end": float(
+                info.get("used_prb_balance_cost_end", 0.0)
+            ),
             "global_cost_start": float(info.get("global_cost_start", 0.0)),
             "global_cost_end": float(info.get("global_cost_end", 0.0)),
             "global_cost_improvement": float(info.get("global_cost_improvement", 0.0)),
@@ -387,9 +376,11 @@ class UpperTrainingCsvCallback(BaseCallback):
             "global_negative_bias_penalty": float(
                 info.get("global_negative_bias_penalty", 0.0)
             ),
-            "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
-            "reward_load_improvement_raw": float(
-                info.get("reward_load_improvement_raw", 0.0)
+            "reward_used_prb_balance_improvement": float(
+                info.get("reward_used_prb_balance_improvement", 0.0)
+            ),
+            "reward_used_prb_balance_improvement_raw": float(
+                info.get("reward_used_prb_balance_improvement_raw", 0.0)
             ),
             "reward_active_slice_count": int(
                 info.get("reward_active_slice_count", 0)
@@ -429,6 +420,15 @@ class UpperTrainingCsvCallback(BaseCallback):
             ),
             "served_active_floor": float(
                 info.get("served_active_floor", 0.0)
+            ),
+            "reward_jain_fairness": float(
+                info.get("reward_jain_fairness", 0.0)
+            ),
+            "jain_fairness_raw": float(
+                info.get("jain_fairness_raw", 0.0)
+            ),
+            "jain_fairness_normalized": float(
+                info.get("jain_fairness_normalized", 0.0)
             ),
             "gnb_excess_load_cost_start": float(
                 info.get("gnb_excess_load_cost_start", 0.0)
@@ -498,10 +498,8 @@ class UpperTrainingCsvCallback(BaseCallback):
             ),
         }
         _add_qos_fields(row, info)
-        _add_matrix_total_fields(row, "demand_load_start", demand_load_start)
-        _add_matrix_total_fields(row, "demand_load_end", demand_load_end)
-        _add_matrix_total_fields(row, "useful_load_start", useful_load_start)
-        _add_matrix_total_fields(row, "useful_load_end", useful_load_end)
+        _add_matrix_total_fields(row, "used_prb_start", used_prb_start)
+        _add_matrix_total_fields(row, "used_prb_end", used_prb_end)
         _add_served_floor_reference_fields(
             row,
             info.get("served_active_floor_reference_gnb_loads", []),
@@ -512,10 +510,8 @@ class UpperTrainingCsvCallback(BaseCallback):
         for prefix, key in (
             ("target_load", "target_load_matrix"),
             ("balance_target", "balance_target_matrix"),
-            ("demand_load_start", "demand_load_matrix_start"),
-            ("demand_load_end", "demand_load_matrix_end"),
-            ("useful_load_start", "load_matrix_start"),
-            ("useful_load_end", "useful_load_matrix_end"),
+            ("used_prb_start", "used_prb_matrix_start"),
+            ("used_prb_end", "used_prb_matrix_end"),
             ("sla", "sla_matrix"),
             ("ue_count", "ue_count_matrix"),
         ):
@@ -647,6 +643,7 @@ def make_env(args) -> Monitor:
             args, "served_active_floor_reward_weight", 1.0
         ),
         served_active_floor=getattr(args, "served_active_floor", 0.20),
+        jain_fairness_weight=getattr(args, "jain_fairness_weight", 1.0),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
         training_scenarios=args.training_scenarios,
@@ -704,8 +701,18 @@ def evaluate_upper_policy(
             step += 1
             ep_return += float(reward)
             if first_imbalance is None:
-                first_imbalance = float(info.get("load_imbalance_start", 0.0))
-            last_imbalance = float(info.get("load_imbalance_end", 0.0))
+                first_imbalance = float(
+                    info.get(
+                        "used_prb_balance_cost_start",
+                        info.get("load_imbalance_start", 0.0),
+                    )
+                )
+            last_imbalance = float(
+                info.get(
+                    "used_prb_balance_cost_end",
+                    info.get("load_imbalance_end", 0.0),
+                )
+            )
             handovers.append(int(info.get("handover_count", 0)))
             sla_counts.append(float(info.get("sla_count", 0.0)))
             directional_bias = np.asarray(
@@ -717,16 +724,8 @@ def evaluate_upper_policy(
             )
             overloaded_negative_scores.append(overloaded_negative)
             light_nonnegative_scores.append(light_nonnegative)
-            demand_load_start = info.get(
-                "demand_load_matrix_start",
-                info.get("load_matrix_start", []),
-            )
-            demand_load_end = info.get(
-                "demand_load_matrix_end",
-                info.get("load_matrix_end", []),
-            )
-            useful_load_start = info.get("load_matrix_start", [])
-            useful_load_end = info.get("useful_load_matrix_end", [])
+            used_prb_start = info.get("used_prb_matrix_start", [])
+            used_prb_end = info.get("used_prb_matrix_end", [])
 
             rows.append({
                 "episode": int(episode),
@@ -745,22 +744,24 @@ def evaluate_upper_policy(
                 "radio_measurement_steps": int(
                     info.get("radio_measurement_steps", 0)
                 ),
-                "load_measurement_mode": str(
+                "prb_measurement_mode": str(
                     info.get("load_measurement_mode", "")
                 ),
-                "ppo_network_demand_load_start": _matrix_sum(demand_load_start),
-                "ppo_network_demand_load_end": _matrix_sum(demand_load_end),
-                "radio_network_total_useful_load_start": _matrix_sum(useful_load_start),
-                "radio_network_total_useful_load_end": _matrix_sum(useful_load_end),
-                "radio_mean_gnb_useful_load_start": _row_sum_mean(useful_load_start),
-                "radio_mean_gnb_useful_load_end": _row_sum_mean(useful_load_end),
-                "radio_max_gnb_useful_load_start": _row_sum_max(useful_load_start),
-                "radio_max_gnb_useful_load_end": _row_sum_max(useful_load_end),
+                "network_used_prb_start": _matrix_sum(used_prb_start),
+                "network_used_prb_end": _matrix_sum(used_prb_end),
+                "mean_gnb_used_prb_start": _row_sum_mean(used_prb_start),
+                "mean_gnb_used_prb_end": _row_sum_mean(used_prb_end),
+                "max_gnb_used_prb_start": _row_sum_max(used_prb_start),
+                "max_gnb_used_prb_end": _row_sum_max(used_prb_end),
                 "reward": float(reward),
                 "load_variance": float(info.get("load_variance", 0.0)),
                 "target_load_error": float(info.get("target_load_error", 0.0)),
-                "load_imbalance_start": float(info.get("load_imbalance_start", 0.0)),
-                "load_imbalance_end": float(info.get("load_imbalance_end", 0.0)),
+                "used_prb_balance_cost_start": float(
+                    info.get("used_prb_balance_cost_start", 0.0)
+                ),
+                "used_prb_balance_cost_end": float(
+                    info.get("used_prb_balance_cost_end", 0.0)
+                ),
                 "target_load_error_start": float(info.get("target_load_error_start", 0.0)),
                 "target_load_error_end": float(info.get("target_load_error_end", 0.0)),
                 "overload_ratio": float(info.get("overload_ratio", 0.0)),
@@ -776,9 +777,11 @@ def evaluate_upper_policy(
                 "global_negative_bias_penalty": float(
                     info.get("global_negative_bias_penalty", 0.0)
                 ),
-                "reward_load_improvement": float(info.get("reward_load_improvement", 0.0)),
-                "reward_load_improvement_raw": float(
-                    info.get("reward_load_improvement_raw", 0.0)
+                "reward_used_prb_balance_improvement": float(
+                    info.get("reward_used_prb_balance_improvement", 0.0)
+                ),
+                "reward_used_prb_balance_improvement_raw": float(
+                    info.get("reward_used_prb_balance_improvement_raw", 0.0)
                 ),
                 "reward_active_slice_count": int(
                     info.get("reward_active_slice_count", 0)
@@ -818,6 +821,15 @@ def evaluate_upper_policy(
                 ),
                 "served_active_floor": float(
                     info.get("served_active_floor", 0.0)
+                ),
+                "reward_jain_fairness": float(
+                    info.get("reward_jain_fairness", 0.0)
+                ),
+                "jain_fairness_raw": float(
+                    info.get("jain_fairness_raw", 0.0)
+                ),
+                "jain_fairness_normalized": float(
+                    info.get("jain_fairness_normalized", 0.0)
                 ),
                 "gnb_excess_load_cost_start": float(
                     info.get("gnb_excess_load_cost_start", 0.0)
@@ -891,10 +903,8 @@ def evaluate_upper_policy(
                 "ue_count_matrix": _json_array(info.get("ue_count_matrix", [])),
             })
             _add_qos_fields(rows[-1], info)
-            _add_matrix_total_fields(rows[-1], "demand_load_start", demand_load_start)
-            _add_matrix_total_fields(rows[-1], "demand_load_end", demand_load_end)
-            _add_matrix_total_fields(rows[-1], "useful_load_start", useful_load_start)
-            _add_matrix_total_fields(rows[-1], "useful_load_end", useful_load_end)
+            _add_matrix_total_fields(rows[-1], "used_prb_start", used_prb_start)
+            _add_matrix_total_fields(rows[-1], "used_prb_end", used_prb_end)
             _add_served_floor_reference_fields(
                 rows[-1],
                 info.get("served_active_floor_reference_gnb_loads", []),
@@ -905,10 +915,8 @@ def evaluate_upper_policy(
             for prefix, key in (
                 ("target_load", "target_load_matrix"),
                 ("balance_target", "balance_target_matrix"),
-                ("demand_load_start", "demand_load_matrix_start"),
-                ("demand_load_end", "demand_load_matrix_end"),
-                ("useful_load_start", "load_matrix_start"),
-                ("useful_load_end", "useful_load_matrix_end"),
+                ("used_prb_start", "used_prb_matrix_start"),
+                ("used_prb_end", "used_prb_matrix_end"),
                 ("sla", "sla_matrix"),
                 ("ue_count", "ue_count_matrix"),
             ):
@@ -922,7 +930,11 @@ def evaluate_upper_policy(
         validation_csv = Path(validation_csv)
         validation_csv.parent.mkdir(parents=True, exist_ok=True)
         with validation_csv.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=VALIDATION_FIELDS)
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=VALIDATION_FIELDS,
+                extrasaction="ignore",
+            )
             writer.writeheader()
             for row in rows:
                 writer.writerow({
@@ -984,7 +996,7 @@ def save_learning_curve(
 
     steps = series("step")
     reward = series("reward")
-    imbalance = series("load_imbalance_end")
+    imbalance = series("used_prb_balance_cost_end")
     handovers = series("handover_count")
     left_bias = series("bias_g1_to_g0_eMBB")
     right_bias = series("bias_g1_to_g2_eMBB")
@@ -1001,9 +1013,9 @@ def save_learning_curve(
 
     axes[0, 1].plot(
         steps, rolling(imbalance), color="#d62828", lw=2.0,
-        label="final imbalance",
+        label="final PRB balance cost",
     )
-    axes[0, 1].set(title="Load balancing", ylabel="imbalance")
+    axes[0, 1].set(title="Useful PRB balancing", ylabel="PRB balance cost")
     axes[0, 1].legend()
 
     axes[1, 0].plot(

@@ -9,6 +9,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import gymnasium as gym
 import numpy as np
 
+from two_neighbor_offset_heuristic import coordinated_neighbor_offsets
+
 
 SLICE_TYPES = ("eMBB", "URLLC", "mMTC")
 VALID_A3_OFFSETS_DB = np.array([-6.0, -4.0, -2.0, 0.0, 2.0, 4.0, 6.0], dtype=float)
@@ -462,31 +464,60 @@ class LocalA3OffsetEnv(gym.Env):
         b_ji = self._bias_for(neighbor_id, self.gnb_id, slice_type)
         return b_ij, b_ji
 
-    def _desired_offset(self, neighbor_id: int, slice_type: str) -> float:
-        """Pairwise desired offset for direction self.gnb_id -> neighbor_id.
+    def _best_radio_margin_db(self, neighbor_id: int, slice_type: str) -> float:
+        serving_gnb = self.base_env._get_gnb_by_id(self.gnb_id)
+        target_gnb = self.base_env._get_gnb_by_id(neighbor_id)
+        if serving_gnb is None or target_gnb is None:
+            return -np.inf
 
-        desired = 6*B_i,j,k + neighbor load pressure + target SLA/mobility
-        safety terms. The upper tensor entry B_i,j,k directly controls the
-        source-target-slice intent: -1 maps to the strongest offload offset,
-        +1 maps to the strongest retain offset before safety terms.
-        """
-        counts = self._slice_counts()
+        margins = []
+        wanted_slice = normalize_slice_type(slice_type)
+        for ue in self.base_env.get_all_ues():
+            if (
+                ue.serving_gnb is None
+                or int(ue.serving_gnb) != self.gnb_id
+                or not ue.connected
+                or normalize_slice_type(getattr(ue, "slice_type", "eMBB")) != wanted_slice
+            ):
+                continue
+            if not self.base_env._is_in_coverage(target_gnb, ue):
+                continue
+            margins.append(self._rx_power(target_gnb, ue) - self._rx_power(serving_gnb, ue))
+        return float(max(margins)) if margins else -np.inf
+
+    def _coordinated_desired_offsets(self) -> Dict[Tuple[int, str], float]:
+        loads = {
+            (int(gnb.id), slice_type): float(
+                self.base_env.estimate_slice_load(int(gnb.id), slice_type)
+            )
+            for gnb in self.base_env.gnbs
+            for slice_type in self.slice_types
+        }
         sla_flags_by_gnb = self._slice_sla_flags_by_gnb()
-        b_ijk, _ = self._directional_bias_pair(neighbor_id, slice_type)
+        hf = {}
+        pp = {}
+        radio = {}
+        for neighbor_id, slice_type in self._iter_keys():
+            key = (int(neighbor_id), slice_type)
+            hf[key], pp[key] = self._mobility_ratios(key)
+            radio[key] = self._best_radio_margin_db(int(neighbor_id), slice_type)
 
-        neighbor_count = counts.get((int(neighbor_id), slice_type), 0)
-        kappa_j = float(neighbor_count) / max(float(self.k_ref[slice_type]), 1e-9)
-        hf, pp = self._mobility_ratios((int(neighbor_id), slice_type))
-        v_j = float(sla_flags_by_gnb.get((int(neighbor_id), slice_type), 0.0))
-
-        desired = (
-            6.0 * b_ijk
-            + self.alpha_k * (kappa_j - self.k_target[slice_type])
-            + self.alpha_hf * hf
-            + self.alpha_pp * pp
-            + self.alpha_sla_target * v_j
+        return coordinated_neighbor_offsets(
+            source_id=self.gnb_id,
+            neighbor_ids=self.neighbor_ids,
+            slice_types=self.slice_types,
+            directional_bias=self.global_bias,
+            useful_load=loads,
+            sla_severity=sla_flags_by_gnb,
+            handover_failure_ratio=hf,
+            pingpong_ratio=pp,
+            best_radio_margin_db=radio,
         )
-        return float(np.clip(desired, -6.0, 6.0))
+
+    def _desired_offset(self, neighbor_id: int, slice_type: str) -> float:
+        """Coordinated desired offset for direction self.gnb_id -> neighbor_id."""
+        key = (int(neighbor_id), normalize_slice_type(slice_type))
+        return float(self._coordinated_desired_offsets().get(key, 0.0))
 
     def _build_observation(self) -> np.ndarray:
         counts = self._slice_counts()

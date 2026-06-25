@@ -114,32 +114,49 @@ def test_training_csv_is_compact_and_contains_before_after_loads():
     assert "action_0" not in row
     assert row["post_handover_settle_steps"] == "4"
     assert row["radio_measurement_steps"] == "6"
-    assert row["load_measurement_mode"] == "post_settle_window_average_useful_prbs"
+    assert row["prb_measurement_mode"] == "post_settle_window_average_useful_prbs"
     assert "load_start_g0_eMBB" not in row
     assert "load_end_g0_eMBB" not in row
-    assert "demand_load_start_g0_eMBB" in row
-    assert "demand_load_end_g0_eMBB" in row
-    assert "useful_load_start_g0_eMBB" in row
-    assert "useful_load_end_g0_eMBB" in row
-    assert "gnb_demand_load_start_g0" in row
-    assert "gnb_demand_load_end_g0" in row
-    assert "gnb_useful_load_start_g0" in row
-    assert "gnb_useful_load_end_g0" in row
-    assert "slice_demand_load_start_eMBB" in row
-    assert "slice_demand_load_end_eMBB" in row
-    assert "slice_useful_load_start_eMBB" in row
-    assert "slice_useful_load_end_eMBB" in row
+    assert "demand_load_start_g0_eMBB" not in row
+    assert "demand_load_end_g0_eMBB" not in row
+    assert "useful_load_start_g0_eMBB" not in row
+    assert "useful_load_end_g0_eMBB" not in row
+    assert "gnb_demand_load_start_g0" not in row
+    assert "gnb_demand_load_end_g0" not in row
+    assert "gnb_useful_load_start_g0" not in row
+    assert "gnb_useful_load_end_g0" not in row
+    assert "slice_demand_load_start_eMBB" not in row
+    assert "slice_demand_load_end_eMBB" not in row
+    assert "slice_useful_load_start_eMBB" not in row
+    assert "slice_useful_load_end_eMBB" not in row
     assert "network_total_load_start" not in row
     assert "network_total_load_end" not in row
-    assert "ppo_network_demand_load_start" in row
-    assert "ppo_network_demand_load_end" in row
+    assert "ppo_network_demand_load_start" not in row
+    assert "ppo_network_demand_load_end" not in row
     assert "radio_network_useful_load_end" not in row
-    assert "radio_network_total_useful_load_start" in row
-    assert "radio_network_total_useful_load_end" in row
-    assert "radio_mean_gnb_useful_load_start" in row
-    assert "radio_mean_gnb_useful_load_end" in row
-    assert "radio_max_gnb_useful_load_start" in row
-    assert "radio_max_gnb_useful_load_end" in row
+    assert "radio_network_total_useful_load_start" not in row
+    assert "radio_network_total_useful_load_end" not in row
+    assert "radio_mean_gnb_useful_load_start" not in row
+    assert "radio_mean_gnb_useful_load_end" not in row
+    assert "radio_max_gnb_useful_load_start" not in row
+    assert "radio_max_gnb_useful_load_end" not in row
+    assert "used_prb_start_g0_eMBB" in row
+    assert "used_prb_end_g0_eMBB" in row
+    assert "network_used_prb_start" in row
+    assert "network_used_prb_end" in row
+    assert "mean_gnb_used_prb_start" in row
+    assert "mean_gnb_used_prb_end" in row
+    assert "max_gnb_used_prb_start" in row
+    assert "max_gnb_used_prb_end" in row
+    assert "gnb_used_prb_start_g0" in row
+    assert "gnb_used_prb_end_g0" in row
+    assert "slice_used_prb_start_eMBB" in row
+    assert "slice_used_prb_end_eMBB" in row
+    assert "used_prb_balance_cost_start" in row
+    assert "used_prb_balance_cost_end" in row
+    assert "reward_used_prb_balance_improvement" in row
+    assert "reward_used_prb_balance_improvement_raw" in row
+    assert "reward_load_improvement" not in row
     assert "reward_served_share_improvement" in row
     assert "reward_served_share_improvement_raw" in row
     assert "served_share_cost_start" in row
@@ -152,8 +169,8 @@ def test_training_csv_is_compact_and_contains_before_after_loads():
     assert "served_active_floor_reference_g0" in row
     assert "served_active_floor_reference_g1" in row
     assert "served_active_floor_reference_g2" in row
-    assert float(row["radio_max_gnb_useful_load_start"]) <= 1.0 + 1e-9
-    assert float(row["radio_max_gnb_useful_load_end"]) <= 1.0 + 1e-9
+    assert float(row["max_gnb_used_prb_start"]) <= 100.0 + 1e-9
+    assert float(row["max_gnb_used_prb_end"]) <= 100.0 + 1e-9
     assert float(row["network_queue_kbits"]) >= 0.0
 
 
@@ -165,7 +182,7 @@ def test_training_csv_generates_learning_curve():
             writer = csv.DictWriter(
                 fh,
                 fieldnames=[
-                    "step", "reward", "load_imbalance_end",
+                    "step", "reward", "used_prb_balance_cost_end",
                     "handover_count", "bias_g1_to_g0_eMBB",
                     "bias_g1_to_g2_eMBB",
                 ],
@@ -175,7 +192,7 @@ def test_training_csv_generates_learning_curve():
                 writer.writerow({
                     "step": step,
                     "reward": step / 20.0,
-                    "load_imbalance_end": 1.0 - step / 20.0,
+                    "used_prb_balance_cost_end": 1.0 - step / 20.0,
                     "handover_count": min(step / 10.0, 3.0),
                     "bias_g1_to_g0_eMBB": 0.2,
                     "bias_g1_to_g2_eMBB": -step / 20.0,

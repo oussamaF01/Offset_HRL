@@ -79,8 +79,8 @@ def test_reward_matches_pdf_terms_plus_balanced_nonzero_bias_penalty():
             info["reward_load_improvement"]
             + info["reward_saturation_improvement"]
             + info["reward_excess_load_improvement"]
-            + info["reward_served_share_improvement"]
             + info["reward_served_active_floor"]
+            + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
         )
@@ -139,8 +139,8 @@ def test_load_improvement_is_scaled_by_starting_imbalance():
             info["reward_load_improvement"]
             + info["reward_saturation_improvement"]
             + info["reward_excess_load_improvement"]
-            + info["reward_served_share_improvement"]
             + info["reward_served_active_floor"]
+            + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
         )
@@ -167,8 +167,8 @@ def test_sla_is_logged_but_cannot_change_upper_routing_reward():
             info["reward_load_improvement"]
             + info["reward_saturation_improvement"]
             + info["reward_excess_load_improvement"]
-            + info["reward_served_share_improvement"]
             + info["reward_served_active_floor"]
+            + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
         )
@@ -313,8 +313,8 @@ def test_legacy_source_shaping_does_not_change_directional_reward():
             info["reward_load_improvement"]
             + info["reward_saturation_improvement"]
             + info["reward_excess_load_improvement"]
-            + info["reward_served_share_improvement"]
             + info["reward_served_active_floor"]
+            + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
         )

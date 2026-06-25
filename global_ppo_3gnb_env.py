@@ -165,6 +165,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         served_share_reward_weight: float = 1.0,
         served_active_floor_reward_weight: float = 1.0,
         served_active_floor: float = 0.20,
+        jain_fairness_weight: float = 1.0,
         a3_handover_cooldown_s: float = 2.0,
         a3_min_residence_s: float = 2.0,
         a3_history_window_s: float = 20.0,
@@ -273,6 +274,7 @@ class GlobalPPO3GNBEnv(gym.Env):
             float(served_active_floor_reward_weight), 0.0
         )
         self.served_active_floor = float(np.clip(served_active_floor, 0.0, 1.0))
+        self.jain_fairness_weight = max(float(jain_fairness_weight), 0.0)
         self.a3_handover_cooldown_s = max(float(a3_handover_cooldown_s), 0.0)
         self.a3_min_residence_s = max(float(a3_min_residence_s), self.a3_handover_cooldown_s)
         self.a3_history_window_s = max(float(a3_history_window_s), 0.0)
@@ -307,9 +309,10 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=np.float32,
         )
         # Directional upper state:
-        # [L_i,s, normalized K_i,s, SLA_i,s, previous B_i,k,s].
+        # [L_i,s, normalized K_i,s, SLA_i,s, demand_i (per gNB), previous B_i,k,s].
         obs_dim = (
             self.n_gnbs * len(self.slice_types) * 3
+            + self.n_gnbs
             + action_dim
         )
         self.observation_space = gym.spaces.Box(
@@ -342,6 +345,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         self._episode_start_imbalance = 0.0
         self._episode_start_variance = 0.0
         self._episode_served_floor_reference_loads = np.zeros(
+            (self.n_gnbs, len(self.slice_types)),
+            dtype=float,
+        )
+        self._episode_start_useful_prb_matrix = np.zeros(
             (self.n_gnbs, len(self.slice_types)),
             dtype=float,
         )
@@ -411,6 +418,10 @@ class GlobalPPO3GNBEnv(gym.Env):
             (self.n_gnbs, len(self.slice_types)),
             dtype=float,
         )
+        self._episode_start_useful_prb_matrix = np.zeros(
+            (self.n_gnbs, len(self.slice_types)),
+            dtype=float,
+        )
         for agent in self.lower_agents.values():
             agent.reset()
 
@@ -435,6 +446,9 @@ class GlobalPPO3GNBEnv(gym.Env):
         self._episode_start_imbalance = self._load_balance_cost(reset_loads)
         self._episode_start_variance = self._load_variance(reset_loads)
         self._episode_served_floor_reference_loads = reset_loads.copy()
+        self._episode_start_useful_prb_matrix = self._load_to_useful_prb_matrix(
+            reset_loads
+        )
         reset_cost = self._load_balance_cost(reset_loads)
         obs = self._get_observation()
         info = self._build_info(
@@ -576,9 +590,14 @@ class GlobalPPO3GNBEnv(gym.Env):
             if self._previous_window_average_loads is not None
             else self._current_useful_load_matrix()
         )
-        start_variance = self._load_variance(start_loads)
-        start_saturation = self._saturation_count(start_loads)
-        start_imbalance = self._load_balance_cost(start_loads)
+        reward_start_loads = (
+            self._episode_served_floor_reference_loads.copy()
+            if np.any(self._episode_served_floor_reference_loads)
+            else start_loads.copy()
+        )
+        start_variance = self._load_variance(reward_start_loads)
+        start_saturation = self._saturation_count(reward_start_loads)
+        start_imbalance = self._load_balance_cost(reward_start_loads)
         instant_rewards = []
         start_handover_idx = len(getattr(self.base_env, "handover_events", []))
 
@@ -629,6 +648,10 @@ class GlobalPPO3GNBEnv(gym.Env):
 
         useful_window_loads = self._window_average_load_matrix()
         end_loads = useful_window_loads.copy()
+        start_used_prbs = self._episode_start_useful_prb_matrix.copy()
+        if not np.any(start_used_prbs):
+            start_used_prbs = self._load_to_useful_prb_matrix(reward_start_loads)
+        end_used_prbs = self._load_to_useful_prb_matrix(end_loads)
         end_demand_loads = self._load_matrix()
         self._calibrate_demand_from_radio_window()
         self._previous_window_average_loads = end_loads.copy()
@@ -645,15 +668,18 @@ class GlobalPPO3GNBEnv(gym.Env):
             if self._previous_window_sla_severity is None
             else float(self._previous_window_sla_severity)
         )
+        start_used_prb_balance_cost = self._used_prb_balance_cost(start_used_prbs)
+        end_used_prb_balance_cost = self._used_prb_balance_cost(end_used_prbs)
         start_cost = float(
-            self.global_reward_mu * start_variance
+            self.global_reward_mu * start_used_prb_balance_cost
             + self.global_reward_zeta * start_saturation
         )
         end_cost = float(
-            self.global_reward_mu * end_variance
+            self.global_reward_mu * end_used_prb_balance_cost
             + self.global_reward_zeta * end_saturation
         )
-        end_imbalance = self._load_balance_cost(end_loads)
+        start_imbalance = float(start_used_prb_balance_cost)
+        end_imbalance = float(end_used_prb_balance_cost)
         action_penalty = self._bias_smoothness_penalty(
             directional_bias,
             previous_directional_bias,
@@ -670,8 +696,8 @@ class GlobalPPO3GNBEnv(gym.Env):
         #
         # Source-collapsed sign shaping from the old B[i,s] action is excluded.
         # Target choice must be learned from the actual network outcome.
-        raw_load_improvement = float(start_imbalance - end_imbalance)
-        active_slice_count = self._active_slice_count(start_loads)
+        raw_load_improvement = float(start_used_prb_balance_cost - end_used_prb_balance_cost)
+        active_slice_count = self._active_slice_count(reward_start_loads)
         load_reward = float(
             np.clip(
                 raw_load_improvement / max(start_imbalance, 0.05),
@@ -693,7 +719,7 @@ class GlobalPPO3GNBEnv(gym.Env):
             self._effective_gnb_load_target()
         )
         start_excess_cost = self._gnb_excess_load_cost(
-            start_loads, effective_load_target
+            reward_start_loads, effective_load_target
         )
         end_excess_cost = self._gnb_excess_load_cost(
             end_loads, effective_load_target
@@ -706,19 +732,13 @@ class GlobalPPO3GNBEnv(gym.Env):
                 1.0,
             )
         )
-        start_served_share_cost = self._gnb_total_share_cost(start_loads)
-        end_served_share_cost = self._gnb_total_share_cost(end_loads)
-        raw_served_share_improvement = (
-            start_served_share_cost - end_served_share_cost
-        )
-        served_share_reward = self.served_share_reward_weight * float(
-            np.clip(
-                raw_served_share_improvement
-                / max(start_served_share_cost, 0.01),
-                -1.0,
-                1.0,
-            )
-        )
+        start_served_share_cost = self._used_prb_balance_cost(start_used_prbs)
+        end_served_share_cost = self._used_prb_balance_cost(end_used_prbs)
+        # In the useful-PRB objective, served-share balance is the same
+        # quantity as the main PRB balance term.  Keep the costs for logging,
+        # but do not double-count the same improvement in the reward.
+        raw_served_share_improvement = 0.0
+        served_share_reward = 0.0
         served_floor_reference_loads = (
             self._episode_served_floor_reference_loads
         )
@@ -740,6 +760,15 @@ class GlobalPPO3GNBEnv(gym.Env):
         # SLA remains observable for diagnostics and admission safety, but it
         # is deliberately excluded from the upper routing-agent objective.
         sla_reward = 0.0
+        # State-based Jain fairness reward on persistent PRB demand.
+        # Range [0, 1]: 1.0 when demand is equally distributed across all gNBs,
+        # 0.0 when all demand is concentrated in one gNB. This signal is
+        # independent of history — the agent is rewarded for BEING in a fair
+        # state, not just for improving from the previous step.
+        jain_raw = self._demand_jain_fairness()
+        n = float(self.n_gnbs)
+        jain_normalized = (jain_raw - 1.0 / n) / max(1.0 - 1.0 / n, 1e-9)
+        jain_reward = self.jain_fairness_weight * jain_normalized
         # Upper PPO reward uses the post-settle radio window useful PRB load.
         # Demand PRBs remain logged separately as a conserved routing diagnostic.
         window_reward = float(
@@ -748,6 +777,7 @@ class GlobalPPO3GNBEnv(gym.Env):
             + excess_load_reward
             + served_share_reward
             + served_floor_reward
+            + jain_reward
             - action_penalty
             - negative_bias_penalty
         )
@@ -775,7 +805,7 @@ class GlobalPPO3GNBEnv(gym.Env):
             handovers=total_handovers,
             start_imbalance=start_imbalance,
             end_imbalance=end_imbalance,
-            start_loads=start_loads,
+            start_loads=reward_start_loads,
             end_loads=end_loads,
         )
         info["dense_window_reward"] = float(dense_reward)
@@ -815,9 +845,35 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["gnb_load_target_effective"] = float(effective_load_target)
         info["gnb_load_target_feasible"] = bool(base_target_feasible)
         info["persistent_demand_utilization"] = float(demand_utilization)
+        info["used_prb_matrix_start"] = start_used_prbs.copy()
+        info["used_prb_matrix_end"] = end_used_prbs.copy()
+        info["gnb_used_prb_start"] = np.sum(start_used_prbs, axis=1)
+        info["gnb_used_prb_end"] = np.sum(end_used_prbs, axis=1)
+        info["slice_used_prb_start"] = np.sum(start_used_prbs, axis=0)
+        info["slice_used_prb_end"] = np.sum(end_used_prbs, axis=0)
+        info["used_prb_balance_cost_start"] = float(start_used_prb_balance_cost)
+        info["used_prb_balance_cost_end"] = float(end_used_prb_balance_cost)
+        info["reward_used_prb_balance_improvement"] = float(load_reward)
+        info["reward_used_prb_balance_improvement_raw"] = float(raw_load_improvement)
         info["useful_load_matrix_end"] = useful_window_loads.copy()
         info["demand_load_matrix_start"] = start_demand_loads.copy()
         info["demand_load_matrix_end"] = end_demand_loads.copy()
+        info["reward_jain_fairness"] = float(jain_reward)
+        info["jain_fairness_raw"] = float(jain_raw)
+        info["jain_fairness_normalized"] = float(jain_normalized)
+        info["jain_per_gnb_demand_prbs"] = np.asarray(
+            [
+                sum(
+                    int(getattr(ue, "upper_demand_prbs", 0))
+                    for ue in self.base_env.get_all_ues()
+                    if ue.connected
+                    and ue.serving_gnb is not None
+                    and int(ue.serving_gnb) == gnb_id
+                )
+                for gnb_id in range(self.n_gnbs)
+            ],
+            dtype=int,
+        )
         info["reward_sla_improvement"] = float(sla_reward)
         # Backward-compatible zeroes for older notebooks; these legacy shaping
         # terms are not part of the active upper-agent reward or training CSV.
@@ -880,10 +936,28 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=float,
         )
         sla = np.clip(self._sla_matrix(), 0.0, 1.0).reshape(-1)
+        # Per-gNB normalized demand: sum of upper_demand_prbs / gNB capacity.
+        # Gives the agent a noise-free view of the demand distribution it is
+        # rewarded on (Jain fairness), independent of scheduler saturation.
+        capacities = self._gnb_prb_capacities()
+        demand_load = np.asarray(
+            [
+                sum(
+                    int(getattr(ue, "upper_demand_prbs", 0))
+                    for ue in self.base_env.get_all_ues()
+                    if ue.connected
+                    and ue.serving_gnb is not None
+                    and int(ue.serving_gnb) == gnb_id
+                ) / max(float(capacities[gnb_id]), 1.0)
+                for gnb_id in range(self.n_gnbs)
+            ],
+            dtype=float,
+        )
         obs = np.concatenate((
             loads,
             counts,
             sla,
+            demand_load,
             self._last_directional_bias_tensor.reshape(-1),
         ))
         return np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
@@ -1408,6 +1482,64 @@ class GlobalPPO3GNBEnv(gym.Env):
         totals = np.sum(np.asarray(loads, dtype=float), axis=1)
         target = float(np.mean(totals)) if totals.size else 0.0
         return float(np.mean((totals - target) ** 2))
+
+    def _gnb_prb_capacities(self) -> np.ndarray:
+        return np.asarray(
+            [
+                max(
+                    float(
+                        getattr(
+                            self.base_env._get_gnb_by_id(gnb_id),
+                            "n_prbs",
+                            0.0,
+                        )
+                    ),
+                    1.0,
+                )
+                for gnb_id in range(self.n_gnbs)
+            ],
+            dtype=float,
+        )
+
+    def _load_to_useful_prb_matrix(self, loads: np.ndarray) -> np.ndarray:
+        loads = np.asarray(loads, dtype=float)
+        capacities = self._gnb_prb_capacities()[:, None]
+        return np.maximum(loads, 0.0) * capacities
+
+    def _used_prb_balance_cost(self, used_prb_matrix: np.ndarray) -> float:
+        """Mean squared gNB used-PRB imbalance, normalized by physical capacity."""
+        used = np.asarray(used_prb_matrix, dtype=float)
+        totals = np.sum(np.maximum(used, 0.0), axis=1)
+        target = float(np.mean(totals)) if totals.size else 0.0
+        capacity = float(np.mean(self._gnb_prb_capacities()))
+        return float(np.mean((totals - target) ** 2) / max(capacity ** 2, 1.0))
+
+    def _demand_jain_fairness(self) -> float:
+        """Jain's fairness index on per-gNB sum of upper_demand_prbs.
+
+        Returns a value in [1/n_gnbs, 1.0]:
+          1.0  → PRB demand perfectly equal across all gNBs
+          1/n  → all demand concentrated in a single gNB
+        Uses upper_demand_prbs (conserved UE property) so the signal is
+        noise-free and does not depend on the radio scheduler output.
+        """
+        demands = np.asarray(
+            [
+                float(sum(
+                    int(getattr(ue, "upper_demand_prbs", 0))
+                    for ue in self.base_env.get_all_ues()
+                    if ue.connected
+                    and ue.serving_gnb is not None
+                    and int(ue.serving_gnb) == gnb_id
+                ))
+                for gnb_id in range(self.n_gnbs)
+            ],
+            dtype=float,
+        )
+        sum_sq = float(np.sum(demands ** 2))
+        if sum_sq <= 0.0:
+            return 1.0
+        return float(np.sum(demands) ** 2) / (self.n_gnbs * sum_sq)
 
     def _served_active_floor_cost(
         self,

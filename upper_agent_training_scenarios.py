@@ -100,6 +100,25 @@ CENTER_INNER_4 = (
     (132.0, 30.0),
 )
 
+# UEs placed at the equidistant midpoint between gNB1 and gNB0/gNB2 (medium_270m).
+# At x=±135m (with y=±30) each UE is exactly 138.3m from both its serving gNB1
+# and the neighbouring outer gNB, giving a 0 dB signal difference.
+# A3 condition: RSRP_target > RSRP_serving + offset + hysteresis (1 dB)
+#   offset <  −1 dB  (bias < −0.167) → A3 fires
+#   offset >= −1 dB                  → A3 blocked
+#   offset =  +6 dB                  → A3 completely blocked
+# This gives the maximum ±6 dB controllability range of any fixed UE placement.
+JAIN_CONTROL_6 = (
+    (-135.0, -30.0),
+    (135.0, -30.0),
+    (-135.0, 0.0),
+    (135.0, 0.0),
+    (-135.0, 30.0),
+    (135.0, 30.0),
+)
+JAIN_CONTROL_6_UPPER = tuple((x, y + 12.0) for x, y in JAIN_CONTROL_6)
+JAIN_CONTROL_6_LOWER = tuple((x, y - 12.0) for x, y in JAIN_CONTROL_6)
+
 
 # Slice-aware traffic scenarios. The three gap topologies remain independent:
 # selecting a topology changes gNB overlap only, not these UE coordinates.
@@ -364,6 +383,99 @@ UPPER_TRAINING_SCENARIOS = (
             "Asymmetric neighbor loads with center UEs in inner zone.  Left "
             "gNB is pre-loaded to 0.54, right is near-empty at 0.12 — agent "
             "must learn directional preference toward gNB-2 in one upper step."
+        ),
+    ),
+    # ── Jain-fairness-optimised scenario ─────────────────────────────────────
+    # UEs sit at the equidistant midpoint between gNB1 and the outer gNBs
+    # (x = ±135 m in medium_270m → both distances = 138.3 m, Δ RSRP = 0 dB).
+    # Full ±6 dB offset range controls the A3 outcome:
+    #   bias > −0.167  (offset > −1 dB) → A3 blocked, UEs stay on gNB1
+    #   bias < −0.167  (offset < −1 dB) → A3 fires,   UEs move to outer gNBs
+    # All demand starts on gNB1 (Jain = 1/3). A small negative bias produces
+    # three symmetric handovers that drive Jain to ≈ 1.0 in a single upper step.
+    UpperTrainingScenario(
+        "jain_balance_controllable",
+        1.0,
+        (
+            UpperUEGroup(
+                "eMBB", 1, 6, 0.90,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6,
+                placement_region="overlap",
+            ),
+        ),
+        (
+            "Six eMBB UEs at the gNB1/outer equidistant midpoint (±135 m). "
+            "Signal difference = 0 dB so A3 fires with any bias below −0.17 and "
+            "is fully blocked at +1.0. All demand on gNB1 (Jain = 1/3); the agent "
+            "must apply a small negative bias to trigger three outward handovers "
+            "and reach Jain ≈ 1.0 — maximum ±6 dB offset controllability."
+        ),
+    ),
+    UpperTrainingScenario(
+        "jain_control_urllc",
+        1.0,
+        (
+            UpperUEGroup(
+                "URLLC", 1, 6, 0.72,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6_UPPER,
+                placement_region="overlap",
+            ),
+        ),
+        (
+            "URLLC-only controlled Jain scenario: six midpoint UEs start on "
+            "gNB1 with the same A3 controllability as jain_balance_controllable, "
+            "but shifted slightly upward so slice placement is distinct."
+        ),
+    ),
+    UpperTrainingScenario(
+        "jain_control_mmtc",
+        1.0,
+        (
+            UpperUEGroup(
+                "mMTC", 1, 6, 0.60,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6_LOWER,
+                placement_region="overlap",
+            ),
+        ),
+        (
+            "mMTC-only controlled Jain scenario: six midpoint UEs start on "
+            "gNB1 with symmetric left/right handover controllability and a "
+            "slightly lower placement band."
+        ),
+    ),
+    UpperTrainingScenario(
+        "jain_control_mixed",
+        1.0,
+        (
+            UpperUEGroup(
+                "eMBB", 1, 6, 0.36,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6,
+                placement_region="overlap",
+            ),
+            UpperUEGroup(
+                "URLLC", 1, 6, 0.30,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6_UPPER,
+                placement_region="overlap",
+            ),
+            UpperUEGroup(
+                "mMTC", 1, 6, 0.24,
+                speed_mps=0.0,
+                fixed_source_offsets_m=JAIN_CONTROL_6_LOWER,
+                placement_region="overlap",
+            ),
+        ),
+        (
+            "Mixed controlled Jain scenario: eMBB, URLLC, and mMTC each have "
+            "six controllable midpoint UEs starting on gNB1. A correct policy "
+            "must open both outer directions for all active slices while safe "
+            "admission limits the released volume; per-slice loads are kept "
+            "below saturation so this scenario tests controllability rather "
+            "than raw target capacity."
         ),
     ),
 )
