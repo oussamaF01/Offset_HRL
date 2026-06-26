@@ -50,7 +50,9 @@ DIRECTIONAL_BIAS_FIELDS = [
 MATRIX_FIELDS = [
     f"{prefix}_g{gnb_id}_{slice_type}"
     for prefix in (
+        "target_load", "balance_target",
         "used_prb_start", "used_prb_end",
+        "demand_prb_start", "demand_prb_end",
         "sla", "ue_count",
     )
     for gnb_id in GNB_IDS
@@ -67,6 +69,21 @@ USED_PRB_TOTAL_FIELDS = (
     ]
     + [
         f"slice_used_prb_{phase}_{slice_type}"
+        for phase in ("start", "end")
+        for slice_type in SLICE_TYPES
+    ]
+)
+DEMAND_PRB_TOTAL_FIELDS = (
+    [f"network_demand_prb_{phase}" for phase in ("start", "end")]
+    + [f"mean_gnb_demand_prb_{phase}" for phase in ("start", "end")]
+    + [f"max_gnb_demand_prb_{phase}" for phase in ("start", "end")]
+    + [
+        f"gnb_demand_prb_{phase}_g{gnb_id}"
+        for phase in ("start", "end")
+        for gnb_id in GNB_IDS
+    ]
+    + [
+        f"slice_demand_prb_{phase}_{slice_type}"
         for phase in ("start", "end")
         for slice_type in SLICE_TYPES
     ]
@@ -118,11 +135,23 @@ TRAINING_FIELDS = [
     "post_handover_settle_steps",
     "radio_measurement_steps",
     "prb_measurement_mode",
+    "required_handover_settle_steps",
+    "effective_handover_settle_steps",
+    "handover_settle_truncated",
+    "dynamic_upper_window_enabled",
+    "fixed_local_steps_per_global",
+    "dynamic_local_steps_per_global",
+    "total_raw_directional_budget",
+    "total_accepted_directional_budget",
+    "dynamic_required_execution_steps",
+    "dynamic_window_capped",
     *USED_PRB_TOTAL_FIELDS,
+    *DEMAND_PRB_TOTAL_FIELDS,
     "overload_ratio",
     "sla_count",
     "sla_severity",
     "handover_count",
+    "upper_window_handover_sequence",
     "used_prb_balance_cost_start",
     "used_prb_balance_cost_end",
     "global_cost_start",
@@ -130,8 +159,51 @@ TRAINING_FIELDS = [
     "global_cost_improvement",
     "global_action_penalty",
     "global_negative_bias_penalty",
+    "global_contradictory_bias_penalty",
+    "global_contradictory_bias_raw",
     "reward_used_prb_balance_improvement",
     "reward_used_prb_balance_improvement_raw",
+    "upper_reward_mode",
+    "paper_cost_reward",
+    "paper_load_source",
+    "paper_load_std_penalty",
+    "paper_demand_load_std",
+    "paper_useful_load_std",
+    "paper_excess_load_mean",
+    "paper_excess_load_penalty",
+    "paper_handover_penalty",
+    "paper_pingpong_penalty",
+    "paper_handover_ratio",
+    "paper_pingpong_ratio",
+    "paper_pingpong_count",
+    "paper_delta_cost_start",
+    "paper_delta_cost_end",
+    "paper_delta_cost_improvement",
+    "paper_delta_handover_weight",
+    "paper_delta_adaptive_handover_penalty",
+    "paper_delta_sla_penalty_start",
+    "paper_delta_sla_penalty_end",
+    "paper_delta_excess_penalty_start",
+    "paper_delta_excess_penalty_end",
+    "paper_delta_reward",
+    "paper_target_cost_start",
+    "paper_target_cost_end",
+    "paper_target_cost_improvement",
+    "paper_target_error_start",
+    "paper_target_error_end",
+    "paper_target_load_std_start",
+    "paper_target_load_std_end",
+    "paper_target_excess_start",
+    "paper_target_excess_end",
+    "paper_target_sla_start",
+    "paper_target_sla_end",
+    "paper_target_source_under_penalty",
+    "paper_target_wrong_direction_penalty",
+    "paper_target_handover_weight",
+    "paper_target_handover_penalty",
+    "paper_target_pingpong_ratio",
+    "paper_target_handover_failure_ratio",
+    "paper_target_reward",
     "reward_active_slice_count",
     "reward_saturation_improvement",
     "reward_excess_load_improvement",
@@ -149,6 +221,11 @@ TRAINING_FIELDS = [
     "jain_fairness_raw",
     "jain_fairness_normalized",
     "jain_demand_raw",
+    "gnb_total_demand_load_std_end",
+    "gnb_total_demand_load_std_start",
+    *[f"gnb_total_demand_load_end_g{g}" for g in GNB_IDS],
+    *[f"gnb_total_demand_load_start_g{g}" for g in GNB_IDS],
+    *[f"gnb_total_demand_excess_end_g{g}" for g in GNB_IDS],
     "gnb_total_useful_load_std_end",
     "gnb_total_useful_load_std_start",
     *[f"gnb_total_useful_load_end_g{g}" for g in GNB_IDS],
@@ -327,6 +404,8 @@ class UpperTrainingCsvCallback(BaseCallback):
         rollout_step_in_update = ((int(self.num_timesteps) - 1) % ppo_n_steps) + 1
         used_prb_start = info.get("used_prb_matrix_start", [])
         used_prb_end = info.get("used_prb_matrix_end", [])
+        demand_prb_start = info.get("demand_prb_matrix_start", [])
+        demand_prb_end = info.get("demand_prb_matrix_end", [])
         overloaded_negative, light_nonnegative = _bias_quality_scores(
             info.get("directional_bias_tensor", []),
             info.get("load_matrix", []),
@@ -358,12 +437,51 @@ class UpperTrainingCsvCallback(BaseCallback):
             "prb_measurement_mode": str(
                 info.get("load_measurement_mode", "")
             ),
+            "required_handover_settle_steps": int(
+                info.get("required_handover_settle_steps", 0)
+            ),
+            "effective_handover_settle_steps": int(
+                info.get(
+                    "effective_handover_settle_steps",
+                    info.get("post_handover_settle_steps", 0),
+                )
+            ),
+            "handover_settle_truncated": bool(
+                info.get("handover_settle_truncated", False)
+            ),
+            "dynamic_upper_window_enabled": bool(
+                info.get("dynamic_upper_window_enabled", False)
+            ),
+            "fixed_local_steps_per_global": int(
+                info.get("fixed_local_steps_per_global", 0)
+            ),
+            "dynamic_local_steps_per_global": int(
+                info.get("dynamic_local_steps_per_global", 0)
+            ),
+            "total_raw_directional_budget": int(
+                info.get("total_raw_directional_budget", 0)
+            ),
+            "total_accepted_directional_budget": int(
+                info.get("total_accepted_directional_budget", 0)
+            ),
+            "dynamic_required_execution_steps": int(
+                info.get("dynamic_required_execution_steps", 0)
+            ),
+            "dynamic_window_capped": bool(
+                info.get("dynamic_window_capped", False)
+            ),
             "network_used_prb_start": _matrix_sum(used_prb_start),
             "network_used_prb_end": _matrix_sum(used_prb_end),
             "mean_gnb_used_prb_start": _row_sum_mean(used_prb_start),
             "mean_gnb_used_prb_end": _row_sum_mean(used_prb_end),
             "max_gnb_used_prb_start": _row_sum_max(used_prb_start),
             "max_gnb_used_prb_end": _row_sum_max(used_prb_end),
+            "network_demand_prb_start": _matrix_sum(demand_prb_start),
+            "network_demand_prb_end": _matrix_sum(demand_prb_end),
+            "mean_gnb_demand_prb_start": _row_sum_mean(demand_prb_start),
+            "mean_gnb_demand_prb_end": _row_sum_mean(demand_prb_end),
+            "max_gnb_demand_prb_start": _row_sum_max(demand_prb_start),
+            "max_gnb_demand_prb_end": _row_sum_max(demand_prb_end),
             "overload_ratio": float(info.get("overload_ratio", 0.0)),
             "sla_count": float(info.get("sla_count", 0.0)),
             "sla_severity": float(info.get("sla_severity", 0.0)),
@@ -381,12 +499,77 @@ class UpperTrainingCsvCallback(BaseCallback):
             "global_negative_bias_penalty": float(
                 info.get("global_negative_bias_penalty", 0.0)
             ),
+            "global_contradictory_bias_penalty": float(
+                info.get("global_contradictory_bias_penalty", 0.0)
+            ),
+            "global_contradictory_bias_raw": float(
+                info.get("global_contradictory_bias_raw", 0.0)
+            ),
             "reward_used_prb_balance_improvement": float(
                 info.get("reward_used_prb_balance_improvement", 0.0)
             ),
             "reward_used_prb_balance_improvement_raw": float(
                 info.get("reward_used_prb_balance_improvement_raw", 0.0)
             ),
+            "upper_reward_mode": str(info.get("upper_reward_mode", "paper_cost")),
+            "paper_cost_reward": float(info.get("paper_cost_reward", 0.0)),
+            "paper_load_source": str(info.get("paper_load_source", "")),
+            "paper_load_std_penalty": float(
+                info.get("paper_load_std_penalty", 0.0)
+            ),
+            "paper_demand_load_std": float(
+                info.get("paper_demand_load_std", 0.0)
+            ),
+            "paper_useful_load_std": float(
+                info.get("paper_useful_load_std", 0.0)
+            ),
+            "paper_excess_load_mean": float(
+                info.get("paper_excess_load_mean", 0.0)
+            ),
+            "paper_excess_load_penalty": float(
+                info.get("paper_excess_load_penalty", 0.0)
+            ),
+            "paper_handover_penalty": float(
+                info.get("paper_handover_penalty", 0.0)
+            ),
+            "paper_pingpong_penalty": float(
+                info.get("paper_pingpong_penalty", 0.0)
+            ),
+            "paper_handover_ratio": float(
+                info.get("paper_handover_ratio", 0.0)
+            ),
+            "paper_pingpong_ratio": float(
+                info.get("paper_pingpong_ratio", 0.0)
+            ),
+            "paper_pingpong_count": int(info.get("paper_pingpong_count", 0)),
+            "paper_delta_cost_start": float(info.get("paper_delta_cost_start", 0.0)),
+            "paper_delta_cost_end": float(info.get("paper_delta_cost_end", 0.0)),
+            "paper_delta_cost_improvement": float(info.get("paper_delta_cost_improvement", 0.0)),
+            "paper_delta_handover_weight": float(info.get("paper_delta_handover_weight", 0.0)),
+            "paper_delta_adaptive_handover_penalty": float(info.get("paper_delta_adaptive_handover_penalty", 0.0)),
+            "paper_delta_sla_penalty_start": float(info.get("paper_delta_sla_penalty_start", 0.0)),
+            "paper_delta_sla_penalty_end": float(info.get("paper_delta_sla_penalty_end", 0.0)),
+            "paper_delta_excess_penalty_start": float(info.get("paper_delta_excess_penalty_start", 0.0)),
+            "paper_delta_excess_penalty_end": float(info.get("paper_delta_excess_penalty_end", 0.0)),
+            "paper_delta_reward": float(info.get("paper_delta_reward", 0.0)),
+            "paper_target_cost_start": float(info.get("paper_target_cost_start", 0.0)),
+            "paper_target_cost_end": float(info.get("paper_target_cost_end", 0.0)),
+            "paper_target_cost_improvement": float(info.get("paper_target_cost_improvement", 0.0)),
+            "paper_target_error_start": float(info.get("paper_target_error_start", 0.0)),
+            "paper_target_error_end": float(info.get("paper_target_error_end", 0.0)),
+            "paper_target_load_std_start": float(info.get("paper_target_load_std_start", 0.0)),
+            "paper_target_load_std_end": float(info.get("paper_target_load_std_end", 0.0)),
+            "paper_target_excess_start": float(info.get("paper_target_excess_start", 0.0)),
+            "paper_target_excess_end": float(info.get("paper_target_excess_end", 0.0)),
+            "paper_target_sla_start": float(info.get("paper_target_sla_start", 0.0)),
+            "paper_target_sla_end": float(info.get("paper_target_sla_end", 0.0)),
+            "paper_target_source_under_penalty": float(info.get("paper_target_source_under_penalty", 0.0)),
+            "paper_target_wrong_direction_penalty": float(info.get("paper_target_wrong_direction_penalty", 0.0)),
+            "paper_target_handover_weight": float(info.get("paper_target_handover_weight", 0.0)),
+            "paper_target_handover_penalty": float(info.get("paper_target_handover_penalty", 0.0)),
+            "paper_target_pingpong_ratio": float(info.get("paper_target_pingpong_ratio", 0.0)),
+            "paper_target_handover_failure_ratio": float(info.get("paper_target_handover_failure_ratio", 0.0)),
+            "paper_target_reward": float(info.get("paper_target_reward", 0.0)),
             "reward_active_slice_count": int(
                 info.get("reward_active_slice_count", 0)
             ),
@@ -438,6 +621,30 @@ class UpperTrainingCsvCallback(BaseCallback):
             "jain_demand_raw": float(
                 info.get("jain_demand_raw", 0.0)
             ),
+            "gnb_total_demand_load_std_end": float(
+                info.get("gnb_total_demand_load_std_end", 0.0)
+            ),
+            "gnb_total_demand_load_std_start": float(
+                info.get("gnb_total_demand_load_std_start", 0.0)
+            ),
+            **{
+                f"gnb_total_demand_load_end_g{g}": float(
+                    np.asarray(info.get("gnb_total_demand_load_end", [0.0, 0.0, 0.0]))[g]
+                )
+                for g in GNB_IDS
+            },
+            **{
+                f"gnb_total_demand_load_start_g{g}": float(
+                    np.asarray(info.get("gnb_total_demand_load_start", [0.0, 0.0, 0.0]))[g]
+                )
+                for g in GNB_IDS
+            },
+            **{
+                f"gnb_total_demand_excess_end_g{g}": float(
+                    np.asarray(info.get("gnb_total_demand_excess_end", [0.0, 0.0, 0.0]))[g]
+                )
+                for g in GNB_IDS
+            },
             "gnb_total_useful_load_std_end": float(
                 info.get("gnb_total_useful_load_std_end", 0.0)
             ),
@@ -476,6 +683,9 @@ class UpperTrainingCsvCallback(BaseCallback):
             ),
             "reward_sla_improvement": float(info.get("reward_sla_improvement", 0.0)),
             "saturation_count": int(info.get("saturation_count", 0)),
+            "upper_window_handover_sequence": json.dumps(
+                info.get("upper_window_handover_sequence", [])
+            ),
             "overloaded_negative_fraction": overloaded_negative,
             "light_nonnegative_fraction": light_nonnegative,
             "directional_offset_tensor": _json_array(info.get("directional_offset_tensor", [])),
@@ -483,7 +693,10 @@ class UpperTrainingCsvCallback(BaseCallback):
                 {
                     ":".join(map(str, key)): value
                     for key, value in info.get("safe_admission", {})
-                    .get("capacities", {})
+                    .get(
+                        "direction_quota",
+                        info.get("safe_admission", {}).get("capacities", {}),
+                    )
                     .items()
                 }
             ),
@@ -491,7 +704,10 @@ class UpperTrainingCsvCallback(BaseCallback):
                 {
                     ":".join(map(str, key)): value
                     for key, value in info.get("safe_admission", {})
-                    .get("accepted", {})
+                    .get(
+                        "direction_used",
+                        info.get("safe_admission", {}).get("accepted", {}),
+                    )
                     .items()
                 }
             ),
@@ -499,7 +715,10 @@ class UpperTrainingCsvCallback(BaseCallback):
                 {
                     ":".join(map(str, key)): value
                     for key, value in info.get("safe_admission", {})
-                    .get("remaining", {})
+                    .get(
+                        "direction_remaining",
+                        info.get("safe_admission", {}).get("remaining", {}),
+                    )
                     .items()
                 }
             ),
@@ -507,7 +726,7 @@ class UpperTrainingCsvCallback(BaseCallback):
                 {
                     ":".join(map(str, key)): value
                     for key, value in info.get("safe_admission", {})
-                    .get("source_capacities", {})
+                    .get("quota", info.get("safe_admission", {}).get("source_capacities", {}))
                     .items()
                 }
             ),
@@ -515,7 +734,7 @@ class UpperTrainingCsvCallback(BaseCallback):
                 {
                     ":".join(map(str, key)): value
                     for key, value in info.get("safe_admission", {})
-                    .get("source_accepted", {})
+                    .get("used", info.get("safe_admission", {}).get("source_accepted", {}))
                     .items()
                 }
             ),
@@ -526,6 +745,8 @@ class UpperTrainingCsvCallback(BaseCallback):
         _add_qos_fields(row, info)
         _add_matrix_total_fields(row, "used_prb_start", used_prb_start)
         _add_matrix_total_fields(row, "used_prb_end", used_prb_end)
+        _add_matrix_total_fields(row, "demand_prb_start", demand_prb_start)
+        _add_matrix_total_fields(row, "demand_prb_end", demand_prb_end)
         _add_served_floor_reference_fields(
             row,
             info.get("served_active_floor_reference_gnb_loads", []),
@@ -538,6 +759,8 @@ class UpperTrainingCsvCallback(BaseCallback):
             ("balance_target", "balance_target_matrix"),
             ("used_prb_start", "used_prb_matrix_start"),
             ("used_prb_end", "used_prb_matrix_end"),
+            ("demand_prb_start", "demand_prb_matrix_start"),
+            ("demand_prb_end", "demand_prb_matrix_end"),
             ("sla", "sla_matrix"),
             ("ue_count", "ue_count_matrix"),
         ):
@@ -573,11 +796,28 @@ def resolve_upper_training_curriculum_args(args):
     has learned one stable control problem, so the default is a single retained
     scenario. Use --curriculum-training to intentionally train over a pool.
     """
+    if bool(getattr(args, "controllable_type1_training", False)):
+        type1_steps = max(int(getattr(args, "type1_phase_timesteps", 15_000)), 1)
+        mixed_steps = max(int(getattr(args, "mixed_phase_timesteps", 30_000)), 1)
+        args.training_scenarios = (
+            "jain_balance_controllable,"
+            "jain_control_urllc,"
+            "jain_control_mmtc,"
+            "jain_control_mixed"
+        )
+        args.curriculum_training = True
+        args.block_curriculum_training = False
+        args.scenario_selection = "controllable_type1_then_mixed"
+        args.curriculum_block_episodes = type1_steps
+        args.total_timesteps = (3 * type1_steps) + mixed_steps
+        return args
+
     if bool(getattr(args, "block_curriculum_training", False)):
         default_pool = (
-            "high_load_inner_embb,"
-            "high_load_inner_mixed,"
-            "high_load_inner_asymmetric"
+            "jain_balance_controllable,"
+            "jain_control_urllc,"
+            "jain_control_mmtc,"
+            "jain_control_mixed"
         )
         if str(getattr(args, "training_scenarios", "")).strip() == str(
             getattr(args, "single_training_scenario", "")
@@ -591,14 +831,15 @@ def resolve_upper_training_curriculum_args(args):
     if bool(getattr(args, "curriculum_training", False)):
         if not str(getattr(args, "training_scenarios", "")).strip():
             args.training_scenarios = (
-                "high_load_inner_embb,"
-                "high_load_inner_mixed,"
-                "high_load_inner_asymmetric"
+                "jain_balance_controllable,"
+                "jain_control_urllc,"
+                "jain_control_mmtc,"
+                "jain_control_mixed"
             )
         return args
 
     args.training_scenarios = str(
-        getattr(args, "single_training_scenario", "high_load_inner_asymmetric")
+        getattr(args, "single_training_scenario", "jain_balance_controllable")
     )
     args.scenario_selection = "cycle"
     return args
@@ -670,6 +911,19 @@ def make_env(args) -> Monitor:
         ),
         served_active_floor=getattr(args, "served_active_floor", 0.20),
         jain_fairness_weight=getattr(args, "jain_fairness_weight", 1.0),
+        upper_reward_mode=getattr(args, "upper_reward_mode", "paper_cost"),
+        paper_handover_penalty_weight=getattr(
+            args, "paper_handover_penalty_weight", 1.0
+        ),
+        paper_pingpong_penalty_weight=getattr(
+            args, "paper_pingpong_penalty_weight", 5.0
+        ),
+        paper_excess_load_penalty_weight=getattr(
+            args, "paper_excess_load_penalty_weight", 3.0
+        ),
+        contradictory_bias_penalty_weight=getattr(
+            args, "contradictory_bias_penalty_weight", 1.0
+        ),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
         training_scenarios=args.training_scenarios,
@@ -688,11 +942,15 @@ def make_env(args) -> Monitor:
         a3_min_residence_s=getattr(args, "a3_min_residence_s", 2.0),
         a3_history_window_s=getattr(args, "a3_history_window_s", 20.0),
         a3_pingpong_threshold_s=getattr(args, "a3_pingpong_threshold_s", 5.0),
-        safe_admission_enabled=getattr(args, "safe_admission", False),
+        safe_admission_enabled=getattr(args, "safe_admission", True),
         warmup_steps=getattr(args, "warmup_steps", 2),
         post_handover_settle_steps=getattr(args, "post_handover_settle_steps", 4),
         demand_calibration_alpha=getattr(
             args, "demand_calibration_alpha", 0.5
+        ),
+        dynamic_upper_window=getattr(args, "dynamic_upper_window", False),
+        max_dynamic_local_steps_per_global=getattr(
+            args, "max_dynamic_local_steps_per_global", 12
         ),
     )
     return Monitor(env)
@@ -752,6 +1010,8 @@ def evaluate_upper_policy(
             light_nonnegative_scores.append(light_nonnegative)
             used_prb_start = info.get("used_prb_matrix_start", [])
             used_prb_end = info.get("used_prb_matrix_end", [])
+            demand_prb_start = info.get("demand_prb_matrix_start", [])
+            demand_prb_end = info.get("demand_prb_matrix_end", [])
 
             rows.append({
                 "episode": int(episode),
@@ -779,6 +1039,12 @@ def evaluate_upper_policy(
                 "mean_gnb_used_prb_end": _row_sum_mean(used_prb_end),
                 "max_gnb_used_prb_start": _row_sum_max(used_prb_start),
                 "max_gnb_used_prb_end": _row_sum_max(used_prb_end),
+                "network_demand_prb_start": _matrix_sum(demand_prb_start),
+                "network_demand_prb_end": _matrix_sum(demand_prb_end),
+                "mean_gnb_demand_prb_start": _row_sum_mean(demand_prb_start),
+                "mean_gnb_demand_prb_end": _row_sum_mean(demand_prb_end),
+                "max_gnb_demand_prb_start": _row_sum_max(demand_prb_start),
+                "max_gnb_demand_prb_end": _row_sum_max(demand_prb_end),
                 "reward": float(reward),
                 "load_variance": float(info.get("load_variance", 0.0)),
                 "target_load_error": float(info.get("target_load_error", 0.0)),
@@ -803,12 +1069,49 @@ def evaluate_upper_policy(
                 "global_negative_bias_penalty": float(
                     info.get("global_negative_bias_penalty", 0.0)
                 ),
+                "global_contradictory_bias_penalty": float(
+                    info.get("global_contradictory_bias_penalty", 0.0)
+                ),
+                "global_contradictory_bias_raw": float(
+                    info.get("global_contradictory_bias_raw", 0.0)
+                ),
                 "reward_used_prb_balance_improvement": float(
                     info.get("reward_used_prb_balance_improvement", 0.0)
                 ),
                 "reward_used_prb_balance_improvement_raw": float(
                     info.get("reward_used_prb_balance_improvement_raw", 0.0)
                 ),
+                "upper_reward_mode": str(info.get("upper_reward_mode", "paper_cost")),
+                "paper_cost_reward": float(info.get("paper_cost_reward", 0.0)),
+                "paper_load_source": str(info.get("paper_load_source", "")),
+                "paper_load_std_penalty": float(
+                    info.get("paper_load_std_penalty", 0.0)
+                ),
+                "paper_demand_load_std": float(
+                    info.get("paper_demand_load_std", 0.0)
+                ),
+                "paper_useful_load_std": float(
+                    info.get("paper_useful_load_std", 0.0)
+                ),
+                "paper_excess_load_mean": float(
+                    info.get("paper_excess_load_mean", 0.0)
+                ),
+                "paper_excess_load_penalty": float(
+                    info.get("paper_excess_load_penalty", 0.0)
+                ),
+                "paper_handover_penalty": float(
+                    info.get("paper_handover_penalty", 0.0)
+                ),
+                "paper_pingpong_penalty": float(
+                    info.get("paper_pingpong_penalty", 0.0)
+                ),
+                "paper_handover_ratio": float(
+                    info.get("paper_handover_ratio", 0.0)
+                ),
+                "paper_pingpong_ratio": float(
+                    info.get("paper_pingpong_ratio", 0.0)
+                ),
+                "paper_pingpong_count": int(info.get("paper_pingpong_count", 0)),
                 "reward_active_slice_count": int(
                     info.get("reward_active_slice_count", 0)
                 ),
@@ -857,6 +1160,30 @@ def evaluate_upper_policy(
                 "jain_fairness_normalized": float(
                     info.get("jain_fairness_normalized", 0.0)
                 ),
+                "gnb_total_demand_load_std_end": float(
+                    info.get("gnb_total_demand_load_std_end", 0.0)
+                ),
+                "gnb_total_demand_load_std_start": float(
+                    info.get("gnb_total_demand_load_std_start", 0.0)
+                ),
+                **{
+                    f"gnb_total_demand_load_end_g{g}": float(
+                        np.asarray(info.get("gnb_total_demand_load_end", [0.0, 0.0, 0.0]))[g]
+                    )
+                    for g in GNB_IDS
+                },
+                **{
+                    f"gnb_total_demand_load_start_g{g}": float(
+                        np.asarray(info.get("gnb_total_demand_load_start", [0.0, 0.0, 0.0]))[g]
+                    )
+                    for g in GNB_IDS
+                },
+                **{
+                    f"gnb_total_demand_excess_end_g{g}": float(
+                        np.asarray(info.get("gnb_total_demand_excess_end", [0.0, 0.0, 0.0]))[g]
+                    )
+                    for g in GNB_IDS
+                },
                 "gnb_excess_load_cost_start": float(
                     info.get("gnb_excess_load_cost_start", 0.0)
                 ),
@@ -886,20 +1213,41 @@ def evaluate_upper_policy(
                 "safe_admission_capacities": json.dumps(
                     {
                         ":".join(map(str, key)): value
-                        for key, value in info.get("safe_admission", {}).get("capacities", {}).items()
+                        for key, value in info.get("safe_admission", {})
+                        .get(
+                            "direction_quota",
+                            info.get("safe_admission", {}).get("capacities", {}),
+                        )
+                        .items()
                     }
                 ),
                 "safe_admission_accepted": json.dumps(
                     {
                         ":".join(map(str, key)): value
-                        for key, value in info.get("safe_admission", {}).get("accepted", {}).items()
+                        for key, value in info.get("safe_admission", {})
+                        .get(
+                            "direction_used",
+                            info.get("safe_admission", {}).get("accepted", {}),
+                        )
+                        .items()
+                    }
+                ),
+                "safe_admission_remaining": json.dumps(
+                    {
+                        ":".join(map(str, key)): value
+                        for key, value in info.get("safe_admission", {})
+                        .get(
+                            "direction_remaining",
+                            info.get("safe_admission", {}).get("remaining", {}),
+                        )
+                        .items()
                     }
                 ),
                 "safe_admission_source_capacities": json.dumps(
                     {
                         ":".join(map(str, key)): value
                         for key, value in info.get("safe_admission", {})
-                        .get("source_capacities", {})
+                        .get("quota", info.get("safe_admission", {}).get("source_capacities", {}))
                         .items()
                     }
                 ),
@@ -907,7 +1255,7 @@ def evaluate_upper_policy(
                     {
                         ":".join(map(str, key)): value
                         for key, value in info.get("safe_admission", {})
-                        .get("source_accepted", {})
+                        .get("used", info.get("safe_admission", {}).get("source_accepted", {}))
                         .items()
                     }
                 ),
@@ -938,11 +1286,15 @@ def evaluate_upper_policy(
             _add_directional_bias_fields(
                 rows[-1], info.get("directional_bias_tensor", [])
             )
+            _add_matrix_total_fields(rows[-1], "demand_prb_start", demand_prb_start)
+            _add_matrix_total_fields(rows[-1], "demand_prb_end", demand_prb_end)
             for prefix, key in (
                 ("target_load", "target_load_matrix"),
                 ("balance_target", "balance_target_matrix"),
                 ("used_prb_start", "used_prb_matrix_start"),
                 ("used_prb_end", "used_prb_matrix_end"),
+                ("demand_prb_start", "demand_prb_matrix_start"),
+                ("demand_prb_end", "demand_prb_matrix_end"),
                 ("sla", "sla_matrix"),
                 ("ue_count", "ue_count_matrix"),
             ):
@@ -1143,7 +1495,7 @@ def main():
     parser.add_argument(
         "--training-scenarios",
         type=str,
-        default="high_load_inner_asymmetric",
+        default="jain_balance_controllable",
         help=(
             "Comma-separated slice-aware scenario names, or 'all'. In default "
             "single-scenario mode this is overwritten by --single-training-scenario. "
@@ -1153,7 +1505,7 @@ def main():
     parser.add_argument(
         "--single-training-scenario",
         type=str,
-        default="high_load_inner_asymmetric",
+        default="jain_balance_controllable",
         help=(
             "Scenario used by default upper PPO training. Keeping one scenario "
             "makes the previous-bias state and bias-smoothness reward coherent "
@@ -1175,6 +1527,27 @@ def main():
             "Train over a scenario pool in long blocks: repeat one scenario for "
             "--curriculum-block-episodes, then switch to the next scenario."
         ),
+    )
+    parser.add_argument(
+        "--controllable-type1-training",
+        action="store_true",
+        help=(
+            "Use the controllable setup: eMBB-only, URLLC-only, and mMTC-only "
+            "for --type1-phase-timesteps each, then jain_control_mixed for "
+            "--mixed-phase-timesteps."
+        ),
+    )
+    parser.add_argument(
+        "--type1-phase-timesteps",
+        type=int,
+        default=15_000,
+        help="Timesteps for each single-slice controllable phase.",
+    )
+    parser.add_argument(
+        "--mixed-phase-timesteps",
+        type=int,
+        default=30_000,
+        help="Timesteps for the final mixed controllable phase.",
     )
     parser.add_argument(
         "--curriculum-block-episodes",
@@ -1205,7 +1578,13 @@ def main():
     )
     parser.add_argument(
         "--scenario-selection",
-        choices=("cycle", "random", "staged", "block"),
+        choices=(
+            "cycle",
+            "random",
+            "staged",
+            "block",
+            "controllable_type1_then_mixed",
+        ),
         default="cycle",
         help=(
             "Select retained scenarios by deterministic cycle, random, or staged mode. "
@@ -1333,7 +1712,51 @@ def main():
         "--load-balance-reward-weight",
         type=float,
         default=2.0,
-        help="Legacy diagnostic weight; the PDF v15 PPO reward uses raw load-dispersion improvement.",
+        help=(
+            "Load term weight. In --upper-reward-mode paper_cost this is omega "
+            "for final post-settle gNB demand-load standard deviation."
+        ),
+    )
+    parser.add_argument(
+        "--upper-reward-mode",
+        choices=("paper_cost", "paper_cost_delta", "paper_cost_target_delta"),
+        default="paper_cost",
+        help=(
+            "Upper reward formula. paper_cost: static demand cost; "
+            "paper_cost_delta: improvement-based without expected HO count; "
+            "paper_cost_target_delta: target-aware with wrong-direction and "
+            "source-under-target penalties."
+        ),
+    )
+    parser.add_argument(
+        "--paper-handover-penalty-weight",
+        type=float,
+        default=1.0,
+        help="Alpha handover penalty for --upper-reward-mode paper_cost.",
+    )
+    parser.add_argument(
+        "--paper-pingpong-penalty-weight",
+        type=float,
+        default=5.0,
+        help="Beta ping-pong penalty for --upper-reward-mode paper_cost.",
+    )
+    parser.add_argument(
+        "--paper-excess-load-penalty-weight",
+        type=float,
+        default=3.0,
+        help=(
+            "Penalty weight for mean demand load above the effective safe target "
+            "in --upper-reward-mode paper_cost."
+        ),
+    )
+    parser.add_argument(
+        "--contradictory-bias-penalty-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Penalty weight for same-sign reciprocal source-target biases for "
+            "the same gNB pair and slice."
+        ),
     )
     parser.add_argument(
         "--saturation-reward-weight",
@@ -1444,10 +1867,10 @@ def main():
         help="UEs created for target loads from 0.8 upward.",
     )
     parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--ppo-n-steps", type=int, default=2048)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--ppo-n-steps", type=int, default=4096)
     parser.add_argument("--ppo-batch-size", type=int, default=256)
-    parser.add_argument("--ppo-n-epochs", type=int, default=10)
+    parser.add_argument("--ppo-n-epochs", type=int, default=5)
     parser.add_argument(
         "--dense-window-reward",
         action=argparse.BooleanOptionalAction,
@@ -1457,11 +1880,11 @@ def main():
     parser.add_argument(
         "--safe-admission",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Enable the SafeAdmissionController quota gate (default: disabled). "
-            "When disabled the agent's A3 offsets are the sole driver of handovers, "
-            "giving PPO a clean bias→HO gradient without load-based fallback interference."
+            "Enable the directional admission budget gate (default: enabled). "
+            "Use --no-safe-admission only for ablations where A3 offsets are "
+            "the sole driver of handovers."
         ),
     )
     parser.add_argument(
@@ -1498,11 +1921,10 @@ def main():
         type=int,
         default=4,
         help=(
-            "Number of local steps to run after applying the action but BEFORE opening the "
-            "radio measurement window. During these steps the A3 handover fires and PRBs "
-            "recalculate at the new gNB, so the transient coverage-gap peak is excluded from "
-            "the reward signal. Must be < local_steps_per_global. A value of handover_ttt+1 "
-            "is recommended (e.g. 4 when handover_ttt=3 and local_steps_per_global=10)."
+            "Minimum local steps to run after applying the action but BEFORE opening the "
+            "radio measurement window. The env raises the effective settle phase to "
+            "handover_ttt + ceil(max_directional_budget / max_handovers_per_local_step) "
+            "when sequential budgeted handovers need more time."
         ),
     )
     parser.add_argument(
@@ -1510,6 +1932,25 @@ def main():
         type=float,
         default=0.5,
         help="Smoothing gain for requested-versus-achieved PRB demand calibration.",
+    )
+    parser.add_argument(
+        "--dynamic-upper-window",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Scale the upper window dynamically to provide enough local steps "
+            "for the full accepted directional handover budget to execute "
+            "sequentially (one per local step)."
+        ),
+    )
+    parser.add_argument(
+        "--max-dynamic-local-steps-per-global",
+        type=int,
+        default=12,
+        help=(
+            "Hard cap on local steps per upper window when --dynamic-upper-window "
+            "is enabled. Clamped internally to at least local_steps_per_global."
+        ),
     )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -1559,10 +2000,14 @@ def main():
         "single_training_scenario": str(args.single_training_scenario),
         "curriculum_training": bool(args.curriculum_training),
         "block_curriculum_training": bool(args.block_curriculum_training),
+        "controllable_type1_training": bool(args.controllable_type1_training),
+        "type1_phase_timesteps": int(args.type1_phase_timesteps),
+        "mixed_phase_timesteps": int(args.mixed_phase_timesteps),
         "curriculum_block_episodes": int(args.curriculum_block_episodes),
         "ppo_updates_per_scenario": int(args.ppo_updates_per_scenario),
         "upper_training_regime": (
-            "block_curriculum" if bool(args.block_curriculum_training)
+            "controllable_type1_then_mixed" if bool(args.controllable_type1_training)
+            else "block_curriculum" if bool(args.block_curriculum_training)
             else "curriculum_pool" if bool(args.curriculum_training)
             else "single_coherent_scenario"
         ),
@@ -1577,7 +2022,16 @@ def main():
         "max_handovers_per_episode": int(args.max_handovers_per_episode),
         "handover_pingpong_guard_s": float(args.handover_pingpong_guard_s),
         "action_direction_reward_weight": float(args.action_direction_reward_weight),
+        "upper_reward_mode": str(args.upper_reward_mode),
         "load_balance_reward_weight": float(args.load_balance_reward_weight),
+        "paper_handover_penalty_weight": float(args.paper_handover_penalty_weight),
+        "paper_pingpong_penalty_weight": float(args.paper_pingpong_penalty_weight),
+        "paper_excess_load_penalty_weight": float(
+            args.paper_excess_load_penalty_weight
+        ),
+        "contradictory_bias_penalty_weight": float(
+            args.contradictory_bias_penalty_weight
+        ),
         "saturation_reward_weight": float(args.saturation_reward_weight),
         "gnb_load_target": float(args.gnb_load_target),
         "excess_load_reward_weight": float(args.excess_load_reward_weight),

@@ -99,10 +99,10 @@ GLOBAL_SNAPSHOT_SCENARIOS = {
 class GlobalPPO3GNBEnv(gym.Env):
     """Upper/global PPO environment for 3-gNB HRL control.
 
-    One upper action is a flattened 3x3 bias matrix B. The matrix is held for
-    one upper window. During that window, three heuristic lower agents compute
-    neighbor/slice A3 offsets and this wrapper applies the resulting handovers
-    simultaneously before advancing the base simulator.
+    One upper action is a flattened directional bias tensor. The tensor is held
+    for one upper window while the base simulator advances through sequential
+    local steps. A3 eligibility and admission budget decide at most a bounded
+    number of successful handovers per local step.
     """
 
     metadata = {"render_modes": []}
@@ -166,6 +166,11 @@ class GlobalPPO3GNBEnv(gym.Env):
         served_active_floor_reward_weight: float = 1.0,
         served_active_floor: float = 0.20,
         jain_fairness_weight: float = 1.0,
+        upper_reward_mode: str = "paper_cost",
+        paper_handover_penalty_weight: float = 1.0,
+        paper_pingpong_penalty_weight: float = 5.0,
+        paper_excess_load_penalty_weight: float = 3.0,
+        contradictory_bias_penalty_weight: float = 1.0,
         a3_handover_cooldown_s: float = 2.0,
         a3_min_residence_s: float = 2.0,
         a3_history_window_s: float = 20.0,
@@ -173,6 +178,8 @@ class GlobalPPO3GNBEnv(gym.Env):
         warmup_steps: int = 2,
         post_handover_settle_steps: int = 4,
         demand_calibration_alpha: float = 0.5,
+        dynamic_upper_window: bool = False,
+        max_dynamic_local_steps_per_global: int = 12,
     ):
         super().__init__()
         if int(n_gnbs) != 3:
@@ -191,8 +198,17 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.global_steps_per_episode = max(1, int(global_steps_per_episode))
         self.training_scenarios = get_upper_training_scenarios(training_scenarios)
         self.scenario_selection = str(scenario_selection).strip().lower()
-        if self.scenario_selection not in {"cycle", "random", "staged", "block"}:
-            raise ValueError("scenario_selection must be 'cycle', 'random', 'staged', or 'block'")
+        if self.scenario_selection not in {
+            "cycle",
+            "random",
+            "staged",
+            "block",
+            "controllable_type1_then_mixed",
+        }:
+            raise ValueError(
+                "scenario_selection must be 'cycle', 'random', 'staged', "
+                "'block', or 'controllable_type1_then_mixed'"
+            )
         self.curriculum_block_episodes = max(1, int(curriculum_block_episodes))
         self.fixed_stage_episodes = max(int(fixed_stage_episodes), 0)
         self.slow_stage_episodes = max(int(slow_stage_episodes), 0)
@@ -275,6 +291,25 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
         self.served_active_floor = float(np.clip(served_active_floor, 0.0, 1.0))
         self.jain_fairness_weight = max(float(jain_fairness_weight), 0.0)
+        mode = str(upper_reward_mode).strip().lower()
+        if mode not in {"paper_cost", "paper_cost_delta", "paper_cost_target_delta"}:
+            raise ValueError(
+                "upper_reward_mode must be 'paper_cost', 'paper_cost_delta', "
+                "or 'paper_cost_target_delta'"
+            )
+        self.upper_reward_mode = mode
+        self.paper_handover_penalty_weight = max(
+            float(paper_handover_penalty_weight), 0.0
+        )
+        self.paper_pingpong_penalty_weight = max(
+            float(paper_pingpong_penalty_weight), 0.0
+        )
+        self.paper_excess_load_penalty_weight = max(
+            float(paper_excess_load_penalty_weight), 0.0
+        )
+        self.contradictory_bias_penalty_weight = max(
+            float(contradictory_bias_penalty_weight), 0.0
+        )
         self.a3_handover_cooldown_s = max(float(a3_handover_cooldown_s), 0.0)
         self.a3_min_residence_s = max(float(a3_min_residence_s), self.a3_handover_cooldown_s)
         self.a3_history_window_s = max(float(a3_history_window_s), 0.0)
@@ -283,8 +318,25 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.post_handover_settle_steps = max(
             0, min(int(post_handover_settle_steps), self.local_steps_per_global - 1)
         )
+        self._last_required_handover_settle_steps = int(
+            self.post_handover_settle_steps
+        )
+        self._last_effective_handover_settle_steps = int(
+            self.post_handover_settle_steps
+        )
+        self._last_handover_settle_truncated = False
+        self._last_upper_window_handover_sequence: list[dict] = []
+        self._last_dynamic_local_steps = self.local_steps_per_global
+        self._last_total_raw_directional_budget = 0
+        self._last_total_accepted_directional_budget = 0
+        self._last_dynamic_required_execution_steps = 0
+        self._last_dynamic_window_capped = False
         self.demand_calibration_alpha = float(
             np.clip(demand_calibration_alpha, 0.0, 1.0)
+        )
+        self.dynamic_upper_window = bool(dynamic_upper_window)
+        self.max_dynamic_local_steps_per_global = max(
+            int(max_dynamic_local_steps_per_global), self.local_steps_per_global
         )
         self.sla_deadband = max(float(sla_deadband), 0.0)
         default_critical = {"eMBB": 0.95, "URLLC": 0.95, "mMTC": 0.95}
@@ -309,7 +361,8 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=np.float32,
         )
         # Directional upper state:
-        # [L_i,s, normalized K_i,s, SLA_i,s, demand_i (per gNB), previous B_i,k,s].
+        # [demand_load_i,s, normalized K_i,s, SLA_i,s,
+        #  total_demand_load_i, previous B_i,k,s].
         obs_dim = (
             self.n_gnbs * len(self.slice_types) * 3
             + self.n_gnbs
@@ -449,6 +502,19 @@ class GlobalPPO3GNBEnv(gym.Env):
         self._episode_start_useful_prb_matrix = self._load_to_useful_prb_matrix(
             reset_loads
         )
+        self._last_upper_window_handover_sequence = []
+        self._last_required_handover_settle_steps = int(
+            self.post_handover_settle_steps
+        )
+        self._last_effective_handover_settle_steps = int(
+            self.post_handover_settle_steps
+        )
+        self._last_handover_settle_truncated = False
+        self._last_dynamic_local_steps = self.local_steps_per_global
+        self._last_total_raw_directional_budget = 0
+        self._last_total_accepted_directional_budget = 0
+        self._last_dynamic_required_execution_steps = 0
+        self._last_dynamic_window_capped = False
         reset_cost = self._load_balance_cost(reset_loads)
         obs = self._get_observation()
         info = self._build_info(
@@ -600,6 +666,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         start_imbalance = self._load_balance_cost(reward_start_loads)
         instant_rewards = []
         start_handover_idx = len(getattr(self.base_env, "handover_events", []))
+        start_pingpong_count = sum(
+            len(events)
+            for events in getattr(self.base_env, "_ho_pingpongs", {}).values()
+        )
 
         offsets, offset_debug = self._compute_strong_local_offsets(directional_bias)
         self._apply_slice_offsets(offsets)
@@ -608,36 +678,116 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
         self.base_env.begin_sla_window()
         self._last_strong_offset_debug = offset_debug
+        # Compute accepted directional budget for dynamic window sizing
+        _adm_state = self.base_env.get_safe_admission_state()
+        _adm_quota = _adm_state.get("direction_quota", {})
+        _total_accepted_budget = sum(int(v) for v in _adm_quota.values())
+        _total_raw_budget = 0
+        for _bsrc in range(self.n_gnbs):
+            for _bslot, _bdst in enumerate(self.neighbors.get(_bsrc, [])):
+                for _bs_idx, _bst in enumerate(self.slice_types):
+                    if offsets[_bsrc, _bslot, _bs_idx] < -0.1:
+                        _total_raw_budget += sum(
+                            1 for _bue in self.base_env.get_all_ues()
+                            if _bue.connected
+                            and _bue.serving_gnb is not None
+                            and int(_bue.serving_gnb) == _bsrc
+                            and normalize_slice_type(
+                                getattr(_bue, "slice_type", "eMBB")
+                            ) == _bst
+                        )
+        _required_exec_steps = math.ceil(
+            _total_accepted_budget / max(self.max_handovers_per_local_step, 1)
+        )
+        if self.dynamic_upper_window:
+            _radio_meas_steps = max(
+                1, self.local_steps_per_global - self.post_handover_settle_steps
+            )
+            _dynamic_raw = (
+                _radio_meas_steps + _required_exec_steps + self.post_handover_settle_steps
+            )
+            _dynamic_local_steps = min(
+                _dynamic_raw, self.max_dynamic_local_steps_per_global
+            )
+            _dynamic_window_capped = bool(
+                _dynamic_raw > self.max_dynamic_local_steps_per_global
+            )
+            _effective_local_steps = _dynamic_local_steps
+        else:
+            _dynamic_local_steps = self.local_steps_per_global
+            _dynamic_window_capped = False
+            _effective_local_steps = self.local_steps_per_global
+        self._last_dynamic_local_steps = int(_effective_local_steps)
+        self._last_total_raw_directional_budget = int(_total_raw_budget)
+        self._last_total_accepted_directional_budget = int(_total_accepted_budget)
+        self._last_dynamic_required_execution_steps = int(_required_exec_steps)
+        self._last_dynamic_window_capped = bool(_dynamic_window_capped)
+        required_settle_steps = self._required_handover_settle_steps()
+        if self.dynamic_upper_window:
+            _min_settle = _required_exec_steps + self.post_handover_settle_steps
+            effective_settle_steps = min(
+                max(_min_settle, required_settle_steps),
+                max(_effective_local_steps - 1, 0),
+            )
+        else:
+            effective_settle_steps = min(
+                max(self.post_handover_settle_steps, required_settle_steps),
+                max(self.local_steps_per_global - 1, 0),
+            )
+        self._last_required_handover_settle_steps = int(required_settle_steps)
+        self._last_effective_handover_settle_steps = int(effective_settle_steps)
+        self._last_handover_settle_truncated = bool(
+            effective_settle_steps < required_settle_steps
+        )
+        handover_sequence: list[dict] = []
 
-        # Settle phase: let handovers fire and PRBs recalculate before the
-        # measurement window opens.  These steps count toward episode time but
-        # are excluded from the load/SLA measurement that drives the reward.
-        # Keep offsets alive while their safe-admission quota remains.  Once the
-        # shared source/slice quota or a direction quota is exhausted, neutralize
-        # the matching offsets so A3 pressure cannot keep pulling UEs.
+        # Settle phase: keep the upper offsets active across sequential local
+        # steps so A3 TTT can mature and at most max_handovers_per_step
+        # handovers execute per base-env step before reward measurement opens.
+        # Exhausted direction/slice offsets are neutralized after every local
+        # step; other directions from the same source remain active.
         live_offsets = offsets.copy()
         live_offsets = self._zero_quota_exhausted_offsets(live_offsets)
         if not np.array_equal(live_offsets, offsets):
             self._apply_slice_offsets(live_offsets)
         terminated = truncated = False
-        for _ in range(self.post_handover_settle_steps):
+        local_step_in_upper = 0
+        for _ in range(effective_settle_steps):
+            local_step_in_upper += 1
+            event_start = len(getattr(self.base_env, "handover_events", []))
             _obs, _reward, terminated, truncated, _info = self.base_env.step(0)
             updated_offsets = self._zero_quota_exhausted_offsets(live_offsets)
             if not np.array_equal(updated_offsets, live_offsets):
                 live_offsets = updated_offsets
                 self._apply_slice_offsets(live_offsets)
+            handover_sequence.extend(
+                self._handover_sequence_entries(
+                    getattr(self.base_env, "handover_events", [])[event_start:],
+                    local_step_in_upper,
+                    live_offsets,
+                )
+            )
             if terminated or truncated:
                 break
         # Measurement phase: open the window only after the network has settled.
         self.base_env.begin_radio_measurement_window()
-        measurement_steps = self.local_steps_per_global - self.post_handover_settle_steps
+        measurement_steps = _effective_local_steps - effective_settle_steps
         if not (terminated or truncated):
             for _ in range(measurement_steps):
+                local_step_in_upper += 1
+                event_start = len(getattr(self.base_env, "handover_events", []))
                 _obs, _reward, terminated, truncated, _info = self.base_env.step(0)
                 updated_offsets = self._zero_quota_exhausted_offsets(live_offsets)
                 if not np.array_equal(updated_offsets, live_offsets):
                     live_offsets = updated_offsets
                     self._apply_slice_offsets(live_offsets)
+                handover_sequence.extend(
+                    self._handover_sequence_entries(
+                        getattr(self.base_env, "handover_events", [])[event_start:],
+                        local_step_in_upper,
+                        live_offsets,
+                    )
+                )
                 if terminated or truncated:
                     break
 
@@ -645,16 +795,27 @@ class GlobalPPO3GNBEnv(gym.Env):
         # logging and the next step's heuristic continuity.
         self._last_strong_offsets = live_offsets.copy()
         self._strong_prev_offsets = live_offsets.copy()
+        self._last_upper_window_handover_sequence = list(handover_sequence)
 
         useful_window_loads = self._window_average_load_matrix()
         end_loads = useful_window_loads.copy()
-        start_used_prbs = self._episode_start_useful_prb_matrix.copy()
-        if not np.any(start_used_prbs):
-            start_used_prbs = self._load_to_useful_prb_matrix(reward_start_loads)
+        # Reward must be causal for the current upper action.  Comparing the
+        # settled end window against episode-start useful PRBs can pay the agent
+        # for scheduler/radio drift that happened without any accepted handover.
+        start_used_prbs = self._load_to_useful_prb_matrix(reward_start_loads)
         end_used_prbs = self._load_to_useful_prb_matrix(end_loads)
         end_demand_loads = self._load_matrix()
         self._calibrate_demand_from_radio_window()
         self._previous_window_average_loads = end_loads.copy()
+        total_handovers = len(getattr(self.base_env, "handover_events", [])) - start_handover_idx
+        total_pingpongs = max(
+            0,
+            sum(
+                len(events)
+                for events in getattr(self.base_env, "_ho_pingpongs", {}).values()
+            )
+            - start_pingpong_count,
+        )
         end_sla = self._sla_matrix()
         end_variance = self._load_variance(end_loads)
         end_saturation = self._saturation_count(end_loads)
@@ -688,6 +849,13 @@ class GlobalPPO3GNBEnv(gym.Env):
         negative_bias_penalty = self._negative_bias_magnitude_penalty(
             directional_bias,
             active_loads=start_loads,
+        )
+        contradictory_bias_raw = self._contradictory_directional_bias(
+            directional_bias
+        )
+        contradictory_bias_penalty = (
+            self.contradictory_bias_penalty_weight
+            * contradictory_bias_raw
         )
         # Directional upper reward:
         #   r_H(t) = [J_H(t) - J_H(t + T_H)] / |S_active|
@@ -770,18 +938,143 @@ class GlobalPPO3GNBEnv(gym.Env):
         jain_reward = self.jain_fairness_weight * jain_normalized
         # Keep demand-based Jain for logging only (diagnostic, not in reward).
         jain_demand_raw = self._demand_jain_fairness()
-        # Upper PPO reward uses the post-settle radio window useful PRB load.
-        # Demand PRBs remain logged separately as a conserved routing diagnostic.
-        window_reward = float(
-            load_reward
-            + saturation_reward
-            + excess_load_reward
-            + served_share_reward
-            + served_floor_reward
-            + jain_reward
-            - action_penalty
-            - negative_bias_penalty
+        connected_ues = max(
+            sum(1 for ue in self.base_env.get_all_ues() if ue.connected),
+            1,
         )
+        paper_demand_loads = self._gnb_total_demand_load_vector(end_demand_loads)
+        paper_useful_loads = self._gnb_total_useful_load_vector(end_loads)
+        paper_demand_load_std = float(np.std(paper_demand_loads))
+        paper_useful_load_std = float(np.std(paper_useful_loads))
+        paper_excess_load_mean = float(
+            np.mean(np.maximum(paper_demand_loads - effective_load_target, 0.0))
+        )
+        paper_handover_ratio = float(total_handovers) / float(connected_ues)
+        paper_pingpong_ratio = float(total_pingpongs) / float(connected_ues)
+        paper_cost_reward = -float(
+            self.global_reward_mu * paper_demand_load_std
+            + self.paper_excess_load_penalty_weight * paper_excess_load_mean
+            + self.paper_handover_penalty_weight * paper_handover_ratio
+            + self.paper_pingpong_penalty_weight * paper_pingpong_ratio
+            + contradictory_bias_penalty
+        )
+        # paper_cost_delta: improvement-based reward using demand PRB load
+        pd_demand_load_start_vec = self._gnb_total_demand_load_vector(start_demand_loads)
+        pd_demand_load_end_vec = paper_demand_loads
+        pd_demand_load_std_start = float(np.std(pd_demand_load_start_vec))
+        pd_demand_load_std_end = float(np.std(pd_demand_load_end_vec))
+        pd_excess_load_penalty_start = float(
+            np.mean(np.maximum(pd_demand_load_start_vec - effective_load_target, 0.0))
+        )
+        pd_excess_load_penalty_end = float(
+            np.mean(np.maximum(pd_demand_load_end_vec - effective_load_target, 0.0))
+        )
+        pd_sla_penalty_start = float(start_sla_severity)
+        pd_sla_penalty_end = float(end_sla_severity)
+        pd_cost_start = (
+            1.0 * pd_demand_load_std_start
+            + 3.0 * pd_excess_load_penalty_start
+            + 0.1 * pd_sla_penalty_start
+        )
+        pd_cost_end = (
+            1.0 * pd_demand_load_std_end
+            + 3.0 * pd_excess_load_penalty_end
+            + 0.1 * pd_sla_penalty_end
+        )
+        pd_cost_improvement = pd_cost_start - pd_cost_end
+        pd_ho_weight = 0.05 if pd_cost_improvement > 0 else 0.50
+        pd_adaptive_handover_penalty = pd_ho_weight * paper_handover_ratio
+        paper_cost_delta_reward = float(
+            2.0 * pd_cost_improvement
+            - 1.0 * pd_cost_end
+            - pd_adaptive_handover_penalty
+            - 2.0 * paper_pingpong_ratio
+        )
+        # paper_cost_target_delta: target-aware load balancing + cost improvement + stability
+        ptd_balance_target = self._balance_target_matrix()  # (n_gnbs, n_slices)
+        ptd_total_load_start = self._gnb_total_demand_load_vector(start_demand_loads)
+        ptd_total_load_end = paper_demand_loads
+        ptd_target_total = np.sum(ptd_balance_target, axis=1)
+        ptd_target_error_start = float(np.mean(np.abs(start_demand_loads - ptd_balance_target)))
+        ptd_target_error_end = float(np.mean(np.abs(end_demand_loads - ptd_balance_target)))
+        ptd_load_std_start = float(np.std(ptd_total_load_start))
+        ptd_load_std_end = float(np.std(ptd_total_load_end))
+        ptd_excess_start = float(
+            np.mean(np.maximum(ptd_total_load_start - ptd_target_total, 0.0))
+        )
+        ptd_excess_end = float(
+            np.mean(np.maximum(ptd_total_load_end - ptd_target_total, 0.0))
+        )
+        ptd_sla_start = float(start_sla_severity)
+        ptd_sla_end = float(end_sla_severity)
+        _ptd_eps = 1e-6
+        _ptd_above = ptd_total_load_start > ptd_target_total + _ptd_eps
+        if np.any(_ptd_above):
+            ptd_source_under_penalty = float(np.mean(
+                np.maximum(
+                    ptd_target_total[_ptd_above] - ptd_total_load_end[_ptd_above],
+                    0.0,
+                )
+            ))
+        else:
+            ptd_source_under_penalty = 0.0
+        _ptd_wrong_terms = []
+        for _ptd_src in range(self.n_gnbs):
+            for _ptd_slot, _ptd_dst in enumerate(self.neighbors.get(_ptd_src, [])):
+                for _ptd_s in range(len(self.slice_types)):
+                    _ptd_a = float(directional_bias[_ptd_src, _ptd_slot, _ptd_s])
+                    _ptd_rel = max(
+                        0.0,
+                        float(start_demand_loads[_ptd_src, _ptd_s])
+                        - float(ptd_balance_target[_ptd_src, _ptd_s]),
+                    )
+                    _ptd_recv = max(
+                        0.0,
+                        float(ptd_balance_target[_ptd_dst, _ptd_s])
+                        - float(start_demand_loads[_ptd_dst, _ptd_s]),
+                    )
+                    _ptd_useful = _ptd_rel > _ptd_eps and _ptd_recv > _ptd_eps
+                    _ptd_bad_neg = max(0.0, -_ptd_a) if not _ptd_useful else 0.0
+                    _ptd_missed = max(0.0, _ptd_a) if _ptd_useful else 0.0
+                    _ptd_wrong_terms.append(_ptd_bad_neg + 0.5 * _ptd_missed)
+        ptd_wrong_direction_penalty = (
+            float(np.mean(_ptd_wrong_terms)) if _ptd_wrong_terms else 0.0
+        )
+        ptd_cost_start = (
+            1.0 * ptd_target_error_start
+            + 0.7 * ptd_load_std_start
+            + 3.0 * ptd_excess_start
+            + 0.05 * ptd_sla_start
+        )
+        ptd_cost_end = (
+            1.0 * ptd_target_error_end
+            + 0.7 * ptd_load_std_end
+            + 3.0 * ptd_excess_end
+            + 0.05 * ptd_sla_end
+        )
+        ptd_cost_improvement = ptd_cost_start - ptd_cost_end
+        ptd_ho_weight = 0.05 if ptd_cost_improvement > 0 else 0.50
+        ptd_handover_penalty = ptd_ho_weight * paper_handover_ratio
+        ptd_pingpong_ratio = paper_pingpong_ratio
+        ptd_handover_failure_ratio = 0.0
+        paper_cost_target_delta_reward = float(
+            3.0 * ptd_cost_improvement
+            - 1.5 * ptd_cost_end
+            - 1.0 * ptd_source_under_penalty
+            - 1.0 * ptd_wrong_direction_penalty
+            - ptd_handover_penalty
+            - 2.0 * ptd_pingpong_ratio
+            - 3.0 * ptd_handover_failure_ratio
+        )
+        # ``paper_cost`` uses conserved UE occupied/demand load, mirroring the
+        # paper's PRB-occupancy state while avoiding scheduler-service leakage.
+        # Useful PRBs remain logged for radio/scheduler evaluation.
+        if self.upper_reward_mode == "paper_cost_target_delta":
+            window_reward = paper_cost_target_delta_reward
+        elif self.upper_reward_mode == "paper_cost_delta":
+            window_reward = paper_cost_delta_reward
+        else:
+            window_reward = paper_cost_reward
         self._previous_window_sla_severity = float(end_sla_severity)
         instant_rewards = [window_reward]
         # Legacy target-error shaping is intentionally excluded from the v15
@@ -793,7 +1086,6 @@ class GlobalPPO3GNBEnv(gym.Env):
         self._global_step += 1
         terminated = False
         truncated = self._global_step >= self._active_episode_steps
-        total_handovers = len(getattr(self.base_env, "handover_events", [])) - start_handover_idx
         self._episode_handovers += int(total_handovers)
         if self.terminal_reward_only:
             reward = self._episode_terminal_reward() if truncated else 0.0
@@ -815,6 +1107,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["global_cost_improvement"] = float(start_cost - end_cost)
         info["global_action_penalty"] = float(action_penalty)
         info["global_negative_bias_penalty"] = float(negative_bias_penalty)
+        info["global_contradictory_bias_penalty"] = float(
+            contradictory_bias_penalty
+        )
+        info["global_contradictory_bias_raw"] = float(contradictory_bias_raw)
         info["reward_load_improvement"] = float(load_reward)
         info["reward_load_improvement_raw"] = float(raw_load_improvement)
         info["reward_active_slice_count"] = int(active_slice_count)
@@ -856,16 +1152,79 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["used_prb_balance_cost_end"] = float(end_used_prb_balance_cost)
         info["reward_used_prb_balance_improvement"] = float(load_reward)
         info["reward_used_prb_balance_improvement_raw"] = float(raw_load_improvement)
+        info["upper_reward_mode"] = self.upper_reward_mode
+        info["paper_load_source"] = "demand_prbs"
+        info["paper_cost_reward"] = float(paper_cost_reward)
+        info["paper_load_std_penalty"] = float(
+            self.global_reward_mu * paper_demand_load_std
+        )
+        info["paper_demand_load_std"] = float(paper_demand_load_std)
+        info["paper_useful_load_std"] = float(paper_useful_load_std)
+        info["paper_excess_load_mean"] = float(paper_excess_load_mean)
+        info["paper_excess_load_penalty"] = float(
+            self.paper_excess_load_penalty_weight * paper_excess_load_mean
+        )
+        info["paper_handover_penalty"] = float(
+            self.paper_handover_penalty_weight * paper_handover_ratio
+        )
+        info["paper_pingpong_penalty"] = float(
+            self.paper_pingpong_penalty_weight * paper_pingpong_ratio
+        )
+        info["paper_handover_ratio"] = float(paper_handover_ratio)
+        info["paper_pingpong_ratio"] = float(paper_pingpong_ratio)
+        info["paper_pingpong_count"] = int(total_pingpongs)
+        info["paper_delta_cost_start"] = float(pd_cost_start)
+        info["paper_delta_cost_end"] = float(pd_cost_end)
+        info["paper_delta_cost_improvement"] = float(pd_cost_improvement)
+        info["paper_delta_handover_weight"] = float(pd_ho_weight)
+        info["paper_delta_adaptive_handover_penalty"] = float(pd_adaptive_handover_penalty)
+        info["paper_delta_sla_penalty_start"] = float(pd_sla_penalty_start)
+        info["paper_delta_sla_penalty_end"] = float(pd_sla_penalty_end)
+        info["paper_delta_excess_penalty_start"] = float(pd_excess_load_penalty_start)
+        info["paper_delta_excess_penalty_end"] = float(pd_excess_load_penalty_end)
+        info["paper_delta_reward"] = float(paper_cost_delta_reward)
+        info["paper_target_cost_start"] = float(ptd_cost_start)
+        info["paper_target_cost_end"] = float(ptd_cost_end)
+        info["paper_target_cost_improvement"] = float(ptd_cost_improvement)
+        info["paper_target_error_start"] = float(ptd_target_error_start)
+        info["paper_target_error_end"] = float(ptd_target_error_end)
+        info["paper_target_load_std_start"] = float(ptd_load_std_start)
+        info["paper_target_load_std_end"] = float(ptd_load_std_end)
+        info["paper_target_excess_start"] = float(ptd_excess_start)
+        info["paper_target_excess_end"] = float(ptd_excess_end)
+        info["paper_target_sla_start"] = float(ptd_sla_start)
+        info["paper_target_sla_end"] = float(ptd_sla_end)
+        info["paper_target_source_under_penalty"] = float(ptd_source_under_penalty)
+        info["paper_target_wrong_direction_penalty"] = float(ptd_wrong_direction_penalty)
+        info["paper_target_handover_weight"] = float(ptd_ho_weight)
+        info["paper_target_handover_penalty"] = float(ptd_handover_penalty)
+        info["paper_target_pingpong_ratio"] = float(ptd_pingpong_ratio)
+        info["paper_target_handover_failure_ratio"] = float(ptd_handover_failure_ratio)
+        info["paper_target_reward"] = float(paper_cost_target_delta_reward)
         info["useful_load_matrix_end"] = useful_window_loads.copy()
         info["demand_load_matrix_start"] = start_demand_loads.copy()
         info["demand_load_matrix_end"] = end_demand_loads.copy()
+        demand_prb_matrix_start = self._load_to_useful_prb_matrix(start_demand_loads)
+        demand_prb_matrix_end = self._load_to_useful_prb_matrix(end_demand_loads)
+        info["demand_prb_matrix_start"] = demand_prb_matrix_start.copy()
+        info["demand_prb_matrix_end"] = demand_prb_matrix_end.copy()
+        info["gnb_demand_prb_start"] = np.sum(demand_prb_matrix_start, axis=1)
+        info["gnb_demand_prb_end"] = np.sum(demand_prb_matrix_end, axis=1)
+        info["slice_demand_prb_start"] = np.sum(demand_prb_matrix_start, axis=0)
+        info["slice_demand_prb_end"] = np.sum(demand_prb_matrix_end, axis=0)
+        gnb_demand_load_start = self._gnb_total_demand_load_vector(start_demand_loads)
+        gnb_demand_load_end = self._gnb_total_demand_load_vector(end_demand_loads)
+        info["gnb_total_demand_load_start"] = gnb_demand_load_start.copy()
+        info["gnb_total_demand_load_end"] = gnb_demand_load_end.copy()
+        info["gnb_total_demand_load_std_start"] = float(np.std(gnb_demand_load_start))
+        info["gnb_total_demand_load_std_end"] = float(np.std(gnb_demand_load_end))
+        info["gnb_total_demand_excess_end"] = np.maximum(
+            gnb_demand_load_end - effective_load_target,
+            0.0,
+        )
         # Per-gNB total useful PRB load (paper's KPM metric): Σ_s useful_prbs[g,s] / n_prbs[g]
         gnb_useful_load_end = self._gnb_total_useful_load_vector(end_loads)
-        gnb_useful_load_start = self._gnb_total_useful_load_vector(
-            self._previous_window_average_loads
-            if self._previous_window_average_loads is not None
-            else end_loads
-        )
+        gnb_useful_load_start = self._gnb_total_useful_load_vector(reward_start_loads)
         info["gnb_total_useful_load_end"] = gnb_useful_load_end.copy()
         info["gnb_total_useful_load_start"] = gnb_useful_load_start.copy()
         info["gnb_total_useful_load_std_end"] = float(np.std(gnb_useful_load_end))
@@ -901,6 +1260,13 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["episode_terminal_reward"] = (
             float(reward) if truncated and self.terminal_reward_only else 0.0
         )
+        info["dynamic_upper_window_enabled"] = bool(self.dynamic_upper_window)
+        info["fixed_local_steps_per_global"] = int(self.local_steps_per_global)
+        info["dynamic_local_steps_per_global"] = int(_effective_local_steps)
+        info["total_raw_directional_budget"] = int(_total_raw_budget)
+        info["total_accepted_directional_budget"] = int(_total_accepted_budget)
+        info["dynamic_required_execution_steps"] = int(_required_exec_steps)
+        info["dynamic_window_capped"] = bool(_dynamic_window_capped)
         self._last_info = info
         return obs, float(reward), terminated, truncated, info
 
@@ -935,11 +1301,8 @@ class GlobalPPO3GNBEnv(gym.Env):
         return row
 
     def _get_observation(self) -> np.ndarray:
-        loads = (
-            self._previous_window_average_loads
-            if self._previous_window_average_loads is not None
-            else self._current_useful_load_matrix()
-        ).reshape(-1)
+        demand_loads = self._load_matrix()
+        loads = demand_loads.reshape(-1)
         counts = np.asarray(
             [
                 self.base_env.get_slice_ue_count(gnb_id, slice_type)
@@ -950,20 +1313,15 @@ class GlobalPPO3GNBEnv(gym.Env):
             dtype=float,
         )
         sla = np.clip(self._sla_matrix(), 0.0, 1.0).reshape(-1)
-        # Per-gNB total useful PRB load: sum of window-avg useful load across
-        # all slices, divided by gNB capacity.  Equivalent to the KPM PRB
-        # load % in a real ORAN DU — the paper's load metric.
-        window_loads = (
-            self._previous_window_average_loads
-            if self._previous_window_average_loads is not None
-            else self._current_useful_load_matrix()
-        )
-        gnb_useful_load = self._gnb_total_useful_load_vector(window_loads)
+        # Per-gNB total occupied/demand PRB load.  This is the same signal used
+        # by the paper_cost reward, so the agent observes the load it is
+        # directly optimizing.
+        gnb_demand_load = self._gnb_total_demand_load_vector(demand_loads)
         obs = np.concatenate((
             loads,
             counts,
             sla,
-            gnb_useful_load,
+            gnb_demand_load,
             self._last_directional_bias_tensor.reshape(-1),
         ))
         return np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
@@ -1015,13 +1373,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         offsets: np.ndarray,
         events: list,
     ) -> np.ndarray:
-        """Return a copy of offsets with each fired-handover direction set to 0.
-
-        Called after every settle step where a handover fires so the same bias
-        cannot cascade further UEs on the same src→tgt/slice direction during
-        the remainder of the window.  The next upper action re-evaluates from
-        the clean (zeroed) state.
-        """
+        """Compatibility helper for explicitly zeroing fired directions."""
         result = offsets.copy()
         slice_index = {s: i for i, s in enumerate(self.slice_types)}
         for event in events:
@@ -1039,13 +1391,67 @@ class GlobalPPO3GNBEnv(gym.Env):
             result[src, slot, s_idx] = 0.0
         return result
 
+    def _required_handover_settle_steps(self) -> int:
+        state = self.base_env.get_safe_admission_state()
+        direction_quota = state.get("direction_quota", {})
+        expected_budget = max(
+            (int(value) for value in direction_quota.values()),
+            default=0,
+        )
+        handover_ttt = max(int(getattr(self.base_env, "handover_ttt", 0)), 0)
+        per_step = max(int(self.max_handovers_per_local_step), 1)
+        return int(handover_ttt + math.ceil(expected_budget / per_step))
+
+    def _handover_sequence_entries(
+        self,
+        events: Sequence[Mapping],
+        local_step_in_upper: int,
+        active_offsets: np.ndarray,
+    ) -> list[dict]:
+        if not events:
+            return []
+        state = self.base_env.get_safe_admission_state()
+        direction_remaining = state.get("direction_remaining", {})
+        direction_quota = state.get("direction_quota", {})
+        direction_used = state.get("direction_used", {})
+        slice_index = {
+            normalize_slice_type(slice_type): idx
+            for idx, slice_type in enumerate(self.slice_types)
+        }
+        entries: list[dict] = []
+        for event in events:
+            source_id = int(event.get("from_gnb", -1))
+            target_id = int(event.get("to_gnb", -1))
+            slice_type = normalize_slice_type(event.get("slice_type", "eMBB"))
+            neighbors = tuple(self.neighbors.get(source_id, ()))
+            s_idx = slice_index.get(slice_type)
+            active_offset = 0.0
+            if target_id in neighbors and s_idx is not None:
+                target_slot = neighbors.index(target_id)
+                active_offset = float(active_offsets[source_id, target_slot, s_idx])
+            direction_key = (source_id, target_id, slice_type)
+            entries.append({
+                "wrapper_step": int(event.get("step", -1)),
+                "local_step_in_upper_window": int(local_step_in_upper),
+                "ue_id": int(event.get("ue_id", -1)),
+                "source_gnb": int(source_id),
+                "target_gnb": int(target_id),
+                "slice": slice_type,
+                "direction_quota": int(direction_quota.get(direction_key, 0)),
+                "direction_used_after_commit": int(direction_used.get(direction_key, 0)),
+                "direction_remaining_after_commit": int(
+                    direction_remaining.get(direction_key, 0)
+                ),
+                "active_offset_after_zeroing_db": float(active_offset),
+            })
+        return entries
+
     def _zero_quota_exhausted_offsets(self, offsets: np.ndarray) -> np.ndarray:
-        """Neutralize offsets whose safe-admission quota is fully consumed."""
+        """Neutralize only exact direction/slice offsets with consumed budget."""
         if not self.safe_admission_enabled:
             return offsets.copy()
 
         state = self.base_env.get_safe_admission_state()
-        remaining = state.get("remaining", {})
         direction_quota = state.get("direction_quota", {})
         direction_used = state.get("direction_used", {})
         result = offsets.copy()
@@ -1053,17 +1459,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         for serving_id in range(self.n_gnbs):
             for neighbor_slot, neighbor_id in enumerate(self.neighbors.get(serving_id, [])):
                 for s_idx, slice_type in enumerate(self.slice_types):
-                    source_key = (int(serving_id), normalize_slice_type(slice_type))
                     direction_key = (
                         int(serving_id),
                         int(neighbor_id),
                         normalize_slice_type(slice_type),
                     )
-                    source_remaining = int(remaining.get(source_key, 0))
                     d_quota = int(direction_quota.get(direction_key, 0))
                     d_used = int(direction_used.get(direction_key, 0))
-                    if result[serving_id, neighbor_slot, s_idx] < 0.0 and (
-                        source_remaining <= 0 or d_used >= d_quota
+                    if (
+                        result[serving_id, neighbor_slot, s_idx] < 0.0
+                        and d_used >= d_quota
                     ):
                         result[serving_id, neighbor_slot, s_idx] = 0.0
 
@@ -1419,6 +1824,32 @@ class GlobalPPO3GNBEnv(gym.Env):
             self.global_action_lambda
             * (float(np.mean(values)) if values.size else 0.0)
         )
+
+    def _contradictory_directional_bias(self, directional_bias: np.ndarray) -> float:
+        """Penalty raw value for same-sign reciprocal source-target commands."""
+        bias = np.asarray(directional_bias, dtype=float)
+        expected = (self.n_gnbs, self.max_neighbors, len(self.slice_types))
+        if bias.shape != expected:
+            return 0.0
+        contradictions = []
+        deadband = max(float(self.neutral_bias_eps), 0.0)
+        for src in range(self.n_gnbs):
+            for neighbor_slot, dst in enumerate(self.neighbors.get(src, ())):
+                if src >= int(dst):
+                    continue
+                reverse_neighbors = tuple(self.neighbors.get(int(dst), ()))
+                if src not in reverse_neighbors:
+                    continue
+                reverse_slot = reverse_neighbors.index(src)
+                for s_idx in range(len(self.slice_types)):
+                    forward = float(bias[src, neighbor_slot, s_idx])
+                    reverse = float(bias[int(dst), reverse_slot, s_idx])
+                    if abs(forward) <= deadband or abs(reverse) <= deadband:
+                        continue
+                    if forward * reverse <= 0.0:
+                        continue
+                    contradictions.append(min(abs(forward), abs(reverse)) ** 2)
+        return float(np.mean(contradictions)) if contradictions else 0.0
 
     def _active_direction_values(
         self,
@@ -1811,6 +2242,11 @@ class GlobalPPO3GNBEnv(gym.Env):
             1.0,
         )
 
+    @staticmethod
+    def _gnb_total_demand_load_vector(loads: np.ndarray) -> np.ndarray:
+        """Per-gNB occupied/demand load, allowed to exceed 1 under overload."""
+        return np.sum(np.maximum(np.asarray(loads, dtype=float), 0.0), axis=1)
+
     def _calibrate_demand_from_radio_window(self) -> None:
         """Set next-window traffic from realized scheduler efficiency.
 
@@ -1982,9 +2418,24 @@ class GlobalPPO3GNBEnv(gym.Env):
                 * self.base_env.radio_substeps
                 * self.base_env.step_dt
             ),
-            "post_handover_settle_steps": int(self.post_handover_settle_steps),
+            "configured_post_handover_settle_steps": int(
+                self.post_handover_settle_steps
+            ),
+            "required_handover_settle_steps": int(
+                self._last_required_handover_settle_steps
+            ),
+            "post_handover_settle_steps": int(
+                self._last_effective_handover_settle_steps
+            ),
+            "effective_handover_settle_steps": int(
+                self._last_effective_handover_settle_steps
+            ),
+            "handover_settle_truncated": bool(
+                self._last_handover_settle_truncated
+            ),
             "radio_measurement_steps": int(
-                self.local_steps_per_global - self.post_handover_settle_steps
+                self._last_dynamic_local_steps
+                - self._last_effective_handover_settle_steps
             ),
             "load_measurement_mode": "post_settle_window_average_useful_prbs",
             "demand_calibration_mode": "window_requested_vs_achieved_prbs",
@@ -2031,6 +2482,9 @@ class GlobalPPO3GNBEnv(gym.Env):
                 + self.global_reward_zeta * self._saturation_count(end_loads)
             ),
             "handover_count": int(handovers),
+            "upper_window_handover_sequence": list(
+                self._last_upper_window_handover_sequence
+            ),
             "action_direction_reward": self._action_direction_reward(self._last_bias_matrix),
             "bias_matrix": self._last_bias_matrix.copy(),
             "directional_bias_tensor": self._last_directional_bias_tensor.copy(),
@@ -2094,6 +2548,14 @@ class GlobalPPO3GNBEnv(gym.Env):
             pool = self.training_scenarios
             block_index = self._episode_index // self.curriculum_block_episodes
             index = block_index % len(pool)
+        elif self.scenario_selection == "controllable_type1_then_mixed":
+            pool = self.training_scenarios
+            single_slice_count = max(len(pool) - 1, 1)
+            single_slice_episodes = single_slice_count * self.curriculum_block_episodes
+            if self._episode_index < single_slice_episodes:
+                index = self._episode_index // self.curriculum_block_episodes
+            else:
+                index = len(pool) - 1
         elif self.scenario_selection == "random":
             pool = self.training_scenarios
             index = int(self.rng.integers(len(self.training_scenarios)))

@@ -21,6 +21,7 @@ from stable_baselines3.common.noise import NormalActionNoise
 
 from local_a3_training_env import (
     LocalA3RuleBiasTrainingEnv,
+    UpperScenarioLowerEnv,
     THREE_GNB_LOCAL_CONFIGS,
 )
 from local_a3_agent_wrapper import LocalA3OffsetEnv
@@ -521,6 +522,7 @@ def make_env(
     gnb_id: int = 0,
     neighbor_ids: Sequence[int] = (1,),
     gnb_configs: Sequence[Dict[str, Any]] | None = None,
+    heuristic_gnb_ids: Sequence[int] | None = None,
 ) -> Monitor:
     env = LocalA3RuleBiasTrainingEnv(
         seed=seed,
@@ -535,6 +537,36 @@ def make_env(
         radio_substeps=10,
         balance_bias_cases=True,
         training_scenarios=training_scenarios,
+        action_hold_steps=action_hold_steps,
+        bias_hold_steps=bias_hold_steps,
+        max_offset_change_db=max_offset_change_db,
+        heuristic_gnb_ids=heuristic_gnb_ids,
+    )
+    return Monitor(env)
+
+
+def make_upper_scenario_env(
+    seed: int,
+    episode_steps: int,
+    action_hold_steps: int = 5,
+    bias_hold_steps: int = 20,
+    max_offset_change_db: float = 2.0,
+    slice_types=TRACE_SLICE_TYPES,
+    upper_scenarios: str = (
+        "jain_balance_controllable,"
+        "jain_control_urllc,"
+        "jain_control_mmtc,"
+        "jain_control_mixed"
+    ),
+    controlled_gnb_id: int = 1,
+) -> Monitor:
+    env = UpperScenarioLowerEnv(
+        seed=seed,
+        controlled_gnb_id=controlled_gnb_id,
+        training_scenarios=upper_scenarios,
+        scenario_selection="cycle",
+        episode_steps=episode_steps,
+        slice_types=tuple(slice_types),
         action_hold_steps=action_hold_steps,
         bias_hold_steps=bias_hold_steps,
         max_offset_change_db=max_offset_change_db,
@@ -556,6 +588,189 @@ def _write_eval_csv(path: Path, rows):
             writer.writerow(row)
 
 
+def _evaluate_env(
+    model: TD3,
+    env,
+    episodes: int,
+    episode_steps: int,
+    slice_types=TRACE_SLICE_TYPES,
+    logger: "StepCsvLogger | None" = None,
+    eval_csv: "Path | None" = None,
+) -> Dict[str, Any]:
+    """Minimal eval loop for UpperScenarioLowerEnv (env already constructed)."""
+    returns = []
+    lengths = []
+    successes, failures, ping_pongs = [], [], []
+    tracking_errors = []
+    tracking_errors_by_slice = {st: [] for st in TRACE_SLICE_TYPES}
+    offset_changes = []
+    offset_hold_durations = []
+    abs_offset_deltas = []
+    applied_by_bias = {-1.0: [], 0.0: [], 1.0: []}
+    applied_by_slice_bias = {
+        st: {-1.0: [], 0.0: [], 1.0: []} for st in TRACE_SLICE_TYPES
+    }
+    eval_rows = []
+    final_info: Dict[str, Any] = {}
+
+    try:
+        for episode in range(int(episodes)):
+            obs, _ = env.reset()
+            done = False
+            total_reward = 0.0
+            length = 0
+            ep_successes = ep_failures = ep_ping_pongs = ep_attempts = 0
+            ep_tracking_errors: list = []
+            ep_tracking_errors_by_slice = {st: [] for st in TRACE_SLICE_TYPES}
+            ep_offset_changes = 0
+            ep_hold_durations: list = []
+            current_hold_duration = 0
+            ep_abs_offset_deltas: list = []
+            ep_applied_by_bias: Dict[float, list] = {-1.0: [], 0.0: [], 1.0: []}
+            ep_applied_by_slice_bias = {
+                st: {-1.0: [], 0.0: [], 1.0: []} for st in TRACE_SLICE_TYPES
+            }
+
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = bool(terminated or truncated)
+                total_reward += float(reward)
+                length += 1
+
+                if logger is not None:
+                    logger.log_step(
+                        env=env,
+                        phase="eval",
+                        global_step=episode * episode_steps + length,
+                        action=action,
+                        reward=float(reward),
+                        done=done,
+                        info=dict(info),
+                    )
+
+                handover_stats = dict(info.get("handover_stats", {}))
+                ep_attempts += int(handover_stats.get("attempts", 0))
+                ep_successes += int(handover_stats.get("successes", 0))
+                ep_failures += int(handover_stats.get("failures", 0))
+                ep_ping_pongs += int(handover_stats.get("ping_pongs", 0))
+
+                applied_offsets = dict(info.get("applied_offsets", {}))
+                rule_bias = dict(info.get("rule_bias", {}))
+                for st in TRACE_SLICE_TYPES:
+                    key = (TRACE_NEIGHBOR_ID, st)
+                    applied_offset = float(_lookup_tuple_dict(applied_offsets, key, 0.0))
+                    bias = float(_lookup_tuple_dict(
+                        rule_bias, (0, TRACE_NEIGHBOR_ID, st), 0.0
+                    ))
+                    desired = _desired_offset_from_info(env, info, TRACE_NEIGHBOR_ID, st)
+                    err = abs(applied_offset - desired)
+                    ep_tracking_errors.append(err)
+                    tracking_errors.append(err)
+                    ep_tracking_errors_by_slice[st].append(err)
+                    tracking_errors_by_slice[st].append(err)
+                    if bias in ep_applied_by_bias:
+                        ep_applied_by_bias[bias].append(applied_offset)
+                        applied_by_bias[bias].append(applied_offset)
+                        ep_applied_by_slice_bias[st][bias].append(applied_offset)
+                        applied_by_slice_bias[st][bias].append(applied_offset)
+
+                action_temporal = dict(info.get("action_temporal", {}))
+                action_decision = bool(action_temporal.get("offset_changed", False))
+                offset_deltas = dict(action_temporal.get("offset_deltas", {}))
+                step_abs_deltas = (
+                    [abs(float(v)) for v in offset_deltas.values()]
+                    if offset_deltas
+                    else [abs(float(action_temporal.get("offset_delta", 0.0)))]
+                )
+                ep_abs_offset_deltas.extend(step_abs_deltas)
+                abs_offset_deltas.extend(step_abs_deltas)
+                if action_decision:
+                    ep_offset_changes += 1
+                    if current_hold_duration > 0:
+                        ep_hold_durations.append(current_hold_duration)
+                    current_hold_duration = 1
+                else:
+                    current_hold_duration += 1
+                final_info = info
+
+            returns.append(total_reward)
+            lengths.append(length)
+            successes.append(ep_successes)
+            failures.append(ep_failures)
+            ping_pongs.append(ep_ping_pongs)
+            if current_hold_duration > 0:
+                ep_hold_durations.append(current_hold_duration)
+                offset_hold_durations.extend(ep_hold_durations)
+            offset_changes.append(ep_offset_changes)
+            attempts = max(ep_attempts, 1)
+            success_denom = max(ep_successes, 1)
+            eval_rows.append({
+                "episode": int(episode),
+                "episode_return": float(total_reward),
+                "episode_length": int(length),
+                "mean_applied_offset_bias_neg1": _mean_or_zero(ep_applied_by_bias[-1.0]),
+                "mean_applied_offset_bias_0": _mean_or_zero(ep_applied_by_bias[0.0]),
+                "mean_applied_offset_bias_pos1": _mean_or_zero(ep_applied_by_bias[1.0]),
+                **{f"mean_applied_offset_{st}_bias_neg1": _mean_or_zero(ep_applied_by_slice_bias[st][-1.0]) for st in TRACE_SLICE_TYPES},
+                **{f"mean_applied_offset_{st}_bias_0": _mean_or_zero(ep_applied_by_slice_bias[st][0.0]) for st in TRACE_SLICE_TYPES},
+                **{f"mean_applied_offset_{st}_bias_pos1": _mean_or_zero(ep_applied_by_slice_bias[st][1.0]) for st in TRACE_SLICE_TYPES},
+                **{f"average_tracking_error_{st}": _mean_or_zero(ep_tracking_errors_by_slice[st]) for st in TRACE_SLICE_TYPES},
+                "handover_attempts": int(ep_attempts),
+                "handover_successes": int(ep_successes),
+                "handover_failures": int(ep_failures),
+                "handover_ping_pongs": int(ep_ping_pongs),
+                "handover_failure_rate": float(ep_failures / attempts),
+                "ping_pong_rate": float(ep_ping_pongs / success_denom),
+                "average_tracking_error": _mean_or_zero(ep_tracking_errors),
+                "offset_changes": int(ep_offset_changes),
+                "mean_offset_hold_duration": _mean_or_zero(ep_hold_durations),
+                "mean_abs_offset_delta": _mean_or_zero(ep_abs_offset_deltas),
+                "max_abs_offset_delta": float(np.max(ep_abs_offset_deltas)) if ep_abs_offset_deltas else 0.0,
+            })
+    finally:
+        env.close()
+
+    total_attempts = sum(int(r["handover_attempts"]) for r in eval_rows)
+    total_successes = sum(int(r["handover_successes"]) for r in eval_rows)
+    total_failures = sum(int(r["handover_failures"]) for r in eval_rows)
+    total_pp = sum(int(r["handover_ping_pongs"]) for r in eval_rows)
+
+    if eval_csv is not None:
+        _write_eval_csv(Path(eval_csv), eval_rows)
+
+    return {
+        "episodes": int(episodes),
+        "mean_reward": float(np.mean(returns)) if returns else 0.0,
+        "std_reward": float(np.std(returns)) if returns else 0.0,
+        "mean_length": float(np.mean(lengths)) if lengths else 0.0,
+        "mean_handover_successes": float(np.mean(successes)) if successes else 0.0,
+        "mean_handover_failures": float(np.mean(failures)) if failures else 0.0,
+        "mean_ping_pongs": float(np.mean(ping_pongs)) if ping_pongs else 0.0,
+        "mean_offset_changes_per_episode": float(np.mean(offset_changes)) if offset_changes else 0.0,
+        "mean_offset_hold_duration": _mean_or_zero(offset_hold_durations),
+        "mean_abs_offset_delta": _mean_or_zero(abs_offset_deltas),
+        "max_abs_offset_delta": float(np.max(abs_offset_deltas)) if abs_offset_deltas else 0.0,
+        "mean_applied_offset_when_bias_neg1": _mean_or_zero(applied_by_bias[-1.0]),
+        "mean_applied_offset_when_bias_0": _mean_or_zero(applied_by_bias[0.0]),
+        "mean_applied_offset_when_bias_pos1": _mean_or_zero(applied_by_bias[1.0]),
+        "mean_applied_offset_by_slice_bias": {
+            st: {str(b): _mean_or_zero(v) for b, v in bmap.items()}
+            for st, bmap in applied_by_slice_bias.items()
+        },
+        "average_tracking_error_by_slice": {
+            st: _mean_or_zero(v) for st, v in tracking_errors_by_slice.items()
+        },
+        "handover_failure_rate": float(total_failures / max(total_attempts, 1)),
+        "ping_pong_rate": float(total_pp / max(total_successes, 1)),
+        "average_tracking_error": _mean_or_zero(tracking_errors),
+        "eval_csv": str(eval_csv) if eval_csv is not None else None,
+        "final_applied_offsets": _stringify_keys(final_info.get("applied_offsets", {})),
+        "final_rule_bias": _stringify_keys(final_info.get("rule_bias", {})),
+        "final_spawn_counts": _stringify_keys(final_info.get("spawn_counts", {})),
+    }
+
+
 def evaluate(
     model: TD3,
     seed: int,
@@ -569,6 +784,7 @@ def evaluate(
     gnb_id: int = 0,
     neighbor_ids: Sequence[int] = (1,),
     gnb_configs: Sequence[Dict[str, Any]] | None = None,
+    heuristic_gnb_ids: Sequence[int] | None = None,
     logger: StepCsvLogger | None = None,
     eval_csv: Path | None = None,
 ) -> Dict[str, Any]:
@@ -583,6 +799,7 @@ def evaluate(
         gnb_id=gnb_id,
         neighbor_ids=neighbor_ids,
         gnb_configs=gnb_configs,
+        heuristic_gnb_ids=heuristic_gnb_ids,
     )
     returns = []
     lengths = []
@@ -888,6 +1105,28 @@ def main():
             "the intended per-slice offload/retain/neutral behavior clear."
         ),
     )
+    parser.add_argument(
+        "--upper-scenarios",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated upper-agent scenario names to use for lower training "
+            "(e.g. 'jain_balance_controllable,jain_control_mixed'). "
+            "When set, UpperScenarioLowerEnv is used instead of LocalA3RuleBiasTrainingEnv. "
+            "UEs are placed by GlobalPPO3GNBEnv using the medium_270m topology "
+            "(gNB-1 at center). Defaults to the four jain_control_* scenarios."
+        ),
+    )
+    parser.add_argument(
+        "--controlled-gnb-upper",
+        type=int,
+        default=1,
+        help=(
+            "Which gNB the TD3 controls when --upper-scenarios is used. "
+            "Default=1 (center gNB) because all jain_control_* scenarios start "
+            "UEs on gNB-1."
+        ),
+    )
     parser.add_argument("--no-timestamp-run-dir", action="store_true")
     args = parser.parse_args()
 
@@ -908,7 +1147,18 @@ def main():
         if args.gnb_topology == "three_gnb_line"
         else None
     )
+    # Heuristic gNBs: all gNBs in the topology except the controlled one.
+    all_gnb_ids = [int(cfg["id"]) for cfg in (gnb_configs or [{"id": 0}, {"id": 1}])]
+    heuristic_gnb_ids = tuple(g for g in all_gnb_ids if g != args.controlled_gnb_id)
     training_scenarios = local_a3_training_scenario_set(args.scenario_set)
+
+    use_upper_scenarios = args.upper_scenarios is not None
+    upper_scenarios_str = args.upper_scenarios or (
+        "jain_balance_controllable,"
+        "jain_control_urllc,"
+        "jain_control_mmtc,"
+        "jain_control_mixed"
+    )
 
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_dir = (
@@ -923,18 +1173,31 @@ def main():
 
     # Fix #8: always close the CSV logger, even if training or eval raises.
     try:
-        env = make_env(
-            seed=args.seed,
-            episode_steps=args.episode_steps,
-            action_hold_steps=args.action_hold_steps,
-            bias_hold_steps=args.bias_hold_steps,
-            max_offset_change_db=args.max_offset_change_db,
-            slice_types=slice_types,
-            training_scenarios=training_scenarios,
-            gnb_id=args.controlled_gnb_id,
-            neighbor_ids=neighbor_ids,
-            gnb_configs=gnb_configs,
-        )
+        if use_upper_scenarios:
+            env = make_upper_scenario_env(
+                seed=args.seed,
+                episode_steps=args.episode_steps,
+                action_hold_steps=args.action_hold_steps,
+                bias_hold_steps=args.bias_hold_steps,
+                max_offset_change_db=args.max_offset_change_db,
+                slice_types=slice_types,
+                upper_scenarios=upper_scenarios_str,
+                controlled_gnb_id=args.controlled_gnb_upper,
+            )
+        else:
+            env = make_env(
+                seed=args.seed,
+                episode_steps=args.episode_steps,
+                action_hold_steps=args.action_hold_steps,
+                bias_hold_steps=args.bias_hold_steps,
+                max_offset_change_db=args.max_offset_change_db,
+                slice_types=slice_types,
+                training_scenarios=training_scenarios,
+                gnb_id=args.controlled_gnb_id,
+                neighbor_ids=neighbor_ids,
+                gnb_configs=gnb_configs,
+                heuristic_gnb_ids=heuristic_gnb_ids,
+            )
         n_actions = env.action_space.shape[-1]
         action_noise = NormalActionNoise(
             mean=np.zeros(n_actions),
@@ -970,22 +1233,44 @@ def main():
         final_path = model_dir / "local_a3_td3_final.zip"
         model.save(final_path)
 
-        metrics = evaluate(
-            model=model,
-            seed=args.seed + 10_000,
-            episodes=args.eval_episodes,
-            episode_steps=args.episode_steps,
-            action_hold_steps=args.action_hold_steps,
-            bias_hold_steps=args.bias_hold_steps,
-            max_offset_change_db=args.max_offset_change_db,
-            slice_types=slice_types,
-            training_scenarios=training_scenarios,
-            gnb_id=args.controlled_gnb_id,
-            neighbor_ids=neighbor_ids,
-            gnb_configs=gnb_configs,
-            logger=step_logger,
-            eval_csv=eval_csv,
-        )
+        if use_upper_scenarios:
+            eval_env = make_upper_scenario_env(
+                seed=args.seed + 10_000,
+                episode_steps=args.episode_steps,
+                action_hold_steps=args.action_hold_steps,
+                bias_hold_steps=args.bias_hold_steps,
+                max_offset_change_db=args.max_offset_change_db,
+                slice_types=slice_types,
+                upper_scenarios=upper_scenarios_str,
+                controlled_gnb_id=args.controlled_gnb_upper,
+            )
+            metrics = _evaluate_env(
+                model=model,
+                env=eval_env,
+                episodes=args.eval_episodes,
+                episode_steps=args.episode_steps,
+                logger=step_logger,
+                eval_csv=eval_csv,
+                slice_types=slice_types,
+            )
+        else:
+            metrics = evaluate(
+                model=model,
+                seed=args.seed + 10_000,
+                episodes=args.eval_episodes,
+                episode_steps=args.episode_steps,
+                action_hold_steps=args.action_hold_steps,
+                bias_hold_steps=args.bias_hold_steps,
+                max_offset_change_db=args.max_offset_change_db,
+                slice_types=slice_types,
+                training_scenarios=training_scenarios,
+                gnb_id=args.controlled_gnb_id,
+                neighbor_ids=neighbor_ids,
+                gnb_configs=gnb_configs,
+                heuristic_gnb_ids=heuristic_gnb_ids,
+                logger=step_logger,
+                eval_csv=eval_csv,
+            )
         metrics["run_timestamp"] = run_timestamp
         metrics["run_dir"] = str(model_dir)
         metrics["base_model_dir"] = str(args.model_dir)
@@ -995,14 +1280,19 @@ def main():
         metrics["bias_hold_steps"] = int(args.bias_hold_steps)
         metrics["max_offset_change_db"] = float(args.max_offset_change_db)
         metrics["slice_types"] = list(slice_types)
-        metrics["controlled_gnb_id"] = int(args.controlled_gnb_id)
+        metrics["controlled_gnb_id"] = int(
+            args.controlled_gnb_upper if use_upper_scenarios else args.controlled_gnb_id
+        )
         metrics["neighbor_ids"] = list(map(int, neighbor_ids))
         metrics["gnb_topology"] = str(args.gnb_topology)
         metrics["action_dim"] = int(n_actions)
         metrics["scenario_set"] = str(args.scenario_set)
-        metrics["training_scenarios"] = [
-            scenario.name for scenario in training_scenarios
-        ]
+        metrics["upper_scenarios"] = upper_scenarios_str if use_upper_scenarios else None
+        metrics["training_scenarios"] = (
+            upper_scenarios_str.split(",")
+            if use_upper_scenarios
+            else [scenario.name for scenario in training_scenarios]
+        )
         metrics["saved_final_model"] = str(final_path)
         metrics["trace_csv"] = str(trace_csv)
 

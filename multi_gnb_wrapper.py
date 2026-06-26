@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import hashlib
 import math
 from pathlib import Path
@@ -242,6 +242,7 @@ class MultiGNBWrapper(gym.Env):
             bias_deadband=safe_admission_bias_deadband,
             max_target_sla_severity=safe_admission_max_target_sla_severity,
         )
+        self.safe_admission_load_provider: Optional[Callable[[int, str], float]] = None
         self.embb_min_delivery_ratio = float(np.clip(embb_min_delivery_ratio, 0.0, 1.0))
         self.urllc_max_failure_ratio = max(float(urllc_max_failure_ratio), 0.0)
         self.mmtc_max_failure_ratio = max(float(mmtc_max_failure_ratio), 0.0)
@@ -843,6 +844,18 @@ class MultiGNBWrapper(gym.Env):
         key = (int(serving_id), int(neighbor_id), self.normalize_slice_type(slice_type).upper())
         self._a3_offsets[key] = float(offset_db)
 
+    def _safe_admission_slice_load(self, gnb_id: int, slice_type: str) -> float:
+        normalized_slice = self.normalize_slice_type(slice_type)
+        if self.safe_admission_load_provider is not None:
+            return float(self.safe_admission_load_provider(int(gnb_id), normalized_slice))
+        return float(self.estimate_slice_load(int(gnb_id), normalized_slice))
+
+    def _safe_admission_total_load(self, gnb_id: int) -> float:
+        return float(sum(
+            self._safe_admission_slice_load(int(gnb_id), slice_name)
+            for slice_name in SLICE_TYPE_ORDER
+        ))
+
     def _reset_safe_admission_stats(self) -> None:
         self.safe_admission_controller.stats.clear()
 
@@ -870,7 +883,13 @@ class MultiGNBWrapper(gym.Env):
                 f"{(self.n_gnbs, max_neighbors, len(normalized_slices))}, got {bias.shape}"
             )
 
-        loads = self.get_slice_loads()
+        loads = {
+            (int(gnb.id), slice_type): self._safe_admission_slice_load(
+                int(gnb.id), slice_type
+            )
+            for gnb in self.gnbs
+            for slice_type in normalized_slices
+        }
         ue_counts = {
             (int(gnb.id), slice_type): self.get_slice_ue_count(
                 int(gnb.id), slice_type
@@ -912,6 +931,7 @@ class MultiGNBWrapper(gym.Env):
         state = self.safe_admission_controller.get_state()
         direction_capacities = {}
         direction_accepted = {}
+        direction_remaining = {}
         for source in self.gnbs:
             for target in self.gnbs:
                 if int(source.id) == int(target.id):
@@ -931,13 +951,20 @@ class MultiGNBWrapper(gym.Env):
                     direction_accepted[direction_key] = state[
                         "direction_used"
                     ].get((int(source.id), int(target.id), slice_type), 0)
+                    direction_remaining[direction_key] = max(
+                        direction_capacities[direction_key]
+                        - direction_accepted[direction_key],
+                        0,
+                    )
         return {
             "enabled": bool(self.safe_admission_enabled),
             **state,
             "capacities": direction_capacities,
             "accepted": direction_accepted,
+            "remaining": direction_remaining,
             "source_capacities": dict(state["quota"]),
             "source_accepted": dict(state["used"]),
+            "source_remaining": dict(state.get("remaining", {})),
         }
 
     def _safe_admission_allows(
@@ -1029,15 +1056,11 @@ class MultiGNBWrapper(gym.Env):
         self.safe_admission_controller.commit(decision)
         if (
             self.neutralize_offsets_when_quota_exhausted
-            and self.safe_admission_controller.quota_exhausted(
-                source_id, normalized_slice
+            and self.safe_admission_controller.direction_quota_exhausted(
+                source_id, target_id, normalized_slice
             )
         ):
-            for target in self.gnbs:
-                if int(target.id) != int(source_id):
-                    self.set_a3_offset(
-                        source_id, int(target.id), normalized_slice, 0.0
-                    )
+            self.set_a3_offset(source_id, target_id, normalized_slice, 0.0)
 
     def _handover_stability_allows(
         self,
@@ -1350,7 +1373,9 @@ class MultiGNBWrapper(gym.Env):
 
         A neighbor becomes the target when its RSRP is greater than serving
         RSRP plus the configured slice-aware offset and hysteresis for
-        handover_ttt consecutive wrapper ticks.
+        handover_ttt consecutive wrapper ticks. This call executes at most
+        self.max_handovers_per_step successful handovers; remaining eligible
+        UEs must wait for later local steps.
         """
         if offsets_table:
             for (serving_id, neighbor_id, slice_type), info in offsets_table.items():
@@ -1468,16 +1493,14 @@ class MultiGNBWrapper(gym.Env):
                                 )
                             ),
                             "target_load": float(
-                                self.estimate_slice_load(
-                                    neighbor_id, normalized_slice
+                                self._safe_admission_slice_load(
+                                    neighbor_id,
+                                    normalized_slice,
                                 )
                             ),
-                            "target_total_load": float(sum(
-                                self.estimate_slice_load(
-                                    neighbor_id, slice_name
-                                )
-                                for slice_name in SLICE_TYPE_ORDER
-                            )),
+                            "target_total_load": float(
+                                self._safe_admission_total_load(neighbor_id)
+                            ),
                             "target_load_increment": ue_prbs
                             / float(target_budget),
                             "source_load_contribution": ue_prbs
@@ -1596,6 +1619,8 @@ class MultiGNBWrapper(gym.Env):
                 "safe_admission": bool(self.safe_admission_enabled),
             })
             handovers += 1
+            if handovers >= self.max_handovers_per_step:
+                break
 
         if handovers:
             self._invalidate_metric_caches()

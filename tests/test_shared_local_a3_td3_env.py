@@ -81,7 +81,7 @@ def test_shared_env_observation_shape_is_shared_across_gnb_turns():
 def test_shared_env_derives_episode_intervals_from_scenario_time():
     env = SharedLocalA3TD3Env(
         seed=17,
-        training_scenarios="mixed_overlap_with_fixed_slice_loads",
+        training_scenarios="jain_control_mixed",
         upper_window_seconds=2.0,
         local_steps_per_global=10,
         control_interval_steps=4,

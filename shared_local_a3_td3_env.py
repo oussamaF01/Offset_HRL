@@ -29,7 +29,7 @@ class SharedLocalA3TD3Env(gym.Env):
         self,
         seed: int = 7,
         slice_types: Sequence[str] = SLICE_TYPES,
-        training_scenarios: str | Sequence[str] | None = "mixed_overlap_with_fixed_slice_loads",
+        training_scenarios: str | Sequence[str] | None = "jain_control_mixed",
         scenario_selection: str = "cycle",
         upper_window_seconds: float = 1.0,
         local_steps_per_global: int = 10,
@@ -259,7 +259,8 @@ class SharedLocalA3TD3Env(gym.Env):
     def _set_fake_directional_bias(self, force: bool = False) -> None:
         if (not force) and self._control_interval_index % self.bias_update_intervals != 0:
             return
-        loads = self._load_matrix()
+        # Use window-average useful PRBs (demand-proportional) to mirror the upper agent.
+        loads = self._window_average_load_matrix()
         bias = {}
         for src_id in self.gnb_ids:
             for tgt_id in self.neighbors[src_id]:
@@ -297,7 +298,26 @@ class SharedLocalA3TD3Env(gym.Env):
         load_reward = float(np.clip((start_cost - end_cost) / max(start_cost, 0.05), -1.0, 1.0))
         sla_penalty = -float(np.sum(self._sla_matrix()))
         smoothness_penalty = -0.05 * float(self._pending_smoothness_penalty)
-        reward = load_reward + sla_penalty + smoothness_penalty
+
+        # Soft bias-alignment penalty: sum over all gNBs and directions.
+        # Penalises applied offsets that contradict the upper bias direction.
+        # Averaged per active direction so the scale doesn't grow with topology size.
+        bias_align_penalty = 0.0
+        n_active = 0
+        for gnb_id, local_env in self.local_envs.items():
+            for neighbor_id in local_env.neighbor_ids:
+                for slice_type in local_env.slice_types:
+                    b = local_env._bias_for(int(gnb_id), int(neighbor_id), slice_type)
+                    if abs(b) < 0.1:
+                        continue
+                    applied = local_env._offsets.get((int(neighbor_id), slice_type), 0.0)
+                    agreement = b * (applied / 6.0)
+                    bias_align_penalty -= local_env.w_bias_align * max(0.0, -agreement)
+                    n_active += 1
+        if n_active > 1:
+            bias_align_penalty /= n_active
+
+        reward = load_reward + sla_penalty + smoothness_penalty + bias_align_penalty
 
         self._set_fake_directional_bias()
         info = self._build_turn_info(
@@ -318,6 +338,7 @@ class SharedLocalA3TD3Env(gym.Env):
             "reward_load_improvement": float(load_reward),
             "reward_sla_penalty": float(sla_penalty),
             "reward_smoothness_penalty": float(smoothness_penalty),
+            "reward_bias_align_penalty": float(bias_align_penalty),
             "pending_actions": {
                 int(agent_id): action.copy()
                 for agent_id, action in self._pending_actions.items()

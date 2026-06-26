@@ -14,32 +14,23 @@ SourceSliceKey = Tuple[int, str]
 DirectionKey = Tuple[int, int, str]
 
 
-class SafeAdmissionController:
-    """Window-scoped volume control for A3-eligible handover candidates.
+class DirectionalAdmissionBudgetController:
+    """Window-scoped directional handover budget layer.
 
-    A3 offsets only determine eligibility. This controller freezes a release
-    quota at the start of each upper-agent window, ranks eligible candidates,
-    and prevents later local steps from exceeding that quota.
+    A3 offsets create radio eligibility. This controller only limits how many
+    eligible handovers may execute for each source -> target -> slice direction
+    during one upper-agent window. It deliberately does not veto candidates
+    using traffic-safety signals such as source excess, target load, total load,
+    or target SLA.
     """
 
     def __init__(
         self,
         *,
         bias_deadband: float = 0.05,
-        max_target_sla_severity: float = 0.50,
-        failure_penalty_weight: float = 2.0,
-        pingpong_penalty_weight: float = 2.0,
-        target_sla_penalty_weight: float = 1.0,
+        **_ignored_legacy_kwargs,
     ) -> None:
         self.bias_deadband = max(float(bias_deadband), 0.0)
-        self.max_target_sla_severity = float(
-            np.clip(max_target_sla_severity, 0.0, 1.0)
-        )
-        self.failure_penalty_weight = max(float(failure_penalty_weight), 0.0)
-        self.pingpong_penalty_weight = max(float(pingpong_penalty_weight), 0.0)
-        self.target_sla_penalty_weight = max(
-            float(target_sla_penalty_weight), 0.0
-        )
         self.window_id = 0
         self.reset_window()
 
@@ -50,19 +41,22 @@ class SafeAdmissionController:
     def reset_window(self) -> None:
         self.bias: Dict[SourceSliceKey, float] = {}
         self.direction_bias: Dict[DirectionKey, float] = {}
-        self.balance_target: Dict[SourceSliceKey, float] = {}
-        self.source_excess_load: Dict[SourceSliceKey, float] = {}
-        self.requested_release_load: Dict[SourceSliceKey, float] = {}
-        self.estimated_ue_load: Dict[SourceSliceKey, float] = {}
         self.quota: Dict[SourceSliceKey, int] = {}
         self.direction_quota: Dict[DirectionKey, int] = {}
         self.used: Dict[SourceSliceKey, int] = {}
-        self.used_load: Dict[SourceSliceKey, float] = {}
         self.direction_used: Dict[DirectionKey, int] = {}
         self.denied_until: Dict[Tuple[int, int, int, str], int] = {}
         self.stats: Counter = Counter()
         self.last_accepted: List[dict] = []
         self.last_rejected: List[dict] = []
+
+        # Legacy diagnostics kept so old logging/tests can read state without
+        # reintroducing traffic-safety decisions into admission.
+        self.balance_target: Dict[SourceSliceKey, float] = {}
+        self.source_excess_load: Dict[SourceSliceKey, float] = {}
+        self.requested_release_load: Dict[SourceSliceKey, float] = {}
+        self.estimated_ue_load: Dict[SourceSliceKey, float] = {}
+        self.used_load: Dict[SourceSliceKey, float] = {}
 
     def begin_upper_window(
         self,
@@ -72,19 +66,19 @@ class SafeAdmissionController:
         neighbor_graph: Mapping[int, Sequence[int]] | None = None,
         gnb_ids: Sequence[int],
         slice_types: Sequence[str],
-        loads: Mapping[SourceSliceKey, float],
+        loads: Mapping[SourceSliceKey, float] | None = None,
         ue_counts: Mapping[SourceSliceKey, int],
         balance_targets: Mapping[str, float] | None = None,
         remaining_handover_budget: int | None = None,
     ) -> Dict[SourceSliceKey, int]:
-        """Reset state and freeze one release quota per source and slice."""
-        if directional_bias is None:
-            bias = np.asarray(bias_matrix, dtype=float)
-            if bias.shape != (len(gnb_ids), len(slice_types)):
-                raise ValueError(
-                    "bias_matrix must have shape "
-                    f"{(len(gnb_ids), len(slice_types))}, got {bias.shape}"
-                )
+        """Reset state and freeze per-direction quotas for one upper window."""
+        normalized_slices = tuple(self._slice_name(s) for s in slice_types)
+        gnb_ids = tuple(int(gnb_id) for gnb_id in gnb_ids)
+        graph = {
+            int(source_id): [int(target_id) for target_id in targets]
+            for source_id, targets in dict(neighbor_graph or {}).items()
+        }
+        if not graph:
             graph = {
                 int(source_id): [
                     int(target_id) for target_id in gnb_ids
@@ -92,125 +86,86 @@ class SafeAdmissionController:
                 ]
                 for source_id in gnb_ids
             }
-            directional = np.repeat(bias[:, None, :], max(map(len, graph.values())), axis=1)
+        max_neighbors = max(
+            (len(graph.get(int(source_id), ())) for source_id in gnb_ids),
+            default=0,
+        )
+
+        if directional_bias is None:
+            bias = np.asarray(bias_matrix, dtype=float)
+            if bias.shape != (len(gnb_ids), len(normalized_slices)):
+                raise ValueError(
+                    "bias_matrix must have shape "
+                    f"{(len(gnb_ids), len(normalized_slices))}, got {bias.shape}"
+                )
+            directional = np.repeat(bias[:, None, :], max_neighbors, axis=1)
         else:
             directional = np.asarray(directional_bias, dtype=float)
-            graph = {
-                int(source_id): [int(target_id) for target_id in targets]
-                for source_id, targets in dict(neighbor_graph or {}).items()
-            }
-            expected = (
-                len(gnb_ids),
-                max((len(graph.get(int(source_id), ())) for source_id in gnb_ids), default=0),
-                len(slice_types),
+
+        expected = (len(gnb_ids), max_neighbors, len(normalized_slices))
+        if directional.shape != expected:
+            raise ValueError(
+                f"directional_bias must have shape {expected}, got {directional.shape}"
             )
-            if directional.shape != expected:
-                raise ValueError(
-                    f"directional_bias must have shape {expected}, got {directional.shape}"
-                )
 
         self.reset_window()
         self.window_id += 1
-        normalized_slices = tuple(self._slice_name(s) for s in slice_types)
-        if balance_targets is None:
-            balance_targets = {
-                slice_type: float(
-                    np.mean([
-                        float(loads.get((int(gnb_id), slice_type), 0.0))
-                        for gnb_id in gnb_ids
-                    ])
-                )
-                for slice_type in normalized_slices
-            }
+        loads = dict(loads or {})
+        balance_targets = dict(balance_targets or {})
 
-        budget_remaining = (
-            None
-            if remaining_handover_budget is None
-            else max(int(remaining_handover_budget), 0)
-        )
-        for source_idx, gnb_id in enumerate(gnb_ids):
-            source_id = int(gnb_id)
+        for source_idx, source_id in enumerate(gnb_ids):
+            targets = tuple(graph.get(int(source_id), ()))
             for slice_idx, slice_type in enumerate(normalized_slices):
-                key = (source_id, slice_type)
-                source_load = max(float(loads.get(key, 0.0)), 0.0)
-                target = max(float(balance_targets.get(slice_type, 0.0)), 0.0)
-                source_ues = max(int(ue_counts.get(key, 0)), 0)
-                targets = graph.get(source_id, ())
-                direction_strengths = []
-                for target_slot, target_id in enumerate(targets):
-                    direction_key = (source_id, int(target_id), slice_type)
-                    value = float(np.clip(
-                        directional[source_idx, target_slot, slice_idx], -1.0, 1.0
-                    ))
-                    self.direction_bias[direction_key] = value
-                    direction_strengths.append(
-                        abs(value) if value < -self.bias_deadband else 0.0
-                    )
-                release_fraction = min(sum(direction_strengths), 1.0)
-                source_bias = -release_fraction if release_fraction > 0.0 else 0.0
-                excess = max(source_load - target, 0.0)
-                requested_load = release_fraction * excess
-                average_ue_load = (
+                source_key = (int(source_id), slice_type)
+                source_ues = max(int(ue_counts.get(source_key, 0)), 0)
+                source_quota = 0
+                source_bias_values = []
+
+                source_load = max(float(loads.get(source_key, 0.0)), 0.0)
+                target_load = max(float(balance_targets.get(slice_type, 0.0)), 0.0)
+                self.balance_target[source_key] = target_load
+                self.source_excess_load[source_key] = max(source_load - target_load, 0.0)
+                self.estimated_ue_load[source_key] = (
                     source_load / float(source_ues)
                     if source_ues > 0 and source_load > 0.0
                     else 0.0
                 )
+                self.used[source_key] = 0
+                self.used_load[source_key] = 0.0
 
-                if requested_load <= 0.0 or average_ue_load <= 0.0:
-                    quota = 0
-                else:
-                    quota = int(math.ceil(
-                        requested_load / average_ue_load - 1e-9
-                    ))
-                    quota = min(max(quota, 0), source_ues)
-                if budget_remaining is not None:
-                    quota = min(quota, budget_remaining)
-
-                self.bias[key] = source_bias
-                self.balance_target[key] = target
-                self.source_excess_load[key] = excess
-                self.requested_release_load[key] = requested_load
-                self.estimated_ue_load[key] = average_ue_load
-                self.quota[key] = quota
-                self.used[key] = 0
-                self.used_load[key] = 0.0
-
-                if quota > 0 and sum(direction_strengths) > 0.0:
-                    exact = [
-                        quota * strength / sum(direction_strengths)
-                        for strength in direction_strengths
-                    ]
-                    allocated = [int(math.floor(value)) for value in exact]
-                    remaining = quota - sum(allocated)
-                    order = sorted(
-                        range(len(exact)),
-                        key=lambda idx: exact[idx] - allocated[idx],
-                        reverse=True,
+                for target_slot, target_id in enumerate(targets):
+                    direction_key = (int(source_id), int(target_id), slice_type)
+                    value = float(
+                        np.clip(directional[source_idx, target_slot, slice_idx], -1.0, 1.0)
                     )
-                    for idx in order[:remaining]:
-                        allocated[idx] += 1
-                else:
-                    allocated = [0] * len(targets)
-                for target_id, direction_quota in zip(targets, allocated):
-                    self.direction_quota[
-                        (source_id, int(target_id), slice_type)
-                    ] = int(direction_quota)
+                    strength = max(0.0, -value)
+                    if strength <= self.bias_deadband:
+                        direction_budget = 0
+                    else:
+                        direction_budget = min(
+                            int(math.ceil(strength * float(source_ues) - 1e-6)),
+                            source_ues,
+                        )
+                    self.direction_bias[direction_key] = value
+                    self.direction_quota[direction_key] = int(direction_budget)
+                    self.direction_used[direction_key] = 0
+                    source_quota += int(direction_budget)
+                    source_bias_values.append(value)
+
+                self.quota[source_key] = int(source_quota)
+                self.requested_release_load[source_key] = (
+                    float(source_quota) * self.estimated_ue_load.get(source_key, 0.0)
+                )
+                negative_strength = sum(max(0.0, -value) for value in source_bias_values)
+                self.bias[source_key] = -min(float(negative_strength), 1.0)
 
         return dict(self.quota)
 
-    def candidate_score(self, candidate: Mapping) -> float:
-        """Rank safer candidates first while retaining A3 margin as the base."""
-        return float(
-            float(candidate.get(
-                "radio_delta_db",
-                candidate.get("a3_margin", 0.0),
-            ))
-            - self.pingpong_penalty_weight
-            * float(candidate.get("pingpong_ratio", 0.0))
-            - self.failure_penalty_weight
-            * float(candidate.get("handover_failure_ratio", 0.0))
-            - self.target_sla_penalty_weight
-            * float(candidate.get("target_sla_severity", 0.0))
+    def candidate_sort_key(self, candidate: Mapping) -> tuple:
+        return (
+            float(candidate.get("a3_margin", candidate.get("radio_delta_db", 0.0))),
+            -float(candidate.get("pingpong_ratio", 0.0)),
+            -float(candidate.get("handover_failure_ratio", 0.0)),
         )
 
     def admit_candidates(
@@ -221,21 +176,18 @@ class SafeAdmissionController:
         remaining_handover_budget: int | None = None,
         current_tick: int | None = None,
     ) -> Tuple[List[dict], List[dict], Dict]:
-        """Rank and filter one local-step batch without consuming quota.
+        """Select eligible candidates without consuming real quota.
 
-        Quota is consumed only by ``commit`` after the simulator confirms that
-        the selected handover succeeded.
+        Real budget consumption happens in ``commit`` after the simulator
+        confirms that the handover succeeded. This method uses temporary counts
+        only to avoid over-selecting a direction in the current batch.
         """
         ranked = [dict(candidate) for candidate in candidates]
-        for candidate in ranked:
-            candidate["admission_score"] = self.candidate_score(candidate)
-        ranked.sort(key=lambda item: item["admission_score"], reverse=True)
+        ranked.sort(key=self.candidate_sort_key, reverse=True)
 
         accepted: List[dict] = []
         rejected: List[dict] = []
-        provisional_by_source: Counter = Counter()
-        projected_target_load: Dict[Tuple[int, str], float] = {}
-        projected_target_total_load: Dict[int, float] = {}
+        temporary_direction_used: Counter = Counter()
         selected_ues = set()
         step_limit = len(ranked) if max_acceptances is None else max(
             int(max_acceptances), 0
@@ -259,10 +211,9 @@ class SafeAdmissionController:
             slice_type = self._slice_name(candidate["slice_type"])
             source_key = (source_id, slice_type)
             direction_key = (source_id, target_id, slice_type)
-            target_key = (target_id, slice_type)
             ue_id = int(candidate["ue_id"])
-
             self.stats["eligible"] += 1
+
             guard_reason = candidate.get("guard_rejection_reason")
             if guard_reason:
                 reject(candidate, str(guard_reason))
@@ -281,78 +232,29 @@ class SafeAdmissionController:
                 reject(candidate, "step_budget")
                 continue
             if len(accepted) >= global_limit:
-                reject(candidate, "episode_budget")
-                continue
-            source_excess = self.source_excess_load.get(source_key, 0.0)
-            agent_signaled = (
-                self.direction_bias.get(direction_key, 0.0)
-                < -self.bias_deadband
-            )
-            if not agent_signaled:
-                reject(candidate, "no_directional_release")
-                continue
-            if source_excess <= 0.0:
-                reject(candidate, "no_source_excess")
-                continue
-            quota = self.quota.get(source_key, 0)
-            consumed = self.used.get(source_key, 0) + provisional_by_source[source_key]
-            if consumed >= quota:
-                reject(candidate, "quota_exhausted")
-                continue
-            direction_consumed = (
-                self.direction_used.get(direction_key, 0)
-                + sum(
-                    1
-                    for item in accepted
-                    if (
-                        int(item["source_id"]),
-                        int(item["target_id"]),
-                        self._slice_name(item["slice_type"]),
-                    ) == direction_key
-                )
-            )
-            if direction_consumed >= self.direction_quota.get(direction_key, 0):
-                reject(candidate, "direction_quota_exhausted")
-                continue
-            if float(candidate.get("target_sla_severity", 0.0)) > (
-                self.max_target_sla_severity
-            ):
-                reject(candidate, "target_sla")
+                reject(candidate, "global_budget_exhausted")
                 continue
 
-            target_load = float(candidate.get("target_load", 0.0))
-            load_increment = max(float(candidate.get("target_load_increment", 0.0)), 0.0)
-            safe_limit = float(candidate.get("target_safe_limit", 1.0))
-            projected_before = projected_target_load.get(target_key, target_load)
-            projected_after = projected_before + load_increment
-            if projected_after > safe_limit + 1e-12:
-                reject(candidate, "target_safety")
+            quota = int(self.direction_quota.get(direction_key, 0))
+            used = int(self.direction_used.get(direction_key, 0))
+            provisional = int(temporary_direction_used[direction_key])
+            if quota <= 0:
+                reject(candidate, "no_directional_budget")
                 continue
-            target_total_load = float(
-                candidate.get("target_total_load", target_load)
-            )
-            target_total_safe_limit = float(
-                candidate.get("target_total_safe_limit", 1.0)
-            )
-            projected_total_before = projected_target_total_load.get(
-                target_id, target_total_load
-            )
-            projected_total_after = projected_total_before + load_increment
-            if projected_total_after > target_total_safe_limit + 1e-12:
-                reject(candidate, "target_total_safety")
+            if used + provisional >= quota:
+                reject(candidate, "direction_quota_exhausted")
                 continue
 
             decision = dict(candidate)
             decision["accepted"] = True
-            decision["projected_target_load_after"] = projected_after
-            decision["projected_target_total_load_after"] = (
-                projected_total_after
-            )
             accepted.append(decision)
             selected_ues.add(ue_id)
-            provisional_by_source[source_key] += 1
-            projected_target_load[target_key] = projected_after
-            projected_target_total_load[target_id] = projected_total_after
+            temporary_direction_used[direction_key] += 1
+
+            # Keep source counters projected only for debug; real consumption is
+            # still strictly deferred to commit().
+            self.quota.setdefault(source_key, 0)
+            self.used.setdefault(source_key, 0)
 
         self.last_accepted = [
             {key: value for key, value in item.items() if not key.startswith("_")}
@@ -369,6 +271,14 @@ class SafeAdmissionController:
             "rejection_reasons": dict(Counter(
                 item["rejection_reason"] for item in rejected
             )),
+            "direction_remaining": {
+                key: max(
+                    self.direction_quota.get(key, 0)
+                    - self.direction_used.get(key, 0),
+                    0,
+                )
+                for key in self.direction_quota
+            },
             "remaining_quota": {
                 key: max(self.quota.get(key, 0) - self.used.get(key, 0), 0)
                 for key in self.quota
@@ -377,7 +287,7 @@ class SafeAdmissionController:
         return accepted, rejected, debug
 
     def commit(self, candidate: Mapping) -> None:
-        """Consume one source quota slot after a successful handover."""
+        """Consume one slot after a successful handover."""
         source_id = int(candidate["source_id"])
         target_id = int(candidate["target_id"])
         slice_type = self._slice_name(candidate["slice_type"])
@@ -395,22 +305,40 @@ class SafeAdmissionController:
         key = (int(source_id), self._slice_name(slice_type))
         return self.used.get(key, 0) >= self.quota.get(key, 0)
 
+    def direction_quota_exhausted(
+        self,
+        source_id: int,
+        target_id: int,
+        slice_type: str,
+    ) -> bool:
+        key = (int(source_id), int(target_id), self._slice_name(slice_type))
+        return self.direction_used.get(key, 0) >= self.direction_quota.get(key, 0)
+
     def get_state(self) -> Dict:
+        direction_remaining = {
+            key: max(self.direction_quota.get(key, 0) - self.direction_used.get(key, 0), 0)
+            for key in self.direction_quota
+        }
         stats = {
             "eligible": 0,
             "accepted": 0,
-            "rejected_no_release_pressure": 0,
-            "rejected_no_directional_release": 0,
-            "rejected_no_source_excess": 0,
-            "rejected_quota_exhausted": 0,
+            "rejected_no_directional_budget": 0,
             "rejected_direction_quota_exhausted": 0,
-            "rejected_target_safety": 0,
-            "rejected_target_total_safety": 0,
-            "rejected_target_sla": 0,
+            "rejected_global_budget_exhausted": 0,
             "rejected_pingpong_guard": 0,
             "rejected_ue_episode_budget": 0,
             "rejected_episode_budget": 0,
             "rejected_step_budget": 0,
+            "rejected_temporary_guard": 0,
+            "rejected_duplicate_ue": 0,
+            # Legacy safety-veto counters intentionally remain zero unless
+            # external guard code writes them.
+            "rejected_no_source_excess": 0,
+            "rejected_target_safety": 0,
+            "rejected_target_total_safety": 0,
+            "rejected_target_sla": 0,
+            "rejected_no_directional_release": 0,
+            "rejected_quota_exhausted": 0,
             **dict(self.stats),
         }
         return {
@@ -418,18 +346,23 @@ class SafeAdmissionController:
             "bias": dict(self.bias),
             "direction_bias": dict(self.direction_bias),
             "quota": dict(self.quota),
-            "direction_quota": dict(self.direction_quota),
             "used": dict(self.used),
             "remaining": {
                 key: max(self.quota.get(key, 0) - self.used.get(key, 0), 0)
                 for key in self.quota
             },
+            "direction_quota": dict(self.direction_quota),
+            "direction_used": dict(self.direction_used),
+            "direction_remaining": direction_remaining,
             "requested_release_load": dict(self.requested_release_load),
             "source_excess_load": dict(self.source_excess_load),
             "estimated_ue_load": dict(self.estimated_ue_load),
             "used_load": dict(self.used_load),
-            "direction_used": dict(self.direction_used),
             "stats": stats,
             "last_accepted": list(self.last_accepted),
             "last_rejected": list(self.last_rejected),
         }
+
+
+# Compatibility name used by the existing wrapper and tests.
+SafeAdmissionController = DirectionalAdmissionBudgetController

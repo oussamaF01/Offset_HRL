@@ -24,7 +24,7 @@ from shared_local_a3_td3_env import SharedLocalA3TD3Env
 def make_env(
     seed: int = 7,
     slice_types=SLICE_TYPES,
-    training_scenarios: str = "mixed_overlap_with_fixed_slice_loads",
+    training_scenarios: str = "jain_control_mixed",
     upper_window_seconds: float = 2.0,
     local_steps_per_global: int = 10,
     radio_substeps: int = 20,
@@ -53,7 +53,7 @@ def evaluate(
     seed: int,
     episodes: int,
     slice_types=SLICE_TYPES,
-    training_scenarios: str = "mixed_overlap_with_fixed_slice_loads",
+    training_scenarios: str = "jain_control_mixed",
     upper_window_seconds: float = 2.0,
     local_steps_per_global: int = 10,
     radio_substeps: int = 20,
@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--action-noise-sigma", type=float, default=0.25)
     parser.add_argument("--slice-types", type=str, default=",".join(SLICE_TYPES))
-    parser.add_argument("--training-scenarios", type=str, default="mixed_overlap_with_fixed_slice_loads")
+    parser.add_argument("--training-scenarios", type=str, default="jain_control_mixed")
     parser.add_argument("--upper-window-seconds", type=float, default=2.0)
     parser.add_argument("--local-steps-per-global", type=int, default=10)
     parser.add_argument("--radio-substeps", type=int, default=20)

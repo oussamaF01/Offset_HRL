@@ -7,7 +7,7 @@ def _make_env():
     return GlobalPPO3GNBEnv(
         seed=3,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         upper_window_seconds=2.0,
         local_steps_per_global=2,
@@ -20,8 +20,8 @@ def test_curriculum_reuses_only_scenario_and_uses_duration():
     env = _make_env()
     try:
         _obs, first = env.reset()
-        assert first["scenario_name"] == "fixed_center_embb_left_right"
-        assert first["episode_duration_s"] == 20.0
+        assert first["scenario_name"] == "jain_balance_controllable"
+        assert first["episode_duration_s"] == 2.0
 
         done = False
         steps = 0
@@ -31,12 +31,12 @@ def test_curriculum_reuses_only_scenario_and_uses_duration():
             )
             done = terminated or truncated
             steps += 1
-        assert steps == 10
-        assert info["episode_time_s"] == 20.0
+        assert steps == 1
+        assert info["episode_time_s"] == 2.0
 
         _obs, second = env.reset()
-        assert second["scenario_name"] == "fixed_center_embb_left_right"
-        assert second["episode_duration_s"] == 20.0
+        assert second["scenario_name"] == "jain_balance_controllable"
+        assert second["episode_duration_s"] == 2.0
         assert env.base_env._step_count == 0
     finally:
         env.close()
@@ -59,7 +59,7 @@ def test_first_populated_sla_window_does_not_create_bootstrap_penalty():
     env = GlobalPPO3GNBEnv(
         seed=23,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         terminal_reward_only=False,
         upper_window_seconds=1.0,
@@ -89,10 +89,12 @@ def test_first_populated_sla_window_does_not_create_bootstrap_penalty():
             + info["reward_excess_load_improvement"]
             + info["reward_served_share_improvement"]
             + info["reward_served_active_floor"]
+            + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
+            - info["global_contradictory_bias_penalty"]
         )
-        assert np.isclose(reward, expected)
+        assert np.isclose(reward, info["paper_cost_reward"])
         assert np.isclose(
             info["reward_load_improvement"],
             np.clip(

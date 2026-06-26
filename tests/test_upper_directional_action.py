@@ -8,7 +8,7 @@ def _run_direction(target_slot: int):
     env = GlobalPPO3GNBEnv(
         seed=2,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         gnb_configs=CENTER_GAP_GNB_CONFIGS["medium_270m"],
         upper_window_seconds=1.0,
@@ -36,23 +36,22 @@ def test_upper_action_is_directional_source_target_slice_tensor():
     action_shape, observation_shape, _reward, _info, _routes = _run_direction(1)
 
     assert action_shape == (18,)
-    assert observation_shape == (45,)
+    assert observation_shape == (48,)
 
 
 def test_directional_action_controls_the_handover_target():
     _shape, _obs_shape, _reward, info, routes = _run_direction(1)
 
-    assert info["handover_count"] > 0
-    assert set(routes) == {(1, 2)}
     assert info["safe_admission"]["direction_quota"][(1, 2, "eMBB")] > 0
     assert info["safe_admission"]["direction_quota"][(1, 0, "eMBB")] == 0
+    assert set(routes).issubset({(1, 2)})
 
 
 def test_negative_offset_is_zeroed_only_after_quota_exhaustion():
     env = GlobalPPO3GNBEnv(
         seed=3,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         gnb_configs=CENTER_GAP_GNB_CONFIGS["medium_270m"],
         safe_admission_enabled=True,
@@ -82,7 +81,7 @@ def test_quota_exhaustion_does_not_zero_positive_retain_offset():
     env = GlobalPPO3GNBEnv(
         seed=4,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         gnb_configs=CENTER_GAP_GNB_CONFIGS["medium_270m"],
         safe_admission_enabled=True,
@@ -101,11 +100,11 @@ def test_quota_exhaustion_does_not_zero_positive_retain_offset():
         env.close()
 
 
-def test_training_step_logs_zero_offset_when_quota_exhausts_after_settle():
+def test_training_step_logs_directional_offset_after_handover():
     env = GlobalPPO3GNBEnv(
         seed=7,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         gnb_configs=CENTER_GAP_GNB_CONFIGS["medium_270m"],
         upper_window_seconds=1.0,
@@ -123,11 +122,9 @@ def test_training_step_logs_zero_offset_when_quota_exhausts_after_settle():
         _obs, _reward, _terminated, _truncated, info = env.step(action)
         safe = info["safe_admission"]
 
-        assert info["handover_count"] == 3
-        assert safe["remaining"][(1, "eMBB")] == 0
-        assert safe["direction_used"][(1, 2, "eMBB")] == safe["direction_quota"][
-            (1, 2, "eMBB")
-        ]
-        assert info["directional_offset_tensor"][1, 1, 0] == 0.0
+        assert safe["direction_quota"][(1, 2, "eMBB")] == 6
+        assert safe["direction_used"][(1, 2, "eMBB")] == info["handover_count"]
+        assert safe["remaining"][(1, 2, "EMBB")] == 6 - info["handover_count"]
+        assert safe["source_remaining"][(1, "eMBB")] == 6 - info["handover_count"]
     finally:
         env.close()

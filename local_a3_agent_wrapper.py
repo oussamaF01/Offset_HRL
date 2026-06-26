@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -79,6 +79,7 @@ class LocalA3OffsetEnv(gym.Env):
         w_pp: float = 0.5,
         w_sla: float = 1.0,
         w_balance: float = 3.0,
+        w_bias_align: float = 0.3,
         alpha_hf: float = 2.0,
         alpha_pp: float = 1.0,
         alpha_sla_target: float = 2.0,
@@ -86,6 +87,7 @@ class LocalA3OffsetEnv(gym.Env):
         handover_margin_db: float = 0.0,
         steps_per_action: int = 1,
         normalize_observation: bool = True,
+        load_observation_provider: Optional[Callable[[], Dict[Tuple[int, str], float]]] = None,
     ):
         super().__init__()
         self.base_env = base_env
@@ -109,6 +111,7 @@ class LocalA3OffsetEnv(gym.Env):
         self.w_pp = float(w_pp)
         self.w_sla = float(w_sla)
         self.w_balance = float(w_balance)
+        self.w_bias_align = float(w_bias_align)
         self.alpha_hf = float(alpha_hf)
         self.alpha_pp = float(alpha_pp)
         self.alpha_sla_target = float(alpha_sla_target)
@@ -116,6 +119,7 @@ class LocalA3OffsetEnv(gym.Env):
         self.handover_margin_db = float(handover_margin_db)
         self.steps_per_action = max(1, int(steps_per_action))
         self.normalize_observation = bool(normalize_observation)
+        self.load_observation_provider = load_observation_provider
 
         self._offsets: Dict[Tuple[int, str], float] = {
             (neighbor_id, slice_type): 0.0
@@ -556,10 +560,15 @@ class LocalA3OffsetEnv(gym.Env):
 
         # Global context: load and SLA severity for every gNB × slice.
         # Gives each agent a network-wide view so it can coordinate with peers.
+        # Use window-average useful PRBs (demand-proportional) to match the upper agent.
+        if self.load_observation_provider is not None:
+            window_loads = dict(self.load_observation_provider())
+        else:
+            window_loads = self.base_env.get_window_average_slice_loads()
         for gnb in self.base_env.gnbs:
             gid = int(gnb.id)
             for slice_type in self.slice_types:
-                load_g = self.base_env.estimate_slice_load(gid, slice_type)
+                load_g = float(window_loads.get((gid, slice_type), 0.0))
                 sla_g = float(sla_flags_by_gnb.get((gid, slice_type), 0.0))
                 obs.extend([float(load_g), float(sla_g)])
 
@@ -567,14 +576,16 @@ class LocalA3OffsetEnv(gym.Env):
         return np.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
 
     def _compute_local_reward(self, proto_offsets: np.ndarray, handover_stats: Dict[str, int]) -> float:
-        # 1. Global SLA penalty — all gNBs, all slices, equal weight per slice type.
-        #    URLLC counts the same as eMBB and mMTC: no special multiplier.
+        # 1. Global SLA penalty — averaged over all (gNB, slice) pairs so the
+        #    scale is independent of topology size. Result is in [-w_sla, 0].
         sla_flags_by_gnb = self._slice_sla_flags_by_gnb()
-        sla_penalty = -self.w_sla * sum(sla_flags_by_gnb.values())
+        sla_values = list(sla_flags_by_gnb.values())
+        sla_mean = float(np.mean(sla_values)) if sla_values else 0.0
+        sla_penalty = -self.w_sla * sla_mean
 
         # 2. Network load-balance penalty — per-slice variance across ALL gNBs.
-        #    Agents at different gNBs share the same physical loads, so this
-        #    term naturally coordinates them: all agents benefit when variance drops.
+        #    Uses instantaneous allocated loads (estimate_slice_load) so the signal
+        #    is available from the very first step, not only after window warm-up.
         gnb_ids = [int(gnb.id) for gnb in self.base_env.gnbs]
         balance_penalty = 0.0
         for slice_type in self.slice_types:
@@ -599,11 +610,29 @@ class LocalA3OffsetEnv(gym.Env):
             smoothness_penalty -= self.lambda_delta * delta ** 2
             self._prev_proto_offsets[(neighbor_id, slice_type)] = float(proto)
 
+        # 5. Bias alignment — soft penalty when offset direction contradicts upper bias.
+        #    Only active when |bias| > 0.1 (ignore near-neutral signals).
+        #    Penalty = w_bias_align * max(0, -B * offset/6) per direction,
+        #    averaged across directions so the scale is independent of topology size.
+        bias_align_penalty = 0.0
+        n_dirs = 0
+        for neighbor_id, slice_type in self._iter_keys():
+            b = self._bias_for(self.gnb_id, neighbor_id, slice_type)
+            if abs(b) < 0.1:
+                continue
+            applied = self._offsets[(neighbor_id, slice_type)]
+            agreement = b * (applied / 6.0)  # positive = agrees with bias, negative = contradicts
+            bias_align_penalty -= self.w_bias_align * max(0.0, -agreement)
+            n_dirs += 1
+        if n_dirs > 1:
+            bias_align_penalty /= n_dirs
+
         breakdown = {
             "sla_penalty": sla_penalty,
             "balance_penalty": balance_penalty,
             "mobility_penalty": mobility_penalty,
             "smoothness_penalty": smoothness_penalty,
+            "bias_align_penalty": bias_align_penalty,
         }
         reward = sum(breakdown.values())
         self._last_reward_breakdown = {

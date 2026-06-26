@@ -82,6 +82,7 @@ def _admission_stub():
     env.safe_admission_enabled = True
     env.safe_admission_load_limits = {"eMBB": 0.80, "URLLC": 0.80, "mMTC": 0.80}
     env.safe_admission_controller = SafeAdmissionController(bias_deadband=0.05)
+    env.safe_admission_load_provider = None
     env.neutralize_offsets_when_quota_exhausted = False
     env.max_handovers_per_episode = 20
     env._episode_handover_count = 0
@@ -114,38 +115,42 @@ def _directional_bias(
     return bias
 
 
-def test_admission_quota_uses_bias_times_source_excess_and_is_enforced():
+def test_admission_quota_uses_bias_times_source_ues_and_is_enforced():
     env, _loads = _admission_stub()
     bias = _directional_bias(-0.8)
 
     capacities = env.begin_safe_admission_window(bias)
-    # Average load is 0.60, source excess is 0.30, requested release load
-    # is 0.8 * 0.30 = 0.24, and estimated per-UE load is 0.90 / 10 = 0.09.
-    assert capacities[(0, 1, "EMBB")] == 3
-    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 3
+    assert capacities[(0, 1, "EMBB")] == 8
+    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 8
 
     ue = SimpleNamespace(id=1, prbs=5, useful_prbs=5)
-    for _ in range(3):
+    for _ in range(8):
         assert env._safe_admission_allows(ue, 0, 1, "eMBB")
         env._commit_safe_admission(0, 1, "eMBB")
     assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
-    assert env.get_safe_admission_state()["stats"]["rejected_quota_exhausted"] == 1
+    assert env.get_safe_admission_state()["stats"]["rejected_direction_quota_exhausted"] == 1
 
 
-def test_half_release_bias_shares_one_quota_across_both_neighbors():
+def test_half_release_bias_builds_independent_directional_quotas():
     env, _loads = _admission_stub()
     bias = np.zeros((3, 2, 3), dtype=float)
     bias[0, :, 0] = -0.25
     env.begin_safe_admission_window(bias)
 
     ue = SimpleNamespace(id=2, prbs=1, useful_prbs=1)
-    for target in (1, 2):
-        assert env._safe_admission_allows(ue, 0, target, "eMBB")
-        env._commit_safe_admission(0, target, "eMBB")
+    for _ in range(3):
+        assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+        env._commit_safe_admission(0, 1, "eMBB")
+    assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
+    for _ in range(3):
+        assert env._safe_admission_allows(ue, 0, 2, "eMBB")
+        env._commit_safe_admission(0, 2, "eMBB")
     assert not env._safe_admission_allows(ue, 0, 2, "eMBB")
     state = env.get_safe_admission_state()
-    assert state["source_capacities"][(0, "eMBB")] == 2
-    assert state["source_accepted"][(0, "eMBB")] == 2
+    assert state["capacities"][(0, 1, "EMBB")] == 3
+    assert state["capacities"][(0, 2, "EMBB")] == 3
+    assert state["source_capacities"][(0, "eMBB")] == 6
+    assert state["source_accepted"][(0, "eMBB")] == 6
 
 
 def test_float32_bias_does_not_round_admission_quota_up():
@@ -154,10 +159,10 @@ def test_float32_bias_does_not_round_admission_quota_up():
 
     env.begin_safe_admission_window(bias)
 
-    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 1
+    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 2
 
 
-def test_hard_target_limit_rejects_candidate():
+def test_target_load_does_not_veto_budgeted_candidate():
     env, loads = _admission_stub()
     loads[(0, "eMBB")] = 1.0
     loads[(1, "eMBB")] = 0.79
@@ -166,11 +171,11 @@ def test_hard_target_limit_rejects_candidate():
     env.begin_safe_admission_window(bias)
 
     ue = SimpleNamespace(id=3, prbs=5, useful_prbs=5)
-    assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
-    assert env.get_safe_admission_state()["stats"]["rejected_target_safety"] == 1
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+    assert env.get_safe_admission_state()["stats"]["rejected_target_safety"] == 0
 
 
-def test_negative_bias_has_zero_quota_without_source_excess():
+def test_negative_bias_has_budget_even_without_source_excess():
     env, loads = _admission_stub()
     loads[(0, "eMBB")] = 0.30
     loads[(1, "eMBB")] = 0.10
@@ -179,9 +184,9 @@ def test_negative_bias_has_zero_quota_without_source_excess():
     env.begin_safe_admission_window(bias)
     ue = SimpleNamespace(id=4, prbs=1, useful_prbs=1)
 
-    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 0
-    assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
-    assert env.get_safe_admission_state()["stats"]["rejected_no_source_excess"] == 1
+    assert env.get_safe_admission_state()["source_capacities"][(0, "eMBB")] == 5
+    assert env._safe_admission_allows(ue, 0, 1, "eMBB")
+    assert env.get_safe_admission_state()["stats"]["rejected_no_source_excess"] == 0
 
 
 def test_overloaded_source_cannot_release_without_negative_upper_bias():
@@ -193,13 +198,12 @@ def test_overloaded_source_cannot_release_without_negative_upper_bias():
         env.begin_safe_admission_window(bias)
 
         state = env.get_safe_admission_state()
-        assert state["source_excess_load"][(0, "eMBB")] > 0.0
         assert state["requested_release_load"][(0, "eMBB")] == 0.0
         assert state["source_capacities"][(0, "eMBB")] == 0
         assert not env._safe_admission_allows(ue, 0, 1, "eMBB")
         assert (
             env.get_safe_admission_state()["stats"][
-                "rejected_no_directional_release"
+                "rejected_no_directional_budget"
             ]
             == 1
         )
@@ -251,7 +255,7 @@ def test_new_upper_window_recomputes_and_resets_used_quota():
 
     assert first_quota > 0
     assert state["used"][(0, "eMBB")] == 0
-    assert state["quota"][(0, "eMBB")] == 0
+    assert state["quota"][(0, "eMBB")] == first_quota
     assert state["window_id"] == 2
 
 
@@ -263,7 +267,7 @@ def test_controller_ranks_candidates_and_clamps_to_remaining_quota():
         gnb_ids=[0],
         slice_types=["eMBB"],
         loads={(0, "eMBB"): 0.90},
-        ue_counts={(0, "eMBB"): 10},
+        ue_counts={(0, "eMBB"): 4},
         balance_targets={"eMBB": 0.60},
     )
     candidates = [
@@ -303,11 +307,11 @@ def test_controller_ranks_candidates_and_clamps_to_remaining_quota():
 
     assert [item["ue_id"] for item in accepted] == [11, 12]
     assert rejected[0]["ue_id"] == 10
-    assert rejected[0]["rejection_reason"] == "quota_exhausted"
-    assert debug["rejection_reasons"] == {"quota_exhausted": 1}
+    assert rejected[0]["rejection_reason"] == "direction_quota_exhausted"
+    assert debug["rejection_reasons"] == {"direction_quota_exhausted": 1}
 
 
-def test_controller_rejects_unsafe_target_and_reports_reason():
+def test_controller_ignores_target_slice_safety_for_budgeted_candidate():
     controller = SafeAdmissionController()
     controller.begin_upper_window(
         directional_bias=np.asarray([[[-1.0]]], dtype=float),
@@ -331,12 +335,12 @@ def test_controller_rejects_unsafe_target_and_reports_reason():
 
     accepted, rejected, debug = controller.admit_candidates([candidate])
 
-    assert accepted == []
-    assert rejected[0]["rejection_reason"] == "target_safety"
-    assert debug["rejection_reasons"] == {"target_safety": 1}
+    assert [item["ue_id"] for item in accepted] == [20]
+    assert rejected == []
+    assert debug["rejection_reasons"] == {}
 
 
-def test_controller_rejects_target_when_total_physical_load_would_exceed_one():
+def test_controller_ignores_target_total_safety_for_budgeted_candidate():
     controller = SafeAdmissionController()
     controller.begin_upper_window(
         directional_bias=np.asarray([[[-1.0]]], dtype=float),
@@ -361,9 +365,9 @@ def test_controller_rejects_target_when_total_physical_load_would_exceed_one():
 
     accepted, rejected, debug = controller.admit_candidates([candidate])
 
-    assert accepted == []
-    assert rejected[0]["rejection_reason"] == "target_total_safety"
-    assert debug["rejection_reasons"] == {"target_total_safety": 1}
+    assert [item["ue_id"] for item in accepted] == [21]
+    assert rejected == []
+    assert debug["rejection_reasons"] == {}
 
 
 def test_directional_quota_only_allows_the_requested_target():
@@ -394,7 +398,7 @@ def test_directional_quota_only_allows_the_requested_target():
 
     assert [item["target_id"] for item in accepted] == [1]
     assert rejected[0]["target_id"] == 2
-    assert rejected[0]["rejection_reason"] == "no_directional_release"
+    assert rejected[0]["rejection_reason"] == "no_directional_budget"
     state = controller.get_state()
     assert state["direction_quota"][(0, 1, "eMBB")] > 0
     assert state["direction_quota"][(0, 2, "eMBB")] == 0

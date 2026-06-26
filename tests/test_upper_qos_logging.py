@@ -20,7 +20,7 @@ def test_upper_info_exposes_window_qos_matrices():
     env = GlobalPPO3GNBEnv(
         seed=9,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         upper_window_seconds=1.0,
         local_steps_per_global=10,
         radio_substeps=2,
@@ -79,7 +79,7 @@ def test_training_csv_is_compact_and_contains_before_after_loads():
         sla_deadband=0.05,
         upper_window_seconds=2.0,
         post_handover_settle_steps=4,
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
     )
     env = make_env(args)

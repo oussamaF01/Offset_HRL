@@ -1,0 +1,11 @@
+{
+  "scenario": "jain_balance_controllable",
+  "model": "models/lower_td3_upper_scenarios/run_20260626_045526/local_a3_td3_final.zip",
+  "controlled_gnb": 1,
+  "steps_requested": 3,
+  "rows": 18,
+  "output_csv": "results/lower_td3_oracle_scenario_trace_smoke.csv",
+  "mean_abs_offset_error_db": 5.333333333333333,
+  "bias_alignment_rate": 0.3333333333333333,
+  "total_controlled_handover_successes": 12
+}

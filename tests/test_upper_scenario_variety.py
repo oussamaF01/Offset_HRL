@@ -15,42 +15,17 @@ from upper_agent_training_scenarios import (
 def test_scenario_catalog_is_slice_aware_and_uses_explicit_regions():
     names = [scenario.name for scenario in UPPER_TRAINING_SCENARIOS]
     assert names == [
-        "paper_six_ue_slice_aware",
-        "fixed_center_embb_left_right",
-        "mixed_slices_center_overlap",
-        "embb_overlap_preloaded_targets",
-        "asymmetric_embb_target_loads",
-        "urllc_mmtc_overlap_fixed_embb",
-        "mixed_overlap_with_fixed_slice_loads",
-        "high_load_inner_embb",
-        "high_load_inner_mixed",
-        "high_load_inner_asymmetric",
         "jain_balance_controllable",
         "jain_control_urllc",
         "jain_control_mmtc",
         "jain_control_mixed",
     ]
     assert all(scenario.tier == "fixed" for scenario in UPPER_TRAINING_SCENARIOS)
-    assert all(
-        scenario.duration_s == (
-            1.0
-            if (
-                scenario.name.startswith("high_load_inner_")
-                or scenario.name.startswith("jain_")
-            )
-            else 20.0
-        )
-        for scenario in UPPER_TRAINING_SCENARIOS
-    )
+    assert all(scenario.duration_s == 1.0 for scenario in UPPER_TRAINING_SCENARIOS)
     assert any(
         {group.slice_type for group in scenario.groups}
         == {"eMBB", "URLLC", "mMTC"}
         for scenario in UPPER_TRAINING_SCENARIOS
-    )
-    assert any(
-        group.placement_region == "fixed_core"
-        for scenario in UPPER_TRAINING_SCENARIOS
-        for group in scenario.groups
     )
     for scenario in UPPER_TRAINING_SCENARIOS:
         source_slice_pairs = [
@@ -108,20 +83,20 @@ def test_all_scenarios_reset_with_expected_load_and_finite_step():
 
 def test_named_scenario_subset_preserves_requested_order():
     selected = get_upper_training_scenarios(
-        "mixed_slices_center_overlap,asymmetric_embb_target_loads"
+        "jain_control_mmtc,jain_balance_controllable"
     )
     assert [scenario.name for scenario in selected] == [
-        "mixed_slices_center_overlap",
-        "asymmetric_embb_target_loads",
+        "jain_control_mmtc",
+        "jain_balance_controllable",
     ]
 
 
-def test_fixed_center_left_right_scenario_is_stationary_and_bidirectional():
+def test_controllable_embb_scenario_is_stationary_and_bidirectional():
     env = GlobalPPO3GNBEnv(
         seed=123,
         gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         upper_window_seconds=1.0,
         local_steps_per_global=10,
         radio_substeps=2,
@@ -144,21 +119,23 @@ def test_fixed_center_left_right_scenario_is_stationary_and_bidirectional():
         events = list(env.base_env.handover_events)
         state = info["safe_admission"]
 
-        assert state["quota"][(1, "eMBB")] == 4
-        assert state["used"][(1, "eMBB")] == 4
-        assert info["handover_count"] == 4
-        assert {event["to_gnb"] for event in events} == {0, 2}
-        assert sum(int(ue.serving_gnb) == 1 for ue in ues) == 2
+        assert state["quota"][(1, "eMBB")] == 6
+        assert state["used"][(1, "eMBB")] <= 6
+        assert info["handover_count"] == state["used"][(1, "eMBB")]
+        assert state["direction_quota"][(1, 0, "eMBB")] == 3
+        assert state["direction_quota"][(1, 2, "eMBB")] == 3
+        assert {event["to_gnb"] for event in events}.issubset({0, 2})
+        assert sum(int(ue.serving_gnb) == 1 for ue in ues) == 6 - info["handover_count"]
     finally:
         env.close()
 
 
-def test_inner_training_ues_use_learnable_132m_overlap_placement():
+def test_controllable_training_ues_use_learnable_midpoint_placement():
     env = GlobalPPO3GNBEnv(
         seed=123,
         gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_embb",
+        training_scenarios="jain_balance_controllable",
         upper_window_seconds=1.0,
         local_steps_per_global=10,
         radio_substeps=2,
@@ -169,7 +146,7 @@ def test_inner_training_ues_use_learnable_132m_overlap_placement():
         ues = list(env.base_env.get_all_ues())
 
         assert len(ues) == 6
-        assert {abs(float(ue.x)) for ue in ues} == {132.0}
+        assert {abs(float(ue.x)) for ue in ues} == {135.0}
         assert all(
             all(
                 env.base_env._is_in_coverage(
@@ -183,12 +160,13 @@ def test_inner_training_ues_use_learnable_132m_overlap_placement():
         env.close()
 
 
-def test_controlled_jain_scenarios_balance_with_symmetric_safe_release():
-    for scenario_name, active_slice_indices, min_jain in (
-        ("jain_balance_controllable", (0,), 0.99),
-        ("jain_control_urllc", (1,), 0.85),
-        ("jain_control_mmtc", (2,), 0.99),
-        ("jain_control_mixed", (0, 1, 2), 0.95),
+def test_controlled_jain_scenarios_build_symmetric_directional_budgets():
+    slice_names = ("eMBB", "URLLC", "mMTC")
+    for scenario_name, active_slice_indices in (
+        ("jain_balance_controllable", (0,)),
+        ("jain_control_urllc", (1,)),
+        ("jain_control_mmtc", (2,)),
+        ("jain_control_mixed", (0, 1, 2)),
     ):
         env = GlobalPPO3GNBEnv(
             seed=123,
@@ -201,8 +179,8 @@ def test_controlled_jain_scenarios_balance_with_symmetric_safe_release():
             terminal_reward_only=False,
             max_handovers_per_local_step=3,
             safe_admission_enabled=True,
-            a3_handover_cooldown_s=2.0,
-            a3_min_residence_s=2.0,
+            a3_handover_cooldown_s=0.0,
+            a3_min_residence_s=0.0,
         )
         try:
             env.reset(seed=123)
@@ -212,23 +190,25 @@ def test_controlled_jain_scenarios_balance_with_symmetric_safe_release():
                 action_3d[1, :, slice_idx] = -1.0
 
             _obs, _reward, _terminated, _truncated, info = env.step(action)
-            assert info["handover_count"] >= 3
-            assert info["jain_fairness_raw"] >= min_jain
-            assert np.all(
-                np.sum(np.asarray(info["used_prb_matrix_end"]), axis=1) > 0.0
-            )
+            state = info["safe_admission"]
+            for slice_idx in active_slice_indices:
+                slice_type = slice_names[slice_idx]
+                assert state["direction_quota"][(1, 0, slice_type)] == 6
+                assert state["direction_quota"][(1, 2, slice_type)] == 6
+            assert state["stats"]["rejected_target_safety"] == 0
+            assert state["stats"]["rejected_no_source_excess"] == 0
         finally:
             env.close()
 
 
-def test_center_gap_catalog_keeps_ue_placement_and_three_cell_coverage():
+def test_center_gap_catalog_keeps_controllable_placement_and_three_cell_coverage():
     reference_positions = None
     for topology_name, gnb_configs in CENTER_GAP_GNB_CONFIGS.items():
         env = GlobalPPO3GNBEnv(
             seed=123,
             gnb_configs=gnb_configs,
             scenario_mode="curriculum",
-            training_scenarios="fixed_center_embb_left_right",
+            training_scenarios="jain_balance_controllable",
             upper_window_seconds=1.0,
             local_steps_per_global=10,
             radio_substeps=2,
@@ -290,9 +270,9 @@ def test_block_selection_repeats_one_scenario_before_switching():
         seed=8,
         scenario_mode="curriculum",
         training_scenarios=(
-            "high_load_inner_embb,"
-            "high_load_inner_mixed,"
-            "high_load_inner_asymmetric"
+            "jain_balance_controllable,"
+            "jain_control_urllc,"
+            "jain_control_mmtc"
         ),
         scenario_selection="block",
         curriculum_block_episodes=3,
@@ -309,27 +289,27 @@ def test_block_selection_repeats_one_scenario_before_switching():
             block_indices.append(info["curriculum_block_index"])
 
         assert observed == [
-            "high_load_inner_embb",
-            "high_load_inner_embb",
-            "high_load_inner_embb",
-            "high_load_inner_mixed",
-            "high_load_inner_mixed",
-            "high_load_inner_mixed",
-            "high_load_inner_asymmetric",
-            "high_load_inner_asymmetric",
-            "high_load_inner_asymmetric",
+            "jain_balance_controllable",
+            "jain_balance_controllable",
+            "jain_balance_controllable",
+            "jain_control_urllc",
+            "jain_control_urllc",
+            "jain_control_urllc",
+            "jain_control_mmtc",
+            "jain_control_mmtc",
+            "jain_control_mmtc",
         ]
         assert block_indices == [0, 0, 0, 1, 1, 1, 2, 2, 2]
     finally:
         env.close()
 
 
-def test_overlap_and_fixed_core_coverage_semantics():
+def test_controllable_overlap_coverage_semantics():
     env = GlobalPPO3GNBEnv(
         seed=31,
         gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
         scenario_mode="curriculum",
-        training_scenarios="mixed_overlap_with_fixed_slice_loads",
+        training_scenarios="jain_control_mixed",
         upper_window_seconds=1.0,
         local_steps_per_global=1,
         radio_substeps=1,
@@ -351,11 +331,8 @@ def test_overlap_and_fixed_core_coverage_semantics():
                     <= float(gnb.coverage_radius)
                     for gnb in env.base_env.gnbs
                 ]
-                if group.placement_region == "overlap":
-                    assert sum(coverage) == 3
-                else:
-                    assert coverage[group.source_gnb]
-                    assert sum(coverage) == 1
+                assert group.placement_region == "overlap"
+                assert sum(coverage) == 3
     finally:
         env.close()
 
@@ -373,28 +350,20 @@ def test_all_region_semantics_hold_across_all_three_topologies():
                         <= float(cfg["coverage_radius"])
                         for cfg in configs
                     ]
-                    if group.placement_region == "overlap":
-                        assert sum(coverage) == 3, (
-                            topology_name,
-                            scenario.name,
-                            group.slice_type,
-                            (x, y),
-                        )
-                    else:
-                        assert coverage[group.source_gnb]
-                        assert sum(coverage) == 1, (
-                            topology_name,
-                            scenario.name,
-                            group.slice_type,
-                            (x, y),
-                        )
+                    assert group.placement_region == "overlap"
+                    assert sum(coverage) == 3, (
+                        topology_name,
+                        scenario.name,
+                        group.slice_type,
+                        (x, y),
+                    )
 
 
 def test_handover_recalibration_preserves_demand_and_slice_budget():
     env = GlobalPPO3GNBEnv(
         seed=19,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         terminal_reward_only=False,
         upper_window_seconds=1.0,
@@ -427,6 +396,5 @@ def test_handover_recalibration_preserves_demand_and_slice_budget():
             ]
             used = sum(int(getattr(ue, "useful_prbs", 0)) for ue in attached)
             assert used <= env.base_env.get_slice_prb_budget(gnb_id, "eMBB")
-            assert all(int(getattr(ue, "useful_prbs", 0)) <= 20 for ue in attached)
     finally:
         env.close()

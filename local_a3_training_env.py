@@ -21,6 +21,12 @@ from local_a3_training_scenarios import (
 )
 from scenario_creator import create_multignb_env
 from slice_ran import Packet
+from strong_heuristic_local_executor import strong_directional_heuristic_local_executor
+
+# Deferred import to avoid circular dependencies at module load time.
+def _import_global_ppo_env():
+    from global_ppo_3gnb_env import GlobalPPO3GNBEnv
+    return GlobalPPO3GNBEnv
 
 
 DEFAULT_GNB_CONFIGS = [
@@ -81,6 +87,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         training_scenarios: Optional[Sequence[EpisodeTrainingScenario]] = None,
         scenario_hold_episodes: int = 1,
         print_scenarios: bool = True,
+        heuristic_gnb_ids: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.seed_value = int(seed)
@@ -139,6 +146,28 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             ttt=1,
         )
 
+        # Heuristic-controlled gNBs: defaults to all gNBs except the TD3 gNB.
+        all_gnb_ids = [int(cfg["id"]) for cfg in self.gnb_configs]
+        self.heuristic_gnb_ids = tuple(
+            int(g) for g in (heuristic_gnb_ids if heuristic_gnb_ids is not None
+                              else [g for g in all_gnb_ids if g != self.gnb_id])
+        )
+        self._heuristic_prev_offsets: Dict[int, np.ndarray] = {}
+        self._heuristic_local_envs: Dict[int, LocalA3OffsetEnv] = {}
+        for gid in self.heuristic_gnb_ids:
+            h_neighbors = [g for g in all_gnb_ids if g != gid]
+            h_env = LocalA3OffsetEnv(
+                self.base_env,
+                gnb_id=gid,
+                neighbor_ids=h_neighbors,
+                slice_types=self.slice_types,
+                steps_per_action=1,
+                ttt=1,
+            )
+            self._heuristic_local_envs[gid] = h_env
+            n_dirs = len(h_neighbors) * len(self.slice_types)
+            self._heuristic_prev_offsets[gid] = np.zeros(n_dirs, dtype=float)
+
         self.action_space = self.local_env.action_space
         self.observation_space = self.local_env.observation_space
 
@@ -189,6 +218,14 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         self._held_rule_bias = None
         self._last_bias_changed = False
 
+        for gid, h_env in self._heuristic_local_envs.items():
+            for key in h_env._offsets:
+                h_env._offsets[key] = 0.0
+                h_env._prev_proto_offsets[key] = 0.0
+            h_env._ttt_counters.clear()
+            n_dirs = len(h_env.neighbor_ids) * len(self.slice_types)
+            self._heuristic_prev_offsets[gid] = np.zeros(n_dirs, dtype=float)
+
         last_obs = None
         last_info = {}
         attempts = self.max_case_sampling_attempts if self.balance_bias_cases else 1
@@ -221,7 +258,109 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         obs = last_obs if last_obs is not None else self.local_env._build_observation()
         return obs, info
 
+    def _run_heuristic_gnbs(self):
+        """Run strong_directional_heuristic_local_executor for every heuristic gNB."""
+        if not self._heuristic_local_envs:
+            return
+
+        # Collect UE arrays once (shared across all heuristic gNBs).
+        all_ues = [
+            ue for ue in self.base_env.get_all_ues()
+            if ue.connected and ue.serving_gnb is not None
+        ]
+        if not all_ues:
+            return
+
+        all_gnb_ids = [int(cfg["id"]) for cfg in self.gnb_configs]
+        n_gnbs = len(all_gnb_ids)
+        gnb_index = {gid: i for i, gid in enumerate(all_gnb_ids)}
+        slice_index = {st: i for i, st in enumerate(self.slice_types)}
+
+        ue_slice_arr = np.array([
+            slice_index.get(normalize_slice_type(getattr(ue, "slice_type", "eMBB")), 0)
+            for ue in all_ues
+        ], dtype=int)
+        ue_serving_arr = np.array([
+            gnb_index.get(int(ue.serving_gnb), 0) for ue in all_ues
+        ], dtype=int)
+
+        # RSRP matrix [n_ues, n_gnbs]
+        rsrp = np.full((len(all_ues), n_gnbs), -120.0, dtype=float)
+        for u_idx, ue in enumerate(all_ues):
+            for g_idx, gid in enumerate(all_gnb_ids):
+                gnb = self.base_env._get_gnb_by_id(gid)
+                if gnb is not None:
+                    try:
+                        rsrp[u_idx, g_idx] = self.base_env._compute_link_metrics(gnb, ue)["rx_power_dbm"]
+                    except Exception:
+                        pass
+
+        # Load and SLA arrays [n_gnbs, n_slices]
+        load = np.array([
+            [self.base_env.get_window_average_slice_loads().get((gid, st), 0.0)
+             for st in self.slice_types]
+            for gid in all_gnb_ids
+        ], dtype=float)
+        sla_flags = self.base_env.get_slice_sla_flags() if hasattr(self.base_env, "get_slice_sla_flags") else {}
+        sla_arr = np.array([
+            [float(sla_flags.get((gid, st), 0.0)) for st in self.slice_types]
+            for gid in all_gnb_ids
+        ], dtype=float)
+        ho_fail = np.zeros((n_gnbs, len(self.slice_types)), dtype=float)
+        pp_arr = np.zeros((n_gnbs, len(self.slice_types)), dtype=float)
+
+        current_bias = dict(self.local_env.global_bias)
+
+        for gid, h_env in self._heuristic_local_envs.items():
+            g_idx = gnb_index[gid]
+            h_neighbors = h_env.neighbor_ids
+            max_nb = len(h_neighbors)
+            n_slices = len(self.slice_types)
+
+            # Build per-direction bias and prev_offsets [1, max_nb, n_slices]
+            B = np.zeros((n_gnbs, max_nb, n_slices), dtype=float)
+            prev = self._heuristic_prev_offsets[gid].reshape(max_nb, n_slices)
+            prev_full = np.zeros((n_gnbs, max_nb, n_slices), dtype=float)
+            prev_full[g_idx] = prev
+
+            for nb_slot, nb_id in enumerate(h_neighbors):
+                for s_idx, st in enumerate(self.slice_types):
+                    B[g_idx, nb_slot, s_idx] = float(
+                        current_bias.get((gid, nb_id, st), 0.0)
+                    )
+
+            neighbor_graph = {g_idx: [gnb_index[nb] for nb in h_neighbors]}
+
+            offsets_full, _ = strong_directional_heuristic_local_executor(
+                B=B,
+                prev_offsets=prev_full,
+                ue_slice=ue_slice_arr,
+                ue_serving_gnb=ue_serving_arr,
+                rsrp_matrix=rsrp,
+                neighbor_graph=neighbor_graph,
+                load=load,
+                sla_violation=sla_arr,
+                ho_failure_ratio=ho_fail,
+                pingpong_ratio=pp_arr,
+                slice_types=self.slice_types,
+                return_debug=True,
+            )
+
+            # offsets_full[g_idx, nb_slot, s_idx] — extract and apply
+            offsets_vec = offsets_full[g_idx].reshape(-1)  # [max_nb * n_slices]
+            self._heuristic_prev_offsets[gid] = offsets_vec.copy()
+            h_env._apply_proto_offsets(offsets_vec)
+            h_env._execute_a3_handovers()
+
+            # Push offsets into base env so A3 conditions use the right values
+            for nb_slot, nb_id in enumerate(h_neighbors):
+                for s_idx, st in enumerate(self.slice_types):
+                    self.base_env.set_a3_offset(
+                        gid, nb_id, st, float(offsets_full[g_idx, nb_slot, s_idx])
+                    )
+
     def step(self, action):
+        self._run_heuristic_gnbs()
         held_action = self._held_or_new_action(action)
         obs, reward, terminated, truncated, info = self.local_env.step(held_action)
         post_action_slice_loads = self.base_env.get_slice_loads()
@@ -796,3 +935,373 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             f"cases=[{case_text}] loads=[{load_text}] bias=[{bias_text}]",
             flush=True,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Upper-scenario lower training env
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RULE_BIAS_PARAMS = {
+    "eMBB":  {"scale": 0.35, "deadband": 0.10, "min_src": 0.40},
+    "URLLC": {"scale": 0.25, "deadband": 0.07, "min_src": 0.35},
+    "mMTC":  {"scale": 0.40, "deadband": 0.12, "min_src": 0.45},
+}
+_RULE_BIAS_DEFAULT_PARAMS = {"scale": 0.35, "deadband": 0.10, "min_src": 0.40}
+
+
+def _reset_local_env_state(local_env: LocalA3OffsetEnv, base_env) -> None:
+    """Reset a LocalA3OffsetEnv's internal state without touching the simulator."""
+    for key in local_env._offsets:
+        local_env._offsets[key] = 0.0
+        local_env._prev_proto_offsets[key] = 0.0
+        local_env._mobility_counters[key] = {
+            "attempts": 0, "successes": 0, "failures": 0, "ping_pongs": 0,
+        }
+    local_env._ttt_counters.clear()
+    local_env._last_serving = {
+        int(ue.id): ue.serving_gnb for ue in base_env.get_all_ues()
+    }
+    local_env._prev_serving = {ue_id: None for ue_id in local_env._last_serving}
+    local_env._last_reward_breakdown = {}
+
+
+class UpperScenarioLowerEnv(gym.Env):
+    """Lower TD3 training env backed by GlobalPPO3GNBEnv upper scenarios.
+
+    One gNB (``controlled_gnb_id``) has its A3 offsets learned by TD3; all
+    other gNBs run ``strong_directional_heuristic_local_executor`` every step.
+    UE placement is driven by ``UpperTrainingScenario`` objects such as
+    ``jain_balance_controllable``, which place UEs at equidistant midpoints
+    between the center gNB and the outer gNBs — giving maximum A3 offset
+    controllability.
+
+    Defaults: ``controlled_gnb_id=1`` because all controllable scenarios start
+    UEs on gNB-1 (the center gNB in medium_270m topology).
+    """
+
+    metadata = {"render_modes": []}
+
+    # Shared rule-bias parameters (same formula as LocalA3RuleBiasTrainingEnv)
+    _RULE_BIAS_PARAMS = _RULE_BIAS_PARAMS
+    _RULE_BIAS_DEFAULT_PARAMS = _RULE_BIAS_DEFAULT_PARAMS
+
+    def __init__(
+        self,
+        seed: int = 7,
+        controlled_gnb_id: int = 1,
+        training_scenarios: str = (
+            "jain_balance_controllable,"
+            "jain_control_urllc,"
+            "jain_control_mmtc,"
+            "jain_control_mixed"
+        ),
+        scenario_selection: str = "cycle",
+        episode_steps: int = 40,
+        slice_types: Sequence[str] = ("eMBB", "URLLC", "mMTC"),
+        upper_window_seconds: float = 1.0,
+        local_steps_per_global: int = 10,
+        radio_substeps: int = 20,
+        warmup_steps: int = 1,
+        max_handovers_per_local_step: int = 3,
+        action_hold_steps: int = 5,
+        bias_hold_steps: int = 20,
+        max_offset_change_db: float = 2.0,
+        print_scenarios: bool = True,
+    ):
+        super().__init__()
+        self.seed_value = int(seed)
+        self.controlled_gnb_id = int(controlled_gnb_id)
+        self.episode_steps = max(1, int(episode_steps))
+        self.slice_types = tuple(normalize_slice_type(s) for s in slice_types)
+        self.action_hold_steps = max(1, int(action_hold_steps))
+        self.bias_hold_steps = max(1, int(bias_hold_steps))
+        self.max_offset_change_db = float(max_offset_change_db)
+        self.print_scenarios = bool(print_scenarios)
+
+        GlobalPPO3GNBEnv = _import_global_ppo_env()
+        self.upper_env = GlobalPPO3GNBEnv(
+            seed=seed,
+            slice_types=self.slice_types,
+            scenario_mode="curriculum",
+            training_scenarios=training_scenarios,
+            scenario_selection=scenario_selection,
+            upper_window_seconds=upper_window_seconds,
+            local_steps_per_global=local_steps_per_global,
+            radio_substeps=radio_substeps,
+            terminal_reward_only=False,
+            warmup_steps=warmup_steps,
+            max_handovers_per_local_step=max_handovers_per_local_step,
+        )
+
+        self.base_env = self.upper_env.base_env
+        self.gnb_ids = tuple(range(self.upper_env.n_gnbs))
+        self.neighbors: Dict[int, Tuple[int, ...]] = {
+            int(gid): tuple(int(n) for n in self.upper_env.neighbors[int(gid)])
+            for gid in self.gnb_ids
+        }
+        self.heuristic_gnb_ids = tuple(
+            g for g in self.gnb_ids if g != self.controlled_gnb_id
+        )
+
+        self.local_envs: Dict[int, LocalA3OffsetEnv] = {
+            int(gid): LocalA3OffsetEnv(
+                self.base_env,
+                gnb_id=int(gid),
+                neighbor_ids=self.neighbors[int(gid)],
+                slice_types=self.slice_types,
+                steps_per_action=1,
+                ttt=1,
+            )
+            for gid in self.gnb_ids
+        }
+        self._ctrl_env = self.local_envs[self.controlled_gnb_id]
+        self.action_space = self._ctrl_env.action_space
+        self.observation_space = self._ctrl_env.observation_space
+
+        self._heuristic_prev_offsets: Dict[int, np.ndarray] = {
+            gid: np.zeros(
+                len(self.neighbors[gid]) * len(self.slice_types), dtype=float
+            )
+            for gid in self.heuristic_gnb_ids
+        }
+
+        self._elapsed_steps = 0
+        self._reset_count = 0
+        self._action_hold_counter = 0
+        self._held_action: Optional[np.ndarray] = None
+        self._held_rule_bias: Optional[Dict] = None
+        self._bias_hold_counter = 0
+        self._current_scenario_name = "unknown"
+
+    # ── gym interface ─────────────────────────────────────────────────────────
+
+    def reset(self, *, seed=None, options=None):
+        self._reset_count += 1
+        obs_upper, info = self.upper_env.reset(seed=seed, options=options)
+        del obs_upper
+
+        # Re-grab base_env in case it was recreated.
+        self.base_env = self.upper_env.base_env
+        for local_env in self.local_envs.values():
+            local_env.base_env = self.base_env
+            _reset_local_env_state(local_env, self.base_env)
+
+        # Reset heuristic prev-offset memory.
+        for gid in self.heuristic_gnb_ids:
+            n = len(self.neighbors[gid]) * len(self.slice_types)
+            self._heuristic_prev_offsets[gid] = np.zeros(n, dtype=float)
+
+        self._elapsed_steps = 0
+        self._action_hold_counter = 0
+        self._held_action = None
+        self._held_rule_bias = None
+        self._bias_hold_counter = 0
+
+        # Seed the initial rule bias.
+        bias = self._compute_rule_bias(force=True)
+        for local_env in self.local_envs.values():
+            local_env.set_global_bias(bias)
+
+        self._current_scenario_name = str(
+            info.get("scenario_name", getattr(self.upper_env, "_active_scenario", "unknown"))
+        )
+        if self.print_scenarios:
+            print(
+                f"[UpperScenarioLowerEnv] reset={self._reset_count} "
+                f"controlled_gnb={self.controlled_gnb_id} "
+                f"scenario={self._current_scenario_name}",
+                flush=True,
+            )
+
+        return self._ctrl_env._build_observation(), {}
+
+    def step(self, action: np.ndarray):
+        # Heuristic gNBs run first (A3 offsets applied + handovers executed)
+        # before radio time advances — same ordering as LocalA3RuleBiasTrainingEnv.
+        self._run_heuristic_gnbs()
+
+        # Rate-limit and quantize the TD3 action.
+        held = self._apply_action_hold(action)
+
+        # Reset the measurement window so get_window_average_slice_loads()
+        # returns a fresh per-step estimate (not cumulative since episode start).
+        self.base_env.begin_radio_measurement_window()
+
+        # Step the controlled gNB: applies A3 offsets, executes handovers,
+        # advances the radio simulator one step, computes reward.
+        obs, reward, terminated, truncated, info = self._ctrl_env.step(held)
+
+        # Update rule bias with hold logic.
+        bias = self._compute_rule_bias()
+        for local_env in self.local_envs.values():
+            local_env.set_global_bias(bias)
+
+        self._elapsed_steps += 1
+        truncated = bool(truncated or self._elapsed_steps >= self.episode_steps)
+
+        info["rule_bias"] = bias
+        info["scenario_name"] = self._current_scenario_name
+        return obs, float(reward), bool(terminated), bool(truncated), info
+
+    def close(self):
+        self.upper_env.close()
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _compute_rule_bias(self, force: bool = False) -> Dict:
+        """Load-diff proportional bias; holds for bias_hold_steps steps."""
+        if force or self._held_rule_bias is None or self._bias_hold_counter <= 0:
+            bias: Dict = {}
+            for src_id in self.gnb_ids:
+                for tgt_id in self.gnb_ids:
+                    if src_id == tgt_id:
+                        continue
+                    for slice_type in self.slice_types:
+                        p = self._RULE_BIAS_PARAMS.get(
+                            slice_type, self._RULE_BIAS_DEFAULT_PARAMS
+                        )
+                        src_load = self.base_env.estimate_slice_load(src_id, slice_type)
+                        tgt_load = self.base_env.estimate_slice_load(tgt_id, slice_type)
+                        diff = src_load - tgt_load
+                        if abs(diff) < p["deadband"]:
+                            value = 0.0
+                        else:
+                            raw = -diff / p["scale"]
+                            if raw < 0.0 and src_load < p["min_src"]:
+                                raw = 0.0
+                            value = float(np.clip(raw, -1.0, 1.0))
+                        bias[(src_id, tgt_id, slice_type)] = value
+            self._held_rule_bias = bias
+            self._bias_hold_counter = max(self.bias_hold_steps - 1, 0)
+        else:
+            self._bias_hold_counter -= 1
+        return dict(self._held_rule_bias)
+
+    def _apply_action_hold(self, action) -> np.ndarray:
+        """Hold the current action for action_hold_steps steps; rate-limit deltas."""
+        raw = np.asarray(action, dtype=np.float32).reshape(-1)
+        if self._held_action is None or self._action_hold_counter <= 0:
+            applied = self._ctrl_env.get_applied_offsets()
+            keys = [
+                (nb, st)
+                for nb in self._ctrl_env.neighbor_ids
+                for st in self.slice_types
+            ]
+            prev = np.array(
+                [float(applied.get(k, 0.0)) for k in keys], dtype=np.float32
+            )
+            limited = np.clip(
+                raw - prev, -self.max_offset_change_db, self.max_offset_change_db
+            )
+            quantized = np.array(
+                [quantize_a3_offset(float(v)) for v in prev + limited],
+                dtype=np.float32,
+            )
+            self._held_action = quantized
+            self._action_hold_counter = max(self.action_hold_steps - 1, 0)
+        else:
+            self._action_hold_counter -= 1
+        return self._held_action.reshape(self._ctrl_env.action_space.shape)
+
+    def _run_heuristic_gnbs(self) -> None:
+        """Run strong_directional_heuristic_local_executor for all non-controlled gNBs."""
+        if not self.heuristic_gnb_ids:
+            return
+
+        all_ues = [
+            ue for ue in self.base_env.get_all_ues()
+            if ue.connected and ue.serving_gnb is not None
+        ]
+        if not all_ues:
+            return
+
+        all_gnb_ids = list(self.gnb_ids)
+        n_gnbs = len(all_gnb_ids)
+        gnb_index = {gid: i for i, gid in enumerate(all_gnb_ids)}
+        slice_index = {st: i for i, st in enumerate(self.slice_types)}
+
+        ue_slice_arr = np.array([
+            slice_index.get(normalize_slice_type(getattr(ue, "slice_type", "eMBB")), 0)
+            for ue in all_ues
+        ], dtype=int)
+        ue_serving_arr = np.array([
+            gnb_index.get(int(ue.serving_gnb), 0) for ue in all_ues
+        ], dtype=int)
+
+        rsrp = np.full((len(all_ues), n_gnbs), -120.0, dtype=float)
+        for u_idx, ue in enumerate(all_ues):
+            for g_idx, gid in enumerate(all_gnb_ids):
+                gnb = self.base_env._get_gnb_by_id(gid)
+                if gnb is not None:
+                    try:
+                        rsrp[u_idx, g_idx] = self.base_env._compute_link_metrics(
+                            gnb, ue
+                        )["rx_power_dbm"]
+                    except Exception:
+                        pass
+
+        load = np.array([
+            [
+                self.base_env.get_window_average_slice_loads().get((gid, st), 0.0)
+                for st in self.slice_types
+            ]
+            for gid in all_gnb_ids
+        ], dtype=float)
+        sla_flags = (
+            self.base_env.get_slice_sla_flags()
+            if hasattr(self.base_env, "get_slice_sla_flags")
+            else {}
+        )
+        sla_arr = np.array([
+            [float(sla_flags.get((gid, st), 0.0)) for st in self.slice_types]
+            for gid in all_gnb_ids
+        ], dtype=float)
+        ho_fail = np.zeros((n_gnbs, len(self.slice_types)), dtype=float)
+        pp_arr = np.zeros((n_gnbs, len(self.slice_types)), dtype=float)
+        current_bias = dict(self._ctrl_env.global_bias)
+
+        for gid in self.heuristic_gnb_ids:
+            h_env = self.local_envs[gid]
+            g_idx = gnb_index[gid]
+            h_neighbors = h_env.neighbor_ids
+            max_nb = len(h_neighbors)
+            n_slices = len(self.slice_types)
+
+            B = np.zeros((n_gnbs, max_nb, n_slices), dtype=float)
+            prev = self._heuristic_prev_offsets[gid].reshape(max_nb, n_slices)
+            prev_full = np.zeros((n_gnbs, max_nb, n_slices), dtype=float)
+            prev_full[g_idx] = prev
+
+            for nb_slot, nb_id in enumerate(h_neighbors):
+                for s_idx, st in enumerate(self.slice_types):
+                    B[g_idx, nb_slot, s_idx] = float(
+                        current_bias.get((gid, nb_id, st), 0.0)
+                    )
+
+            neighbor_graph = {g_idx: [gnb_index[nb] for nb in h_neighbors]}
+
+            offsets_full, _ = strong_directional_heuristic_local_executor(
+                B=B,
+                prev_offsets=prev_full,
+                ue_slice=ue_slice_arr,
+                ue_serving_gnb=ue_serving_arr,
+                rsrp_matrix=rsrp,
+                neighbor_graph=neighbor_graph,
+                load=load,
+                sla_violation=sla_arr,
+                ho_failure_ratio=ho_fail,
+                pingpong_ratio=pp_arr,
+                slice_types=self.slice_types,
+                return_debug=True,
+            )
+
+            offsets_vec = offsets_full[g_idx].reshape(-1)
+            self._heuristic_prev_offsets[gid] = offsets_vec.copy()
+            h_env._apply_proto_offsets(offsets_vec)
+            h_env._execute_a3_handovers()
+
+            for nb_slot, nb_id in enumerate(h_neighbors):
+                for s_idx, st in enumerate(self.slice_types):
+                    self.base_env.set_a3_offset(
+                        gid, nb_id, st, float(offsets_full[g_idx, nb_slot, s_idx])
+                    )

@@ -14,7 +14,7 @@ def _episode_return(action):
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         upper_window_seconds=1.0,
         local_steps_per_global=4,
@@ -64,7 +64,7 @@ def test_reward_matches_pdf_terms_plus_balanced_nonzero_bias_penalty():
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         upper_window_seconds=1.0,
         local_steps_per_global=4,
         radio_substeps=2,
@@ -83,6 +83,7 @@ def test_reward_matches_pdf_terms_plus_balanced_nonzero_bias_penalty():
             + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
+            - info["global_contradictory_bias_penalty"]
         )
         assert info["reward_sla_improvement"] == 0.0
         assert info["global_bad_direction_penalty"] == 0.0
@@ -104,7 +105,7 @@ def test_load_improvement_is_scaled_by_starting_imbalance():
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="mixed_slices_center_overlap",
+        training_scenarios="jain_control_mixed",
         upper_window_seconds=1.0,
         local_steps_per_global=10,
         radio_substeps=2,
@@ -143,6 +144,7 @@ def test_load_improvement_is_scaled_by_starting_imbalance():
             + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
+            - info["global_contradictory_bias_penalty"]
         )
         assert info["reward_sla_improvement"] == 0.0
         assert np.isclose(reward, expected)
@@ -154,7 +156,7 @@ def test_sla_is_logged_but_cannot_change_upper_routing_reward():
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         terminal_reward_only=False,
         global_reward_beta=1000.0,
     )
@@ -171,6 +173,7 @@ def test_sla_is_logged_but_cannot_change_upper_routing_reward():
             + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
+            - info["global_contradictory_bias_penalty"]
         )
         assert env.global_reward_beta == 0.0
         assert info["reward_sla_improvement"] == 0.0
@@ -180,11 +183,81 @@ def test_sla_is_logged_but_cannot_change_upper_routing_reward():
         env.close()
 
 
+def test_paper_cost_reward_is_negative_final_load_cost():
+    env = GlobalPPO3GNBEnv(
+        seed=327,
+        scenario_mode="curriculum",
+        training_scenarios="jain_balance_controllable",
+        scenario_selection="cycle",
+        terminal_reward_only=False,
+        safe_admission_enabled=True,
+        upper_reward_mode="paper_cost",
+        global_reward_mu=6.0,
+        paper_handover_penalty_weight=1.0,
+        paper_pingpong_penalty_weight=5.0,
+        paper_excess_load_penalty_weight=3.0,
+        upper_window_seconds=1.0,
+        local_steps_per_global=10,
+        radio_substeps=10,
+    )
+    try:
+        env.reset(seed=327)
+        action = np.zeros(env.action_space.shape, dtype=np.float32)
+        _obs, reward, _terminated, _truncated, info = env.step(action)
+
+        expected = -(
+            info["paper_load_std_penalty"]
+            + info["paper_excess_load_penalty"]
+            + info["paper_handover_penalty"]
+            + info["paper_pingpong_penalty"]
+            + info["global_contradictory_bias_penalty"]
+        )
+        assert info["upper_reward_mode"] == "paper_cost"
+        assert info["paper_load_source"] == "demand_prbs"
+        assert np.isclose(reward, expected)
+        assert np.isclose(info["paper_cost_reward"], expected)
+        assert np.isclose(
+            info["paper_load_std_penalty"],
+            6.0 * info["paper_demand_load_std"],
+        )
+        assert reward <= 0.0
+        assert info["handover_count"] == 0
+    finally:
+        env.close()
+
+
+def test_same_sign_reciprocal_bias_is_contradictory():
+    env = GlobalPPO3GNBEnv(
+        seed=1,
+        scenario_mode="curriculum",
+        training_scenarios="jain_balance_controllable",
+        terminal_reward_only=False,
+        contradictory_bias_penalty_weight=2.0,
+    )
+    try:
+        env.reset(seed=1)
+        contradictory = np.zeros((3, 2, 3), dtype=np.float32)
+        contradictory[0, 0, 0] = -0.8  # g0 -> g1 eMBB
+        contradictory[1, 0, 0] = -0.4  # g1 -> g0 eMBB
+
+        aligned = np.zeros((3, 2, 3), dtype=np.float32)
+        aligned[0, 0, 0] = -0.8
+        aligned[1, 0, 0] = 0.4
+
+        assert np.isclose(
+            env._contradictory_directional_bias(contradictory),
+            0.4 ** 2,
+        )
+        assert env._contradictory_directional_bias(aligned) == 0.0
+    finally:
+        env.close()
+
+
 def test_gnb_load_target_is_raised_when_point_65_is_infeasible():
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="mixed_slices_center_overlap",
+        training_scenarios="jain_control_mixed",
         terminal_reward_only=False,
         gnb_load_target=0.65,
     )
@@ -203,7 +276,7 @@ def test_gnb_load_target_stays_point_65_when_demand_is_feasible():
     env = GlobalPPO3GNBEnv(
         seed=123,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         terminal_reward_only=False,
         gnb_load_target=0.65,
     )
@@ -222,7 +295,7 @@ def test_inactive_slice_biases_do_not_trigger_neutral_penalty():
     env = GlobalPPO3GNBEnv(
         seed=7,
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         upper_window_seconds=1.0,
         local_steps_per_global=4,
         radio_substeps=2,
@@ -246,7 +319,7 @@ def test_inactive_slice_biases_do_not_trigger_neutral_penalty():
 def test_balanced_active_slice_prefers_near_zero_bias():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
     )
     try:
         balanced_loads = np.zeros((3, 3), dtype=np.float32)
@@ -273,7 +346,7 @@ def test_balanced_active_slice_prefers_near_zero_bias():
 def test_wrong_bias_direction_penalizes_release_from_light_cells():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
     )
     try:
         loads = np.zeros((3, 3), dtype=np.float32)
@@ -296,7 +369,7 @@ def test_legacy_source_shaping_does_not_change_directional_reward():
     env = GlobalPPO3GNBEnv(
         seed=2,
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         scenario_selection="cycle",
         terminal_reward_only=False,
         global_neutral_bias_weight=100.0,
@@ -317,6 +390,7 @@ def test_legacy_source_shaping_does_not_change_directional_reward():
             + info["reward_jain_fairness"]
             - info["global_action_penalty"]
             - info["global_negative_bias_penalty"]
+            - info["global_contradictory_bias_penalty"]
         )
         assert info["reward_sla_improvement"] == 0.0
         assert np.isclose(reward, expected)
@@ -327,7 +401,7 @@ def test_legacy_source_shaping_does_not_change_directional_reward():
 def test_negative_bias_magnitude_penalty_is_persistent_and_monotonic():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
         global_action_lambda=0.01,
     )
     try:
@@ -352,7 +426,7 @@ def test_negative_bias_magnitude_penalty_is_persistent_and_monotonic():
 def test_one_step_episode_has_no_cross_episode_smoothness_penalty():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         global_action_kappa=0.01,
     )
     try:
@@ -369,7 +443,7 @@ def test_one_step_episode_has_no_cross_episode_smoothness_penalty():
 def test_negative_penalty_ignores_inactive_slice_dimensions():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="high_load_inner_asymmetric",
+        training_scenarios="jain_balance_controllable",
         global_action_lambda=0.01,
     )
     try:
@@ -395,7 +469,7 @@ def test_negative_penalty_ignores_inactive_slice_dimensions():
 def test_pdf_bias_smoothing_default_is_in_recommended_range():
     env = GlobalPPO3GNBEnv(
         scenario_mode="curriculum",
-        training_scenarios="fixed_center_embb_left_right",
+        training_scenarios="jain_balance_controllable",
     )
     try:
         assert 0.01 <= env.global_action_kappa <= 0.05
@@ -408,7 +482,7 @@ def test_served_floor_penalizes_emptying_initially_served_gnb():
         env = GlobalPPO3GNBEnv(
             seed=21,
             scenario_mode="curriculum",
-            training_scenarios="mixed_overlap_with_fixed_slice_loads",
+            training_scenarios="jain_control_mixed",
             scenario_selection="cycle",
             terminal_reward_only=False,
             safe_admission_enabled=safe_admission_enabled,
