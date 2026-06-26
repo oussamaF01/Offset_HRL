@@ -169,6 +169,9 @@ class MultiGNBWrapper(gym.Env):
         self._fading_samples = None
         self._fading_users: Dict[int, Dict[str, int]] = {}
         self._last_scheduler_mode = "mcs_pf_csv_fading"
+        self._last_gnb_prb_activity: Dict[int, float] = {
+            int(gnb.id): 0.0 for gnb in self.gnbs
+        }
 
         self.action_space = gym.spaces.Discrete(1)
         self.observation_space = gym.spaces.Box(
@@ -1907,6 +1910,7 @@ class MultiGNBWrapper(gym.Env):
 
         metrics = self._compute_link_metrics(serving, ue) if serving is not None else {
             "rx_power_dbm": -100.0,
+            "rx_power_total_dbm": -100.0,
             "rsrp_dbm": -100.0,
             "rssi_dbm": -100.0,
             "rsrq_db": -100.0,
@@ -1960,6 +1964,7 @@ class MultiGNBWrapper(gym.Env):
             "snr_db": float(metrics["snr_db"]),
             "sinr_db": float(metrics["sinr_db"]),
             "rx_power_dbm": float(metrics["rx_power_dbm"]),
+            "rx_power_total_dbm": float(metrics["rx_power_total_dbm"]),
             "rsrp_dbm": float(metrics["rsrp_dbm"]),
             "rssi_dbm": float(metrics["rssi_dbm"]),
             "rsrq_db": float(metrics["rsrq_db"]),
@@ -2167,6 +2172,7 @@ class MultiGNBWrapper(gym.Env):
 
     def _simulate_radio_and_service(self):
         attached = self._group_ues_by_serving_gnb()
+        next_gnb_prb_activity = {int(gnb.id): 0.0 for gnb in self.gnbs}
 
         for gnb_id, ue_list in attached.items():
             if gnb_id is None:
@@ -2250,6 +2256,10 @@ class MultiGNBWrapper(gym.Env):
                     received = bool(ue.prbs and self._rng.random() < rx_probability)
                     ue.transmission_step(received)
 
+                next_gnb_prb_activity[int(gnb.id)] = self._gnb_allocated_prb_activity(
+                    gnb,
+                    schedulable_ues,
+                )
                 continue
 
             schedulable_fallback = []
@@ -2320,6 +2330,20 @@ class MultiGNBWrapper(gym.Env):
                 )
 
                 ue.transmission_step(received=True)
+
+            next_gnb_prb_activity[int(gnb.id)] = self._gnb_allocated_prb_activity(
+                gnb,
+                schedulable_fallback,
+            )
+
+        self._last_gnb_prb_activity = next_gnb_prb_activity
+        self._invalidate_metric_caches()
+
+    @staticmethod
+    def _gnb_allocated_prb_activity(gnb, ues) -> float:
+        n_prbs = max(int(getattr(gnb, "n_prbs", 0)), 1)
+        allocated = sum(max(int(getattr(ue, "prbs", 0)), 0) for ue in ues)
+        return float(np.clip(allocated / float(n_prbs), 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Info
@@ -2534,6 +2558,13 @@ class MultiGNBWrapper(gym.Env):
                 return -100.0
         return -100.0
 
+    def _get_rx_power_per_prb_dbm(self, gnb, ue: UE) -> float:
+        rx_total_dbm = self._get_rx_power_dbm(gnb, ue)
+        if not np.isfinite(rx_total_dbm):
+            return -100.0
+        n_prbs = max(int(getattr(gnb, "n_prbs", 1)), 1)
+        return float(rx_total_dbm - 10.0 * np.log10(n_prbs))
+
     def _get_noise_power_dbm(self, gnb) -> float:
         if gnb is None:
             return -100.0
@@ -2569,12 +2600,14 @@ class MultiGNBWrapper(gym.Env):
         for other in self._same_carrier_interferers.get(int(serving_gnb.id), []):
             if not self._is_in_coverage(other, ue):
                 continue
+            duty_factor = self._clip01(
+                self._last_gnb_prb_activity.get(int(other.id), 0.0)
+            )
+            if duty_factor <= 0.0:
+                continue
 
-            if hasattr(other, "get_received_power_watts"):
-                p_w = float(other.get_received_power_watts(ue.x, ue.y))
-            else:
-                p_dbm = self._get_rx_power_dbm(other, ue)
-                p_w = self._dbm_to_watts(p_dbm)
+            p_dbm = self._get_rx_power_per_prb_dbm(other, ue)
+            p_w = self._dbm_to_watts(p_dbm) * duty_factor
 
             total_watts += max(p_w, 0.0)
 
@@ -2593,6 +2626,7 @@ class MultiGNBWrapper(gym.Env):
             noise_w = self._dbm_to_watts(noise_dbm)
             metrics = {
                 "rx_power_dbm": -100.0,
+                "rx_power_total_dbm": -100.0,
                 "rsrp_dbm": -100.0,
                 "rssi_dbm": float(self._watts_to_dbm(noise_w)),
                 "rsrq_db": -100.0,
@@ -2605,15 +2639,17 @@ class MultiGNBWrapper(gym.Env):
             self._link_metrics_cache[cache_key] = metrics
             return metrics
 
-        rx_dbm = self._get_rx_power_dbm(gnb, ue) - env_loss_db
+        rx_total_dbm = self._get_rx_power_dbm(gnb, ue) - env_loss_db
+        rx_dbm = self._get_rx_power_per_prb_dbm(gnb, ue) - env_loss_db
         noise_dbm = self._get_noise_power_dbm(gnb)
 
         if not np.isfinite(rx_dbm) or not np.isfinite(noise_dbm):
-            rsrp_dbm = float(rx_dbm) if np.isfinite(rx_dbm) else -100.0
+            rsrp_dbm = float(rx_total_dbm) if np.isfinite(rx_total_dbm) else -100.0
             noise_dbm = float(noise_dbm) if np.isfinite(noise_dbm) else -100.0
             noise_w = self._dbm_to_watts(noise_dbm)
             metrics = {
-                "rx_power_dbm": rsrp_dbm,
+                "rx_power_dbm": -100.0,
+                "rx_power_total_dbm": rsrp_dbm,
                 "rsrp_dbm": rsrp_dbm,
                 "rssi_dbm": float(self._watts_to_dbm(noise_w)),
                 "rsrq_db": -100.0,
@@ -2640,7 +2676,8 @@ class MultiGNBWrapper(gym.Env):
 
         metrics = {
             "rx_power_dbm": float(rx_dbm),
-            "rsrp_dbm": float(rx_dbm),
+            "rx_power_total_dbm": float(rx_total_dbm),
+            "rsrp_dbm": float(rx_total_dbm),
             "rssi_dbm": float(self._watts_to_dbm(rssi_w)),
             "rsrq_db": self._rsrq_db(sig_w, rssi_w, getattr(gnb, "n_prbs", 1)),
             "noise_dbm": float(noise_dbm),
@@ -2659,22 +2696,7 @@ class MultiGNBWrapper(gym.Env):
         if gnb is None:
             return -100.0
 
-        for method_name in ("get_ue_snr", "get_snr_db", "get_snr"):
-            if hasattr(gnb, method_name):
-                method = getattr(gnb, method_name)
-                try:
-                    value = float(method(ue.x, ue.y))
-                    return value if np.isfinite(value) else -100.0
-                except TypeError:
-                    try:
-                        value = float(method(ue))
-                        return value if np.isfinite(value) else -100.0
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-        rx = self._get_rx_power_dbm(gnb, ue)
+        rx = self._get_rx_power_per_prb_dbm(gnb, ue)
         noise = self._get_noise_power_dbm(gnb)
         return float(rx - noise)
 
