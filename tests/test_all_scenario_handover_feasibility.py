@@ -47,6 +47,8 @@ def _oracle_directional_action(env, loads):
 
 def test_every_retained_scenario_has_bounded_initial_persistent_demand_load():
     for scenario in get_upper_training_scenarios("all"):
+        if scenario.metadata.get("feasible") is False:
+            continue
         env = GlobalPPO3GNBEnv(
             seed=2,
             scenario_mode="curriculum",

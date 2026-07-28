@@ -28,11 +28,17 @@ def _directional_inputs():
     }
 
 
-def test_directional_executor_can_treat_neighbors_differently():
-    offsets = strong_directional_heuristic_local_executor(**_directional_inputs())
+def test_directional_executor_maps_directional_bias_magnitudes_directly():
+    inputs = _directional_inputs()
+    inputs["B"] = np.zeros((3, 2, 3), dtype=float)
+    inputs["B"][0, 0, 0] = -0.5916
+    inputs["B"][0, 1, 0] = -0.1943
+
+    offsets = strong_directional_heuristic_local_executor(**inputs)
 
     assert offsets.shape == (3, 2, 3)
-    assert offsets[0, 0, 0] < offsets[0, 1, 0]
+    assert offsets[0, 0, 0] == -4.0
+    assert offsets[0, 1, 0] == -1.0
     assert set(np.unique(offsets)).issubset(set(EXTENDED_1DB_OFFSET_SET_DB))
 
 
@@ -65,13 +71,46 @@ def test_directional_executor_negative_bias_is_capped_at_minus_6_db():
     assert np.min(offsets) >= -6.0
 
 
-def test_unsafe_target_vetoes_release_without_reversing_other_directions():
+def test_directional_executor_keeps_equal_policy_bias_equal():
+    inputs = _directional_inputs()
+    inputs["B"] = np.zeros((3, 2, 3), dtype=float)
+    inputs["B"][0, 0, 0] = -1.0
+    inputs["B"][0, 1, 0] = -1.0
+    inputs["load"][1, 0] = 0.20
+    inputs["load"][2, 0] = 0.20
+    inputs["rsrp_matrix"] = np.asarray([[-80.0, -79.0, -79.0]], dtype=float)
+
+    offsets = strong_directional_heuristic_local_executor(**inputs)
+
+    assert offsets[0, 0, 0] == -6.0
+    assert offsets[0, 1, 0] == -6.0
+
+
+def test_directional_executor_ignores_local_load_when_applying_policy():
+    inputs = _directional_inputs()
+    inputs["B"] = np.zeros((3, 2, 3), dtype=float)
+    inputs["B"][0, 0, 0] = -1.0
+    inputs["B"][0, 1, 0] = -1.0
+    inputs["load"][0, 0] = 0.35
+    inputs["load"][1, 0] = 0.30
+    inputs["load"][2, 0] = 0.30
+    inputs["rsrp_matrix"] = np.asarray([[-80.0, -79.0, -79.0]], dtype=float)
+
+    offsets = strong_directional_heuristic_local_executor(**inputs)
+
+    assert offsets[0, 0, 0] < 0.0
+    assert offsets[0, 1, 0] < 0.0
+    assert offsets[0, 0, 0] == -6.0
+    assert offsets[0, 1, 0] == -6.0
+
+
+def test_unsafe_target_does_not_rewrite_policy_offset():
     inputs = _directional_inputs()
     inputs["B"][0, 0] = -1.0
     inputs["load"][1, 0] = 0.90
     offsets = strong_directional_heuristic_local_executor(**inputs)
 
-    assert offsets[0, 0, 0] >= 0.0
+    assert offsets[0, 0, 0] == -6.0
     assert offsets[0, 1, 0] <= 0.0
 
 

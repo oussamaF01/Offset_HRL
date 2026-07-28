@@ -330,6 +330,16 @@ class LocalA3OffsetEnv(gym.Env):
         old_id = int(old_gnb.id)
         new_id = int(new_gnb.id)
         ue_id = int(ue.id)
+        tick = int(getattr(self.base_env, "_step_count", 0))
+
+        if hasattr(self.base_env, "_handover_stability_allows") and not self.base_env._handover_stability_allows(
+            ue, old_id, new_id, old_gnb, tick
+        ):
+            return False
+        if hasattr(self.base_env, "_safe_admission_allows") and not self.base_env._safe_admission_allows(
+            ue, old_id, new_id, slice_type
+        ):
+            return False
 
         old_gnb.detach_ue(ue_id)
         attached = new_gnb.attach_ue(ue)
@@ -353,6 +363,18 @@ class LocalA3OffsetEnv(gym.Env):
             "to_gnb": new_id,
             "controller": f"LocalA3OffsetEnv[{self.gnb_id}]",
         })
+        if hasattr(self.base_env, "_commit_safe_admission"):
+            self.base_env._commit_safe_admission(old_id, new_id, slice_type)
+        if hasattr(self.base_env, "_last_ho_source"):
+            self.base_env._last_ho_source[ue_id] = old_id
+        if hasattr(self.base_env, "_last_ho"):
+            self.base_env._last_ho[ue_id] = (new_id, tick)
+        if hasattr(self.base_env, "_ue_episode_handovers"):
+            self.base_env._ue_episode_handovers[ue_id] = (
+                self.base_env._ue_episode_handovers.get(ue_id, 0) + 1
+            )
+        if hasattr(self.base_env, "_episode_handover_count"):
+            self.base_env._episode_handover_count += 1
         self.base_env._invalidate_metric_caches()
         return True
 
@@ -559,12 +581,22 @@ class LocalA3OffsetEnv(gym.Env):
             ])
 
         # Global context: load and SLA severity for every gNB × slice.
-        # Gives each agent a network-wide view so it can coordinate with peers.
-        # Use window-average useful PRBs (demand-proportional) to match the upper agent.
+        # Always use demanded PRB loads (from the scenario demand profile) so the
+        # agent sees what is requested, not what was allocated.
         if self.load_observation_provider is not None:
             window_loads = dict(self.load_observation_provider())
         else:
-            window_loads = self.base_env.get_window_average_slice_loads()
+            window_loads = {}
+            if hasattr(self.base_env, "get_demand_prb_loads"):
+                profile = self.base_env.get_demand_prb_loads()
+                for gnb in self.base_env.gnbs:
+                    for st in self.slice_types:
+                        key = (int(gnb.id), normalize_slice_type(st))
+                        item = profile.get(key, {})
+                        if isinstance(item, dict) and "target_load" in item:
+                            window_loads[key] = float(item["target_load"])
+            if not window_loads:
+                window_loads = self.base_env.get_window_average_slice_loads()
         for gnb in self.base_env.gnbs:
             gid = int(gnb.id)
             for slice_type in self.slice_types:

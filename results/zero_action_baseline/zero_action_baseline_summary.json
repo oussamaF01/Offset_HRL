@@ -1,0 +1,79 @@
+[
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.0985281374238571,
+    "mean_target_load_error_delta": 0.0029912791790123404,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 0.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_balance_controllable_zero_action_trace.csv",
+    "scenario_name": "jain_balance_controllable"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.7488225099390855,
+    "mean_target_load_error_delta": 0.0033479611790123596,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_urllc_zero_action_trace.csv",
+    "scenario_name": "jain_control_urllc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.565685424949238,
+    "mean_target_load_error_delta": 0.0029818213827160515,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_mmtc_zero_action_trace.csv",
+    "scenario_name": "jain_control_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.9042472332656507,
+    "mean_target_load_error_delta": 0.023967202925925947,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_embb_urllc_zero_action_trace.csv",
+    "scenario_name": "jain_control_embb_urllc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.9042472332656507,
+    "mean_target_load_error_delta": 0.02791596313580247,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_embb_mmtc_zero_action_trace.csv",
+    "scenario_name": "jain_control_embb_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.8071067811865476,
+    "mean_target_load_error_delta": 0.01721587910493827,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.3,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_urllc_mmtc_zero_action_trace.csv",
+    "scenario_name": "jain_control_urllc_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.0985281374238567,
+    "mean_target_load_error_delta": 0.0063807052469135594,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 1.4,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 1.0,
+    "validation_csv": "results/zero_action_baseline/jain_control_mixed_zero_action_trace.csv",
+    "scenario_name": "jain_control_mixed"
+  }
+]

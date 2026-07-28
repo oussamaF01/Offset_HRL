@@ -1,0 +1,116 @@
+% Filled from the current /home/oussama/Desktop/chech checkout.
+% Environment sources: upper_agent_training_scenarios.py, global_ppo_3gnb_env.py,
+% scenario_creator.py, node_b.py, multi_gnb_wrapper.py, local_a3_agent_wrapper.py,
+% safe_admission_controller.py, ENV_MOBILITY_RADIO_SCHEDULING.md.
+% Package versions were read from the local project venv on 2026-07-17.
+
+\begin{table}[htbp]
+\centering
+\caption{Main simulation environment parameters.}
+\label{tab:main_simulation_environment_parameters}
+\begin{tabular}{lll}
+\toprule
+\textbf{Category} & \textbf{Parameter} & \textbf{Value} \\
+\midrule
+Topology & Number of gNodeBs & 3 \\
+Topology & gNodeB coordinates & $(-270,0)$, $(0,0)$, $(270,0)$ m \\
+Topology & Inter-site distance & 270 m center-to-neighbor, 540 m outer-to-outer \\
+Radio & Carrier frequency & 3.5 GHz \\
+Radio & Channel bandwidth & 20 MHz \\
+Radio & PRB capacity per gNodeB & 100 PRBs \\
+Radio & Transmit power & 30 dBm \\
+Radio & Antenna gain & Not explicitly modelled \\
+Radio & Path-loss model & Urban macro, $128.1+37.6\log_{10}(d_{\mathrm{km}})+20\log_{10}(f_{\mathrm{GHz}}/2)$ dB \\
+Radio & Noise figure/noise power & 7 dB; $-174+10\log_{10}(180\,\mathrm{kHz})+7 \approx -114.45$ dBm per PRB \\
+Mobility & UE speed range & Scenario-defined; default static unless a scenario sets \texttt{speed\_mps} or SUMO is enabled \\
+Traffic & eMBB traffic model & Fixed-packet CBR, 3000 bit packets, 200 kb/s default \\
+Traffic & URLLC traffic model & Fixed-packet CBR, 800 bit packets, 80 kb/s default \\
+Traffic & mMTC traffic model & Fixed-packet CBR, 400 bit packets, 20 kb/s default \\
+Scheduler & Scheduling rule & Slice-aware MCS proportional-fair scheduler with CSV fading traces \\
+Handover & A3 hysteresis & 1 dB \\
+Handover & Time-to-trigger & 3 local steps \\
+Handover & Bias range & Upper bias $[-1,1]$; lower A3 offsets quantized to $\{-6,-4,-2,0,2,4,6\}$ dB \\
+Safety & Per-step admission budget & 1 handover per local step by default \\
+Safety & Per-episode admission budget & 20 handovers per episode; 2 per UE per episode \\
+Time & Radio substep duration & 1 ms by default \\
+Time & Lower-agent decision period & 5 local steps in lower dataset utilities \\
+Time & Upper-agent decision period & 1 s, equal to 10 local steps and 1000 radio ticks \\
+Time & Episode duration & 12 s by default for upper PPO training \\
+SLA & eMBB minimum throughput & Delivery ratio threshold 0.80 \\
+SLA & URLLC maximum delay & 10 ms packet deadline; max failure ratio 0.01 \\
+SLA & mMTC service requirement & 1 s packet deadline; max failure ratio 0.01 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Policy and value-network architectures.}
+\label{tab:policy_value_network_architectures}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Network} & \textbf{Input} & \textbf{Hidden layers} & \textbf{Activation} & \textbf{Output} \\
+\midrule
+PPO actor & 48 & SB3 \texttt{MlpPolicy} default, $[64,64]$ & Tanh & 18 continuous bias values \\
+PPO critic & 48 & SB3 \texttt{MlpPolicy} default, $[64,64]$ & Tanh & Scalar value \\
+TD3 actor & 72 current lower obs; 10 in old checkpoint & $[64,64]$ in old checkpoint & ReLU & 6 current A3 offsets; 1 in old checkpoint \\
+TD3 critic 1 & State + action & $[64,64]$ in old checkpoint & ReLU & Scalar $Q$ \\
+TD3 critic 2 & State + action & $[64,64]$ in old checkpoint & ReLU & Scalar $Q$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Reinforcement learning training parameters.}
+\label{tab:rl_training_parameters}
+\begin{tabular}{lll}
+\toprule
+\textbf{Component} & \textbf{Parameter} & \textbf{Value} \\
+\midrule
+Lower TD3 & Shared policies trained & 1 saved old checkpoint found \\
+Lower TD3 & Training steps & 50,000 in old checkpoint metadata \\
+Lower TD3 & Learning rate & $1\times 10^{-3}$ in old checkpoint metadata \\
+Lower TD3 & Replay-buffer size & 100,000 \\
+Lower TD3 & Batch size & 128 \\
+Lower TD3 & Discount factor $\gamma_L$ & 0.95 \\
+Lower TD3 & Soft-update factor $\tau$ & 0.005 \\
+Lower TD3 & Exploration noise & Normal action noise, $\sigma=0.25$ \\
+Upper PPO & Training steps & 50,000 default \\
+Upper PPO & Learning rate & $1\times 10^{-4}$ \\
+Upper PPO & Rollout length & 4096 steps \\
+Upper PPO & Batch size & 256 \\
+Upper PPO & Discount factor $\gamma_H$ & 0.99 \\
+Upper PPO & GAE coefficient $\lambda$ & 0.95 \\
+Upper PPO & Clipping range & 0.20 \\
+Temporal & Episode length & 12 upper steps by default \\
+Temporal & Lower action hold & 5 local steps in lower dataset utilities \\
+Temporal & Upper command hold & 10 local steps by default; lower utilities use a 20-step bias hold \\
+Sampling & Scenario hold & Block curriculum computes scenario blocks from PPO rollout updates; default cycle mode changes by episode \\
+Evaluation & Episodes per configuration & 10 \\
+Evaluation & Random seeds & Training seed 7 by default; controlled dataset demand seed 17; controlled-scenario export seed 42 and demand seed 99 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Reproducibility checklist.}
+\label{tab:reproducibility_checklist}
+\begin{tabular}{ll}
+\toprule
+\textbf{Item} & \textbf{Value} \\
+\midrule
+Python version & 3.12.3 \\
+Stable-Baselines3 version & 2.8.0 \\
+PyTorch version & 2.12.0+cu130 \\
+SUMO version & 1.18.0 \\
+Training hardware & CUDA available in local venv; PyTorch CUDA 13.0 build \\
+Training seeds & 7 by default \\
+Evaluation seeds & Evaluation resets use seed offsets from the configured seed \\
+Evaluation frequency & After each completed PPO rollout update by default \\
+Checkpoint criterion & Best composite score: reward + QoS delivery ratio - ping-pong ratio \\
+Training duration & Not fixed in source; depends on selected total timesteps and hardware \\
+\bottomrule
+\end{tabular}
+\end{table}

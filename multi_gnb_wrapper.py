@@ -155,6 +155,7 @@ class MultiGNBWrapper(gym.Env):
         self.default_traffic_model = str(default_traffic_model)
         self.ue_traffic_profiles = self._merge_traffic_profiles(ue_traffic_profiles)
         self.slice_prb_budgets = self._normalize_slice_prb_budgets(slice_prb_budgets)
+        self._last_demand_profile = {}
         self.max_prbs_per_ue = (
             None if max_prbs_per_ue is None else max(int(max_prbs_per_ue), 1)
         )
@@ -341,6 +342,10 @@ class MultiGNBWrapper(gym.Env):
                 return configured_budget
 
         return int(max(getattr(gnb, "n_prbs", 0), 0))
+
+    def get_demand_prb_loads(self) -> Dict[Tuple[int, str], Dict[str, float]]:
+        """Return the last fixed offered-demand profile by (gNB, slice)."""
+        return dict(getattr(self, "_last_demand_profile", {}) or {})
 
     def get_slice_used_prbs(self, gnb_id: int, slice_type: str) -> int:
         gnb_id = int(gnb_id)
@@ -1824,6 +1829,9 @@ class MultiGNBWrapper(gym.Env):
             base.update(dict(profile or {}))
             merged[str(slice_type)] = base
         return merged
+
+    def set_ue_traffic_profiles(self, profiles: Optional[Dict]) -> None:
+        self.ue_traffic_profiles = self._merge_traffic_profiles(profiles)
 
     def _traffic_profile_for_slice(self, slice_type: str) -> Dict:
         profile = dict(self.ue_traffic_profiles.get(str(slice_type), {}))

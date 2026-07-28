@@ -1,0 +1,90 @@
+[
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.0476155470122936,
+    "mean_target_load_error_delta": 0.03717422716666666,
+    "mean_handover_count_per_step": 3.0,
+    "mean_sla_count": 1.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.14285714285714285,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_balance_controllable_trained_policy_trace.csv",
+    "scenario_name": "jain_balance_controllable"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.864915054779026,
+    "mean_target_load_error_delta": 0.08806440147530865,
+    "mean_handover_count_per_step": 6.0,
+    "mean_sla_count": 1.2,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.1357142857142857,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_urllc_trained_policy_trace.csv",
+    "scenario_name": "jain_control_urllc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.7451793495689017,
+    "mean_target_load_error_delta": -0.07530342224691358,
+    "mean_handover_count_per_step": 3.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 0.0,
+    "mean_light_nonnegative_fraction": 0.0,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_mmtc_trained_policy_trace.csv",
+    "scenario_name": "jain_control_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.7959307935412425,
+    "mean_target_load_error_delta": 0.2031105118888889,
+    "mean_handover_count_per_step": 9.0,
+    "mean_sla_count": 5.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.17,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_embb_urllc_trained_policy_trace.csv",
+    "scenario_name": "jain_control_embb_urllc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.7472036819905326,
+    "mean_target_load_error_delta": 0.18952280194444443,
+    "mean_handover_count_per_step": 6.0,
+    "mean_sla_count": 2.6,
+    "mean_overloaded_negative_fraction": 0.5,
+    "mean_light_nonnegative_fraction": 0.0,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_embb_mmtc_trained_policy_trace.csv",
+    "scenario_name": "jain_control_embb_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -0.6485641715701436,
+    "mean_target_load_error_delta": 0.18110260722222224,
+    "mean_handover_count_per_step": 8.0,
+    "mean_sla_count": 3.5,
+    "mean_overloaded_negative_fraction": 0.8666666666666666,
+    "mean_light_nonnegative_fraction": 0.0,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_urllc_mmtc_trained_policy_trace.csv",
+    "scenario_name": "jain_control_urllc_mmtc"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.0915030112227968,
+    "mean_target_load_error_delta": 0.02855645617283953,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.14285714285714285,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_outer_congested_trained_policy_trace.csv",
+    "scenario_name": "jain_control_outer_congested"
+  },
+  {
+    "n_eval_episodes": 10,
+    "mean_eval_return": 0.0010580965421572164,
+    "mean_target_load_error_delta": 0.20970630672222218,
+    "mean_handover_count_per_step": 11.0,
+    "mean_sla_count": 6.1,
+    "mean_overloaded_negative_fraction": 0.9,
+    "mean_light_nonnegative_fraction": 0.0,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval_training_reward/jain_control_mixed_trained_policy_trace.csv",
+    "scenario_name": "jain_control_mixed"
+  }
+]

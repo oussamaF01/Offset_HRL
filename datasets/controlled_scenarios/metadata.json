@@ -1,0 +1,337 @@
+{
+  "case_types": [
+    "g0_embb_overload",
+    "g0_urllc_overload",
+    "g0_mmtc_overload",
+    "g1_embb_overload",
+    "g1_urllc_overload",
+    "g1_mmtc_overload",
+    "g2_embb_overload",
+    "g2_urllc_overload",
+    "g2_mmtc_overload",
+    "g0_total_overload",
+    "g1_total_overload",
+    "g2_total_overload",
+    "g0_no_target",
+    "g1_no_target",
+    "g2_no_target",
+    "balanced"
+  ],
+  "per_case": {
+    "g0_embb_overload": {
+      "case_type": "g0_embb_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g0_urllc_overload": {
+      "case_type": "g0_urllc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g0_mmtc_overload": {
+      "case_type": "g0_mmtc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g1_embb_overload": {
+      "case_type": "g1_embb_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g1_urllc_overload": {
+      "case_type": "g1_urllc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g1_mmtc_overload": {
+      "case_type": "g1_mmtc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g2_embb_overload": {
+      "case_type": "g2_embb_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g2_urllc_overload": {
+      "case_type": "g2_urllc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g2_mmtc_overload": {
+      "case_type": "g2_mmtc_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g0_total_overload": {
+      "case_type": "g0_total_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g1_total_overload": {
+      "case_type": "g1_total_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g2_total_overload": {
+      "case_type": "g2_total_overload",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g0_no_target": {
+      "case_type": "g0_no_target",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g1_no_target": {
+      "case_type": "g1_no_target",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "g2_no_target": {
+      "case_type": "g2_no_target",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    },
+    "balanced": {
+      "case_type": "balanced",
+      "n_samples": 7200,
+      "scenarios_per_case": 20,
+      "episodes_per_scenario": 3,
+      "episode_steps": 40,
+      "gnb_ids": [
+        0,
+        1,
+        2
+      ],
+      "obs_dim": 72,
+      "action_dim": 6,
+      "load_signal": "demanded PRB (upper_demand_prbs or _last_demand_profile.target_load)",
+      "action_units": "dB A3 offsets \u2014 lower heuristic for all 3 gNBs",
+      "upper_heuristic": "compute_upper_expert_directional_bias",
+      "lower_heuristic": "strong_directional_heuristic_local_executor",
+      "admission_control": "begin_safe_admission_window per step"
+    }
+  },
+  "seed": 42,
+  "demand_seed": 99,
+  "scenarios_per_case": 20,
+  "episodes_per_scenario": 3,
+  "episode_steps": 40,
+  "min_demand_load": 0.05,
+  "max_demand_load": 0.95,
+  "safe_total_gnb_load": 0.65,
+  "min_total_gnb_load": 0.25,
+  "placement_jitter_m": 18.0,
+  "randomize_traffic_profiles": true
+}

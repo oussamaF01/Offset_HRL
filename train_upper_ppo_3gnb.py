@@ -16,7 +16,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
 
 from global_ppo_3gnb_env import GlobalPPO3GNBEnv, SLICE_TYPES
@@ -114,6 +114,19 @@ QOS_MATRIX_KEYS = [
     "queue_kbits_matrix",
     "drop_ratio_matrix",
     "packet_failure_ratio_matrix",
+    "sinr_db_matrix",
+    "rsrq_db_matrix",
+]
+
+QOS_MATRIX_FIELDS = [
+    f"qos_{key.removesuffix('_matrix')}_g{gnb_id}_{slice_type}"
+    for key in QOS_MATRIX_KEYS
+    for gnb_id in GNB_IDS
+    for slice_type in SLICE_TYPES
+] + [
+    f"qos_slice_{key.removesuffix('_matrix')}_{slice_type}"
+    for key in QOS_MATRIX_KEYS
+    for slice_type in SLICE_TYPES
 ]
 
 TRAINING_FIELDS = [
@@ -161,10 +174,22 @@ TRAINING_FIELDS = [
     "global_negative_bias_penalty",
     "global_contradictory_bias_penalty",
     "global_contradictory_bias_raw",
+    "idle_slice_bias_penalty",
+    "idle_slice_bias_raw",
+    "global_sinr_penalty",
+    "global_sinr_deficit_raw",
     "reward_used_prb_balance_improvement",
     "reward_used_prb_balance_improvement_raw",
     "upper_reward_mode",
     "paper_cost_reward",
+    "expert_bias_reward",
+    "expert_bias_mse",
+    "expert_bias_closeness",
+    "expert_bias_found",
+    "expert_bias_active_entries",
+    "expert_bias_active_fraction",
+    "expert_bias_reward_weight",
+    "expert_bias_closeness_threshold",
     "paper_load_source",
     "paper_load_std_penalty",
     "paper_demand_load_std",
@@ -248,6 +273,7 @@ TRAINING_FIELDS = [
     "safe_admission_source_accepted",
     "safe_admission_stats",
     *QOS_SCALAR_FIELDS,
+    *QOS_MATRIX_FIELDS,
     *SERVED_FLOOR_REFERENCE_FIELDS,
 ] + DIRECTIONAL_BIAS_FIELDS + MATRIX_FIELDS
 
@@ -322,6 +348,19 @@ def _add_qos_fields(row: Dict[str, Any], info: Dict[str, Any]) -> None:
     qos = dict(info.get("qos", {}))
     for field in QOS_SCALAR_FIELDS:
         row[field] = float(qos.get(field, 0.0))
+    for key in QOS_MATRIX_KEYS:
+        prefix = f"qos_{key.removesuffix('_matrix')}"
+        matrix = _matrix_or_nan(qos.get(key, []))
+        for g_idx, gnb_id in enumerate(GNB_IDS):
+            for s_idx, slice_type in enumerate(SLICE_TYPES):
+                row[f"{prefix}_g{gnb_id}_{slice_type}"] = float(matrix[g_idx, s_idx])
+        for s_idx, slice_type in enumerate(SLICE_TYPES):
+            column = matrix[:, s_idx]
+            if key in {"delivery_ratio_matrix", "drop_ratio_matrix", "packet_failure_ratio_matrix", "sinr_db_matrix", "rsrq_db_matrix"}:
+                value = float(np.nanmean(column))
+            else:
+                value = float(np.nansum(column))
+            row[f"qos_slice_{key.removesuffix('_matrix')}_{slice_type}"] = value
 
 
 def _matrix_sum(value) -> float:
@@ -359,13 +398,11 @@ class UpperTrainingCsvCallback(BaseCallback):
     def __init__(
         self,
         log_path: Path,
-        best_path: Path | None = None,
         log_every: int = 1,
         flush_every: int = 100,
     ):
         super().__init__()
         self.log_path = Path(log_path)
-        self.best_path = Path(best_path) if best_path is not None else None
         self.log_every = max(int(log_every), 1)
         self.flush_every = max(int(flush_every), 1)
         self.file = None
@@ -374,7 +411,6 @@ class UpperTrainingCsvCallback(BaseCallback):
         self.episode = 0
         self.episode_step = 0
         self.episode_return = 0.0
-        self.best_episode_return = -np.inf
 
     def _on_training_start(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -505,6 +541,18 @@ class UpperTrainingCsvCallback(BaseCallback):
             "global_contradictory_bias_raw": float(
                 info.get("global_contradictory_bias_raw", 0.0)
             ),
+            "idle_slice_bias_penalty": float(
+                info.get("idle_slice_bias_penalty", 0.0)
+            ),
+            "idle_slice_bias_raw": float(
+                info.get("idle_slice_bias_raw", 0.0)
+            ),
+            "global_sinr_penalty": float(
+                info.get("global_sinr_penalty", 0.0)
+            ),
+            "global_sinr_deficit_raw": float(
+                info.get("global_sinr_deficit_raw", 0.0)
+            ),
             "reward_used_prb_balance_improvement": float(
                 info.get("reward_used_prb_balance_improvement", 0.0)
             ),
@@ -513,6 +561,22 @@ class UpperTrainingCsvCallback(BaseCallback):
             ),
             "upper_reward_mode": str(info.get("upper_reward_mode", "paper_cost")),
             "paper_cost_reward": float(info.get("paper_cost_reward", 0.0)),
+            "expert_bias_reward": float(info.get("expert_bias_reward", 0.0)),
+            "expert_bias_mse": float(info.get("expert_bias_mse", 0.0)),
+            "expert_bias_closeness": float(info.get("expert_bias_closeness", 0.0)),
+            "expert_bias_found": bool(info.get("expert_bias_found", False)),
+            "expert_bias_active_entries": int(
+                info.get("expert_bias_active_entries", 0)
+            ),
+            "expert_bias_active_fraction": float(
+                info.get("expert_bias_active_fraction", 0.0)
+            ),
+            "expert_bias_reward_weight": float(
+                info.get("expert_bias_reward_weight", 0.0)
+            ),
+            "expert_bias_closeness_threshold": float(
+                info.get("expert_bias_closeness_threshold", 0.0)
+            ),
             "paper_load_source": str(info.get("paper_load_source", "")),
             "paper_load_std_penalty": float(
                 info.get("paper_load_std_penalty", 0.0)
@@ -772,9 +836,6 @@ class UpperTrainingCsvCallback(BaseCallback):
             self.rows_since_flush = 0
 
         if done:
-            if self.best_path is not None and self.episode_return > self.best_episode_return:
-                self.best_episode_return = float(self.episode_return)
-                self.model.save(self.best_path)
             self.episode += 1
             self.episode_step = 0
             self.episode_return = 0.0
@@ -787,14 +848,97 @@ class UpperTrainingCsvCallback(BaseCallback):
             self.file = None
 
 
-def resolve_upper_training_curriculum_args(args):
-    """Keep upper PPO training on one coherent scenario unless requested.
+def _composite_eval_score(
+    summary: Dict[str, Any],
+    qos_weight: float,
+    stability_weight: float,
+) -> float:
+    """reward + QoS (delivery ratio) - handover instability (pingpong ratio)."""
+    reward_term = float(summary.get("mean_eval_return", 0.0))
+    qos_term = float(summary.get("mean_network_delivery_ratio", 0.0))
+    stability_term = float(summary.get("mean_pingpong_ratio", 0.0))
+    return reward_term + qos_weight * qos_term - stability_weight * stability_term
 
-    The upper observation includes previous directional bias and the reward has
-    an action-smoothness penalty versus that previous bias. Mixing unrelated
-    scenarios by default makes the rollout distribution noisy before the policy
-    has learned one stable control problem, so the default is a single retained
-    scenario. Use --curriculum-training to intentionally train over a pool.
+
+class UpperPolicyEvalCallback(BaseCallback):
+    """Deterministic evaluation aligned with PPO policy updates.
+
+    SB3 trains PPO only after a full rollout of ``n_steps`` environment steps.
+    This callback evaluates on the first collected step after a completed
+    rollout/update, so one-step scenarios do not trigger early stopping before
+    the policy has actually been updated.
+    """
+
+    def __init__(
+        self,
+        eval_env: Monitor,
+        best_path: Path,
+        eval_interval_updates: int = 1,
+        n_eval_episodes: int = 10,
+        patience: int = 10,
+        qos_weight: float = 1.0,
+        stability_weight: float = 1.0,
+    ):
+        super().__init__()
+        self.eval_env = eval_env
+        self.best_path = Path(best_path)
+        self.eval_interval_updates = max(int(eval_interval_updates), 1)
+        self.n_eval_episodes = max(int(n_eval_episodes), 1)
+        self.patience = max(int(patience), 0)
+        self.qos_weight = float(qos_weight)
+        self.stability_weight = float(stability_weight)
+        self.last_evaluated_update = 0
+        self.evals_since_best = 0
+        self.best_score = -np.inf
+        self.best_summary: Dict[str, Any] | None = None
+        self._stop_training_early = False
+
+    def _on_step(self) -> bool:
+        ppo_n_steps = max(int(getattr(self.model, "n_steps", 1)), 1)
+        completed_updates = max((int(self.num_timesteps) - 1) // ppo_n_steps, 0)
+        if (
+            completed_updates > self.last_evaluated_update
+            and completed_updates % self.eval_interval_updates == 0
+        ):
+            self.last_evaluated_update = completed_updates
+            self._run_evaluation(completed_updates)
+        return not self._stop_training_early
+
+    def _run_evaluation(self, ppo_update_index: int) -> None:
+        summary = evaluate_upper_policy(
+            self.model, self.eval_env, n_eval_episodes=self.n_eval_episodes
+        )
+        score = _composite_eval_score(summary, self.qos_weight, self.stability_weight)
+        print(
+            f"[eval] ppo_update={ppo_update_index} timestep={self.num_timesteps} "
+            f"score={score:.4f} "
+            f"(reward={summary.get('mean_eval_return', 0.0):.4f} "
+            f"delivery_ratio={summary.get('mean_network_delivery_ratio', 0.0):.4f} "
+            f"pingpong_ratio={summary.get('mean_pingpong_ratio', 0.0):.4f})"
+        )
+        if score > self.best_score:
+            self.best_score = score
+            self.best_summary = summary
+            self.evals_since_best = 0
+            self.model.save(self.best_path)
+        else:
+            self.evals_since_best += 1
+            if self.patience > 0 and self.evals_since_best >= self.patience:
+                print(
+                    f"[early-stop] composite eval score has not improved for "
+                    f"{self.evals_since_best} evaluations "
+                    f"(best={self.best_score:.4f}); stopping at timestep "
+                    f"{self.num_timesteps}."
+                )
+                self._stop_training_early = True
+
+
+def resolve_upper_training_curriculum_args(args):
+    """Resolve the upper PPO scenario pool.
+
+    The current default trains over the controlled scenario catalog used by the
+    heuristic CSV. Use --no-curriculum-training for an explicit single-scenario
+    run.
     """
     if bool(getattr(args, "controllable_type1_training", False)):
         type1_steps = max(int(getattr(args, "type1_phase_timesteps", 15_000)), 1)
@@ -812,13 +956,29 @@ def resolve_upper_training_curriculum_args(args):
         args.total_timesteps = (3 * type1_steps) + mixed_steps
         return args
 
-    if bool(getattr(args, "block_curriculum_training", False)):
-        default_pool = (
+    if bool(getattr(args, "controlled_slice_curriculum", False)):
+        single_steps = max(int(getattr(args, "single_slice_phase_timesteps", 5_000)), 1)
+        two_steps = max(int(getattr(args, "two_slice_phase_timesteps", 10_000)), 1)
+        mixed_steps = max(int(getattr(args, "mixed_phase_timesteps", 20_000)), 1)
+        args.training_scenarios = (
             "jain_balance_controllable,"
             "jain_control_urllc,"
             "jain_control_mmtc,"
+            "jain_control_embb_urllc,"
+            "jain_control_embb_mmtc,"
+            "jain_control_urllc_mmtc,"
             "jain_control_mixed"
         )
+        args.curriculum_training = True
+        args.block_curriculum_training = False
+        args.scenario_selection = "controlled_slice_curriculum"
+        args.curriculum_block_episodes = single_steps
+        args.fixed_stage_episodes = two_steps
+        args.total_timesteps = (3 * single_steps) + (3 * two_steps) + mixed_steps
+        return args
+
+    if bool(getattr(args, "block_curriculum_training", False)):
+        default_pool = "all"
         if str(getattr(args, "training_scenarios", "")).strip() == str(
             getattr(args, "single_training_scenario", "")
         ).strip():
@@ -830,12 +990,7 @@ def resolve_upper_training_curriculum_args(args):
 
     if bool(getattr(args, "curriculum_training", False)):
         if not str(getattr(args, "training_scenarios", "")).strip():
-            args.training_scenarios = (
-                "jain_balance_controllable,"
-                "jain_control_urllc,"
-                "jain_control_mmtc,"
-                "jain_control_mixed"
-            )
+            args.training_scenarios = "all"
         return args
 
     args.training_scenarios = str(
@@ -913,16 +1068,26 @@ def make_env(args) -> Monitor:
         jain_fairness_weight=getattr(args, "jain_fairness_weight", 1.0),
         upper_reward_mode=getattr(args, "upper_reward_mode", "paper_cost"),
         paper_handover_penalty_weight=getattr(
-            args, "paper_handover_penalty_weight", 1.0
+            args, "paper_handover_penalty_weight", 0.0
         ),
         paper_pingpong_penalty_weight=getattr(
-            args, "paper_pingpong_penalty_weight", 5.0
+            args, "paper_pingpong_penalty_weight", 0.0
         ),
         paper_excess_load_penalty_weight=getattr(
             args, "paper_excess_load_penalty_weight", 3.0
         ),
         contradictory_bias_penalty_weight=getattr(
             args, "contradictory_bias_penalty_weight", 1.0
+        ),
+        idle_slice_bias_penalty_weight=getattr(
+            args, "idle_slice_bias_penalty_weight", 1.0
+        ),
+        sinr_penalty_weight=getattr(args, "sinr_penalty_weight", 0.4),
+        sinr_floor_db=getattr(args, "sinr_floor_db", 5.0),
+        expert_bias_csv=getattr(args, "expert_bias_csv", None),
+        expert_bias_reward_weight=getattr(args, "expert_bias_reward_weight", 0.5),
+        expert_bias_closeness_threshold=getattr(
+            args, "expert_bias_closeness_threshold", 0.95
         ),
         sla_deadband=args.sla_deadband,
         upper_window_seconds=args.upper_window_seconds,
@@ -969,6 +1134,8 @@ def evaluate_upper_policy(
     sla_counts = []
     overloaded_negative_scores = []
     light_nonnegative_scores = []
+    network_delivery_ratios = []
+    pingpong_ratios = []
 
     for episode in range(int(n_eval_episodes)):
         obs, info = env.reset()
@@ -999,6 +1166,10 @@ def evaluate_upper_policy(
             )
             handovers.append(int(info.get("handover_count", 0)))
             sla_counts.append(float(info.get("sla_count", 0.0)))
+            network_delivery_ratios.append(
+                float(info.get("qos", {}).get("network_delivery_ratio", 0.0))
+            )
+            pingpong_ratios.append(float(info.get("paper_pingpong_ratio", 0.0)))
             directional_bias = np.asarray(
                 info.get("directional_bias_tensor", []), dtype=float
             )
@@ -1075,6 +1246,18 @@ def evaluate_upper_policy(
                 "global_contradictory_bias_raw": float(
                     info.get("global_contradictory_bias_raw", 0.0)
                 ),
+                "idle_slice_bias_penalty": float(
+                    info.get("idle_slice_bias_penalty", 0.0)
+                ),
+                "idle_slice_bias_raw": float(
+                    info.get("idle_slice_bias_raw", 0.0)
+                ),
+                "global_sinr_penalty": float(
+                    info.get("global_sinr_penalty", 0.0)
+                ),
+                "global_sinr_deficit_raw": float(
+                    info.get("global_sinr_deficit_raw", 0.0)
+                ),
                 "reward_used_prb_balance_improvement": float(
                     info.get("reward_used_prb_balance_improvement", 0.0)
                 ),
@@ -1083,6 +1266,22 @@ def evaluate_upper_policy(
                 ),
                 "upper_reward_mode": str(info.get("upper_reward_mode", "paper_cost")),
                 "paper_cost_reward": float(info.get("paper_cost_reward", 0.0)),
+                "expert_bias_reward": float(info.get("expert_bias_reward", 0.0)),
+                "expert_bias_mse": float(info.get("expert_bias_mse", 0.0)),
+                "expert_bias_closeness": float(info.get("expert_bias_closeness", 0.0)),
+                "expert_bias_found": bool(info.get("expert_bias_found", False)),
+                "expert_bias_active_entries": int(
+                    info.get("expert_bias_active_entries", 0)
+                ),
+                "expert_bias_active_fraction": float(
+                    info.get("expert_bias_active_fraction", 0.0)
+                ),
+                "expert_bias_reward_weight": float(
+                    info.get("expert_bias_reward_weight", 0.0)
+                ),
+                "expert_bias_closeness_threshold": float(
+                    info.get("expert_bias_closeness_threshold", 0.0)
+                ),
                 "paper_load_source": str(info.get("paper_load_source", "")),
                 "paper_load_std_penalty": float(
                     info.get("paper_load_std_penalty", 0.0)
@@ -1334,6 +1533,10 @@ def evaluate_upper_policy(
         "mean_light_nonnegative_fraction": (
             float(np.mean(light_nonnegative_scores)) if light_nonnegative_scores else 0.0
         ),
+        "mean_network_delivery_ratio": (
+            float(np.mean(network_delivery_ratios)) if network_delivery_ratios else 0.0
+        ),
+        "mean_pingpong_ratio": float(np.mean(pingpong_ratios)) if pingpong_ratios else 0.0,
         "validation_csv": None if validation_csv is None else str(validation_csv),
     }
 
@@ -1495,11 +1698,10 @@ def main():
     parser.add_argument(
         "--training-scenarios",
         type=str,
-        default="jain_balance_controllable",
+        default="all",
         help=(
-            "Comma-separated slice-aware scenario names, or 'all'. In default "
-            "single-scenario mode this is overwritten by --single-training-scenario. "
-            "Use --curriculum-training when you intentionally want a scenario pool."
+            "Comma-separated slice-aware scenario names, or 'all'. Default is "
+            "all controlled scenarios from upper_agent_training_scenarios.py."
         ),
     )
     parser.add_argument(
@@ -1514,10 +1716,11 @@ def main():
     )
     parser.add_argument(
         "--curriculum-training",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Train over the comma-separated --training-scenarios pool. Leave off "
-            "for the default fixed single-scenario training."
+            "Train over the comma-separated --training-scenarios pool. Enabled "
+            "by default; use --no-curriculum-training for one scenario."
         ),
     )
     parser.add_argument(
@@ -1536,6 +1739,27 @@ def main():
             "for --type1-phase-timesteps each, then jain_control_mixed for "
             "--mixed-phase-timesteps."
         ),
+    )
+    parser.add_argument(
+        "--controlled-slice-curriculum",
+        action="store_true",
+        help=(
+            "Train 1-slice scenarios, then 2-slice scenarios, then mixed. "
+            "Uses --single-slice-phase-timesteps, --two-slice-phase-timesteps, "
+            "and --mixed-phase-timesteps."
+        ),
+    )
+    parser.add_argument(
+        "--single-slice-phase-timesteps",
+        type=int,
+        default=5_000,
+        help="Timesteps for each one-slice controlled scenario.",
+    )
+    parser.add_argument(
+        "--two-slice-phase-timesteps",
+        type=int,
+        default=10_000,
+        help="Timesteps for each two-slice controlled scenario.",
     )
     parser.add_argument(
         "--type1-phase-timesteps",
@@ -1584,6 +1808,7 @@ def main():
             "staged",
             "block",
             "controllable_type1_then_mixed",
+            "controlled_slice_curriculum",
         ),
         default="cycle",
         help=(
@@ -1731,13 +1956,13 @@ def main():
     parser.add_argument(
         "--paper-handover-penalty-weight",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Alpha handover penalty for --upper-reward-mode paper_cost.",
     )
     parser.add_argument(
         "--paper-pingpong-penalty-weight",
         type=float,
-        default=5.0,
+        default=0.0,
         help="Beta ping-pong penalty for --upper-reward-mode paper_cost.",
     )
     parser.add_argument(
@@ -1752,10 +1977,66 @@ def main():
     parser.add_argument(
         "--contradictory-bias-penalty-weight",
         type=float,
-        default=1.0,
+        default=0.05,
         help=(
             "Penalty weight for same-sign reciprocal source-target biases for "
             "the same gNB pair and slice."
+        ),
+    )
+    parser.add_argument(
+        "--idle-slice-bias-penalty-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Penalty weight for nonzero bias on slices carrying no demand "
+            "anywhere in the network (idle-slice exploration noise)."
+        ),
+    )
+    parser.add_argument(
+        "--sinr-penalty-weight",
+        type=float,
+        default=0.4,
+        help=(
+            "Penalty weight for ending a window with active UEs below "
+            "--sinr-floor-db on their serving link, regardless of PRB "
+            "load-balance quality. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--sinr-floor-db",
+        type=float,
+        default=5.0,
+        help=(
+            "Minimum acceptable mean serving SINR (dB) per active gNB/slice "
+            "cell used by --sinr-penalty-weight."
+        ),
+    )
+    parser.add_argument(
+        "--expert-bias-csv",
+        type=Path,
+        default=Path("results/upper_heuristic_3gnb_baseline/upper_heuristic_3gnb_scenario_summary.csv"),
+        help=(
+            "CSV containing first_upper_bias_* expert columns used as a small "
+            "upper-agent guidance reward."
+        ),
+    )
+    parser.add_argument(
+        "--expert-bias-reward-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Maximum per-window bonus for matching the expert upper bias from "
+            "the CSV. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--expert-bias-closeness-threshold",
+        type=float,
+        default=0.95,
+        help=(
+            "Minimum closeness required before the expert-bias bonus becomes "
+            "positive. This prevents bad biases from receiving a positive "
+            "guidance reward."
         ),
     )
     parser.add_argument(
@@ -1871,6 +2152,64 @@ def main():
     parser.add_argument("--ppo-n-steps", type=int, default=4096)
     parser.add_argument("--ppo-batch-size", type=int, default=256)
     parser.add_argument("--ppo-n-epochs", type=int, default=5)
+    parser.add_argument(
+        "--log-std-init",
+        type=float,
+        default=-1.0,
+        help=(
+            "Initial log std for the Gaussian policy (actions are clipped to "
+            "[-1,1]). SB3's default of 0.0 (std=1.0) is very wide relative to "
+            "that range and causes heavy boundary clipping early in training; "
+            "-1.0 (std~0.37) starts noticeably tighter."
+        ),
+    )
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=0.0,
+        help="PPO entropy bonus coefficient (0 = no explicit exploration bonus).",
+    )
+    parser.add_argument(
+        "--eval-interval-updates",
+        type=int,
+        default=1,
+        help=(
+            "Run deterministic evaluation after this many completed PPO "
+            "rollout updates. With --ppo-n-steps 512, the first evaluation "
+            "happens after the first policy update, not before it."
+        ),
+    )
+    parser.add_argument(
+        "--eval-interval-episodes",
+        type=int,
+        default=None,
+        help=(
+            "Deprecated compatibility option. Evaluation is now aligned to "
+            "PPO updates via --eval-interval-updates."
+        ),
+    )
+    parser.add_argument(
+        "--eval-patience",
+        type=int,
+        default=10,
+        help=(
+            "Stop training if the composite evaluation score (reward + QoS "
+            "delivery ratio - handover pingpong ratio) hasn't improved for "
+            "this many consecutive evaluations. 0 disables early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--eval-qos-weight",
+        type=float,
+        default=1.0,
+        help="Weight of mean network delivery ratio in the composite eval score.",
+    )
+    parser.add_argument(
+        "--eval-stability-weight",
+        type=float,
+        default=1.0,
+        help="Weight of mean handover pingpong ratio (penalty) in the composite eval score.",
+    )
     parser.add_argument(
         "--dense-window-reward",
         action=argparse.BooleanOptionalAction,
@@ -2001,12 +2340,16 @@ def main():
         "curriculum_training": bool(args.curriculum_training),
         "block_curriculum_training": bool(args.block_curriculum_training),
         "controllable_type1_training": bool(args.controllable_type1_training),
+        "controlled_slice_curriculum": bool(args.controlled_slice_curriculum),
+        "single_slice_phase_timesteps": int(args.single_slice_phase_timesteps),
+        "two_slice_phase_timesteps": int(args.two_slice_phase_timesteps),
         "type1_phase_timesteps": int(args.type1_phase_timesteps),
         "mixed_phase_timesteps": int(args.mixed_phase_timesteps),
         "curriculum_block_episodes": int(args.curriculum_block_episodes),
         "ppo_updates_per_scenario": int(args.ppo_updates_per_scenario),
         "upper_training_regime": (
             "controllable_type1_then_mixed" if bool(args.controllable_type1_training)
+            else "controlled_slice_curriculum" if bool(args.controlled_slice_curriculum)
             else "block_curriculum" if bool(args.block_curriculum_training)
             else "curriculum_pool" if bool(args.curriculum_training)
             else "single_coherent_scenario"
@@ -2031,6 +2374,16 @@ def main():
         ),
         "contradictory_bias_penalty_weight": float(
             args.contradictory_bias_penalty_weight
+        ),
+        "idle_slice_bias_penalty_weight": float(
+            args.idle_slice_bias_penalty_weight
+        ),
+        "sinr_penalty_weight": float(args.sinr_penalty_weight),
+        "sinr_floor_db": float(args.sinr_floor_db),
+        "expert_bias_csv": str(args.expert_bias_csv),
+        "expert_bias_reward_weight": float(args.expert_bias_reward_weight),
+        "expert_bias_closeness_threshold": float(
+            args.expert_bias_closeness_threshold
         ),
         "saturation_reward_weight": float(args.saturation_reward_weight),
         "gnb_load_target": float(args.gnb_load_target),
@@ -2071,6 +2424,15 @@ def main():
         "ppo_n_steps": int(args.ppo_n_steps),
         "ppo_batch_size": int(args.ppo_batch_size),
         "ppo_n_epochs": int(args.ppo_n_epochs),
+        "log_std_init": float(args.log_std_init),
+        "ent_coef": float(args.ent_coef),
+        "eval_interval_updates": int(args.eval_interval_updates),
+        "eval_interval_episodes": (
+            None if args.eval_interval_episodes is None
+            else int(args.eval_interval_episodes)
+        ),
+        "eval_patience": int(args.eval_patience),
+        "eval_episodes": int(args.eval_episodes),
     }
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -2091,18 +2453,36 @@ def main():
             n_steps=int(args.ppo_n_steps),
             batch_size=int(args.ppo_batch_size),
             n_epochs=int(args.ppo_n_epochs),
+            ent_coef=float(args.ent_coef),
+            policy_kwargs=dict(log_std_init=float(args.log_std_init)),
             verbose=1,
             tensorboard_log=tensorboard_log,
             device=args.device,
             seed=args.seed,
         )
-        callback = UpperTrainingCsvCallback(
+        csv_callback = UpperTrainingCsvCallback(
             training_csv,
-            best_model_path,
             log_every=args.log_every,
             flush_every=args.log_flush_every,
         )
-        model.learn(total_timesteps=int(args.total_timesteps), callback=callback, progress_bar=False)
+        eval_env = make_env(args)
+        eval_callback = UpperPolicyEvalCallback(
+            eval_env,
+            best_model_path,
+            eval_interval_updates=args.eval_interval_updates,
+            n_eval_episodes=args.eval_episodes,
+            patience=args.eval_patience,
+            qos_weight=args.eval_qos_weight,
+            stability_weight=args.eval_stability_weight,
+        )
+        try:
+            model.learn(
+                total_timesteps=int(args.total_timesteps),
+                callback=CallbackList([csv_callback, eval_callback]),
+                progress_bar=False,
+            )
+        finally:
+            eval_env.close()
         model.save(final_model_path)
     finally:
         env.close()
@@ -2112,10 +2492,18 @@ def main():
         learning_curve_path,
     )
 
+    # Final model selection: prefer the best composite-scored checkpoint
+    # (reward + QoS + handover stability) over the raw end-of-training
+    # weights, since training can drift past its peak (see eval_callback).
+    final_selected_model = best_model_path if best_model_path.exists() else final_model_path
+    validation_model = model
+    if best_model_path.exists():
+        validation_model = PPO.load(best_model_path, device=args.device)
+
     eval_env = make_env(args)
     try:
         validation = evaluate_upper_policy(
-            model,
+            validation_model,
             eval_env,
             n_eval_episodes=args.eval_episodes,
             validation_csv=validation_csv,
@@ -2127,6 +2515,11 @@ def main():
         **config,
         "saved_final_model": str(final_model_path),
         "saved_best_model": str(best_model_path) if best_model_path.exists() else None,
+        "final_selected_model": str(final_selected_model),
+        "best_eval_score": (
+            eval_callback.best_score if eval_callback.best_score > -np.inf else None
+        ),
+        "best_eval_summary": eval_callback.best_summary,
         "training_csv": str(training_csv),
         "learning_curve": (
             None if saved_learning_curve is None

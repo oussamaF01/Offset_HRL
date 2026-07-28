@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -18,6 +18,7 @@ from local_a3_training_scenarios import (
     NEUTRAL_SLICE_SCENARIO,
     EpisodeTrainingScenario,
     choose_training_scenario,
+    generate_demand_curriculum,
 )
 from scenario_creator import create_multignb_env
 from slice_ran import Packet
@@ -47,13 +48,321 @@ DEFAULT_BIAS_CASE_PROBS = {
     "risky_offload": 0.20,
 }
 
+UPPER_EXPERT_SLICE_PARAMS = {
+    "eMBB": {"deadband": 0.08, "safe_load": 0.80, "urgency": 1.0},
+    "URLLC": {"deadband": 0.05, "safe_load": 0.72, "urgency": 1.3},
+    "mMTC": {"deadband": 0.10, "safe_load": 0.85, "urgency": 0.9},
+}
+UPPER_EXPERT_DEFAULT_PARAMS = {"deadband": 0.08, "safe_load": 0.80, "urgency": 1.0}
+
+
+def _slice_param(slice_type: str, name: str) -> float:
+    params = UPPER_EXPERT_SLICE_PARAMS.get(
+        normalize_slice_type(slice_type),
+        UPPER_EXPERT_DEFAULT_PARAMS,
+    )
+    return float(params[name])
+
+
+def _slice_load_for_upper_expert(base_env, gnb_id: int, slice_type: str) -> float:
+    normalized_slice = normalize_slice_type(slice_type)
+
+    # 1. Scenario demand profile (target_load set at episode reset — always preferred).
+    demand_profile = getattr(base_env, "_last_demand_profile", None)
+    if isinstance(demand_profile, dict):
+        item = demand_profile.get((int(gnb_id), normalized_slice))
+        if isinstance(item, dict) and "target_load" in item:
+            return float(item["target_load"])
+
+    # 2. Live per-UE upper_demand_prbs (set by upper scenario on each UE).
+    if hasattr(base_env, "get_all_ues"):
+        demand_prbs = 0.0
+        saw = False
+        for ue in base_env.get_all_ues():
+            if (
+                not getattr(ue, "connected", False)
+                or getattr(ue, "serving_gnb", None) is None
+                or int(ue.serving_gnb) != int(gnb_id)
+                or normalize_slice_type(getattr(ue, "slice_type", "eMBB")) != normalized_slice
+            ):
+                continue
+            if hasattr(ue, "upper_demand_prbs"):
+                saw = True
+                demand_prbs += max(float(getattr(ue, "upper_demand_prbs", 0.0)), 0.0)
+        if saw:
+            gnb = (
+                base_env._get_gnb_by_id(int(gnb_id))
+                if hasattr(base_env, "_get_gnb_by_id")
+                else None
+            )
+            capacity = max(float(getattr(gnb, "n_prbs", 0.0)), 1.0)
+            return float(demand_prbs / capacity)
+
+    return 0.0
+
+
+def _upper_expert_sla_risk(base_env, gnb_id: int, slice_type: str) -> float:
+    normalized = normalize_slice_type(slice_type)
+    risk = 0.0
+    for getter in ("get_slice_sla_severity", "get_slice_sla_flags"):
+        if not hasattr(base_env, getter):
+            continue
+        values = getattr(base_env, getter)()
+        risk = max(risk, float(values.get((int(gnb_id), normalized), 0.0)))
+    return float(np.clip(risk, 0.0, 1.0))
+
+
+def _best_radio_margin_db(base_env, source_id: int, target_id: int, slice_type: str) -> float:
+    source_gnb = base_env._get_gnb_by_id(int(source_id)) if hasattr(base_env, "_get_gnb_by_id") else None
+    target_gnb = base_env._get_gnb_by_id(int(target_id)) if hasattr(base_env, "_get_gnb_by_id") else None
+    if source_gnb is None or target_gnb is None or not hasattr(base_env, "get_all_ues"):
+        return 0.0
+
+    best = -np.inf
+    normalized = normalize_slice_type(slice_type)
+    for ue in base_env.get_all_ues():
+        if (
+            not getattr(ue, "connected", False)
+            or getattr(ue, "serving_gnb", None) is None
+            or int(ue.serving_gnb) != int(source_id)
+            or normalize_slice_type(getattr(ue, "slice_type", "eMBB")) != normalized
+        ):
+            continue
+        try:
+            if hasattr(base_env, "_compute_link_metrics"):
+                target_metrics = base_env._compute_link_metrics(target_gnb, ue)
+                source_metrics = base_env._compute_link_metrics(source_gnb, ue)
+                target_rsrp = float(
+                    target_metrics.get("rx_power_dbm", target_metrics.get("rsrp_dbm", -120.0))
+                )
+                source_rsrp = float(
+                    source_metrics.get("rx_power_dbm", source_metrics.get("rsrp_dbm", -120.0))
+                )
+            else:
+                target_rsrp = float(base_env._measure_rsrp(target_gnb, ue))
+                source_rsrp = float(base_env._measure_rsrp(source_gnb, ue))
+            best = max(best, target_rsrp - source_rsrp)
+        except Exception:
+            continue
+    return 0.0 if not np.isfinite(best) else float(best)
+
+
+def compute_upper_expert_directional_bias(
+    base_env,
+    *,
+    gnb_ids: Sequence[int],
+    neighbor_graph: Mapping[int, Sequence[int]],
+    slice_types: Sequence[str],
+    max_target_rsrp_deficit_db: float = 8.0,
+    safe_total_gnb_load: float = 0.65,
+    total_load_guard_margin: float = 0.05,
+    max_direction_delta: float = 0.20,
+) -> Dict[Tuple[int, int, str], float]:
+    """Build a coordinated upper-expert strategy for lower imitation training.
+
+    Demand PRB load is the source of truth.  The expert is slice-aware, but it
+    also guards total target-gNB demand so multiple slices are not stacked onto
+    the same target just because each slice separately has headroom.
+    """
+    gnb_ids = tuple(int(gid) for gid in gnb_ids)
+    slice_types = tuple(normalize_slice_type(st) for st in slice_types)
+    loads = {
+        (gid, st): max(_slice_load_for_upper_expert(base_env, gid, st), 0.0)
+        for gid in gnb_ids
+        for st in slice_types
+    }
+    total_loads = {
+        gid: float(sum(loads.get((gid, st), 0.0) for st in slice_types))
+        for gid in gnb_ids
+    }
+    mean_total_load = float(np.mean(list(total_loads.values()))) if total_loads else 0.0
+    safe_total_gnb_load = float(safe_total_gnb_load)
+    total_load_guard_margin = float(total_load_guard_margin)
+    max_direction_delta = float(max_direction_delta)
+
+    debug = {
+        "load_source": "demand_prb",
+        "safe_total_gnb_load": safe_total_gnb_load,
+        "total_load_guard_margin": total_load_guard_margin,
+        "max_direction_delta": max_direction_delta,
+        "total_demand_load": dict(total_loads),
+        "directions": {},
+        "rejected_target_total_high": [],
+    }
+
+    bias: Dict[Tuple[int, int, str], float] = {}
+    for source_id in gnb_ids:
+        neighbors = tuple(int(n) for n in neighbor_graph.get(int(source_id), ()))
+        source_total_load = total_loads.get(source_id, 0.0)
+        total_excess = max(source_total_load - mean_total_load - total_load_guard_margin, 0.0)
+        total_safe_excess = max(source_total_load - safe_total_gnb_load, 0.0)
+        source_total_pressure = float(np.clip(
+            (total_excess + total_safe_excess)
+            / max(safe_total_gnb_load - min(mean_total_load, safe_total_gnb_load), 0.10),
+            0.0,
+            1.0,
+        ))
+
+        for slice_type in slice_types:
+            safe_load = _slice_param(slice_type, "safe_load")
+            deadband = _slice_param(slice_type, "deadband")
+            urgency = _slice_param(slice_type, "urgency")
+
+            source_load = loads[(source_id, slice_type)]
+            neighbor_loads = [loads.get((target_id, slice_type), 0.0) for target_id in neighbors]
+            slice_mean = float(np.mean([source_load] + neighbor_loads)) if neighbors else source_load
+            source_sla = _upper_expert_sla_risk(base_env, source_id, slice_type)
+            source_excess = max(source_load - slice_mean - deadband, 0.0)
+            safe_excess = max(source_load - safe_load, 0.0)
+            slice_pressure = float(np.clip(
+                urgency * (source_excess + safe_excess + 0.35 * source_sla)
+                / max(safe_load - min(slice_mean, safe_load), 0.10),
+                0.0,
+                1.0,
+            ))
+            source_pressure = float(np.clip(
+                max(slice_pressure, source_total_pressure if source_load > 1e-9 else 0.0),
+                0.0,
+                1.0,
+            ))
+
+            candidates = []
+            for target_id in neighbors:
+                target_load = loads.get((target_id, slice_type), 0.0)
+                target_total_load = total_loads.get(target_id, 0.0)
+                target_total_headroom = safe_total_gnb_load - target_total_load
+                target_risk = _upper_expert_sla_risk(base_env, target_id, slice_type)
+                headroom = max(safe_load - target_load, 0.0)
+                estimated_delta = min(
+                    max_direction_delta,
+                    max(0.0, source_load - target_load),
+                )
+                radio_margin = _best_radio_margin_db(base_env, source_id, target_id, slice_type)
+                radio_score = float(np.clip(
+                    (radio_margin + max_target_rsrp_deficit_db)
+                    / max(max_target_rsrp_deficit_db, 1e-9),
+                    0.0,
+                    1.0,
+                ))
+                target_deficit = max(slice_mean - target_load, 0.0)
+                target_slice_headroom = safe_load - target_load
+                overload_penalty = max(
+                    target_total_load - (safe_total_gnb_load - total_load_guard_margin),
+                    0.0,
+                ) / max(safe_total_gnb_load, 1e-9)
+                direction_key = (int(source_id), int(target_id), slice_type)
+
+                direction_debug = {
+                    "source_slice_load": float(source_load),
+                    "target_slice_load": float(target_load),
+                    "source_total_load": float(source_total_load),
+                    "target_total_load": float(target_total_load),
+                    "safe_slice_load": float(safe_load),
+                    "safe_total_gnb_load": float(safe_total_gnb_load),
+                    "estimated_delta": float(estimated_delta),
+                    "source_pressure": float(source_pressure),
+                    "slice_pressure": float(slice_pressure),
+                    "source_total_pressure": float(source_total_pressure),
+                    "target_slice_headroom": float(target_slice_headroom),
+                    "target_total_headroom": float(target_total_headroom),
+                    "radio_score": float(radio_score),
+                    "target_sla_risk": float(target_risk),
+                    "overload_penalty": float(overload_penalty),
+                    "rejection_reason": None,
+                    "score": 0.0,
+                }
+
+                candidate_score = (
+                    source_pressure
+                    + float(np.clip((headroom + target_deficit) / max(safe_load, 1e-9), 0.0, 1.0))
+                    + float(np.clip(target_total_headroom / max(safe_total_gnb_load, 1e-9), 0.0, 1.0))
+                    + radio_score
+                    - float(np.clip(target_risk, 0.0, 1.0))
+                    - overload_penalty
+                )
+                direction_debug["score"] = float(candidate_score)
+
+                reject_reason = None
+                total_overload_release = (
+                    source_load > 1e-9
+                    and source_total_load > safe_total_gnb_load
+                )
+                if source_load <= safe_load and not total_overload_release:
+                    reject_reason = "source_slice_not_over_safe"
+                elif source_pressure <= 0.0 or estimated_delta <= 1e-12:
+                    reject_reason = "no_source_pressure_or_delta"
+                elif radio_score <= 0.0:
+                    reject_reason = "radio_infeasible"
+                elif target_total_headroom <= total_load_guard_margin:
+                    reject_reason = "target_total_guard_margin"
+                elif target_load + estimated_delta > safe_load:
+                    reject_reason = "target_slice_over_safe_after_delta"
+                elif target_total_load + estimated_delta > safe_total_gnb_load:
+                    reject_reason = "target_total_over_safe_after_delta"
+                elif candidate_score <= 1e-9:
+                    reject_reason = "non_positive_score"
+
+                if reject_reason is None:
+                    candidates.append((target_id, candidate_score))
+                    direction_debug["accepted_candidate"] = True
+                else:
+                    direction_debug["accepted_candidate"] = False
+                    direction_debug["rejection_reason"] = reject_reason
+                    if reject_reason in {
+                        "target_total_guard_margin",
+                        "target_total_over_safe_after_delta",
+                    }:
+                        debug["rejected_target_total_high"].append({
+                            "source_id": int(source_id),
+                            "target_id": int(target_id),
+                            "slice_type": slice_type,
+                            "reason": reject_reason,
+                            "target_total_load": float(target_total_load),
+                            "target_total_headroom": float(target_total_headroom),
+                            "estimated_delta": float(estimated_delta),
+                        })
+                    retain_pressure = max(
+                        target_load - source_load,
+                        target_load - safe_load,
+                        target_total_load - safe_total_gnb_load,
+                        target_risk - source_sla,
+                        0.0,
+                    )
+                    bias[direction_key] = float(np.clip(
+                        retain_pressure / max(safe_load, safe_total_gnb_load, 1e-9),
+                        0.0,
+                        1.0,
+                    ))
+                debug["directions"][direction_key] = direction_debug
+
+            total = float(sum(score for _target_id, score in candidates))
+            if total <= 1e-12:
+                continue
+            for target_id, score in candidates:
+                share = float(score / total)
+                bias[(source_id, target_id, slice_type)] = -float(np.clip(
+                    source_pressure * share,
+                    0.0,
+                    1.0,
+                ))
+
+    for source_id in gnb_ids:
+        for target_id in neighbor_graph.get(int(source_id), ()):
+            for slice_type in slice_types:
+                bias.setdefault((int(source_id), int(target_id), slice_type), 0.0)
+    try:
+        setattr(base_env, "_last_upper_expert_debug", debug)
+    except Exception:
+        pass
+    return bias
+
 
 class LocalA3RuleBiasTrainingEnv(gym.Env):
     """
     Stage-1 local-agent training environment.
 
     This wrapper randomizes a small static scenario at every reset and trains one
-    LocalA3OffsetEnv with a rule-based fake global bias. It is intentionally
+    LocalA3OffsetEnv with an upper-expert directional bias. It is intentionally
     simple: no SUMO, no global PPO, and usually one slice such as eMBB.
     """
 
@@ -132,7 +441,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         self._held_action = None
         self._last_action_debug = self._empty_action_debug()
         self._bias_hold_counter = 0
-        self._held_rule_bias = None
+        self._held_upper_expert_bias = None
         self._last_bias_changed = False
         self._last_demand_profile = {}
 
@@ -215,7 +524,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         self._held_action = None
         self._last_action_debug = self._empty_action_debug()
         self._bias_hold_counter = 0
-        self._held_rule_bias = None
+        self._held_upper_expert_bias = None
         self._last_bias_changed = False
 
         for gid, h_env in self._heuristic_local_envs.items():
@@ -240,7 +549,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             self._seed_case_prbs()
             self.base_env._invalidate_metric_caches()
 
-            self.local_env.set_global_bias(self._held_or_new_rule_bias(force=True))
+            self.local_env.set_global_bias(self._held_or_new_upper_expert_bias(force=True))
             obs = self.local_env._build_observation()
             self._bias_case_matched = (
                 True
@@ -368,7 +677,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         self._apply_case_demand_profiles()
         self._seed_case_prbs()
         self.base_env._invalidate_metric_caches()
-        self.local_env.set_global_bias(self._held_or_new_rule_bias())
+        self.local_env.set_global_bias(self._held_or_new_upper_expert_bias())
         obs = self.local_env._build_observation()
         self._elapsed_steps += 1
         truncated = bool(truncated or self._elapsed_steps >= self.episode_steps)
@@ -694,53 +1003,21 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             for slice_type in self.slice_types
         )
 
-    # Per-slice parameters for the proportional rule bias.
-    # scale:    load-difference that maps to ±1 bias (smaller = more sensitive)
-    # deadband: imbalances below this are ignored (outputs 0)
-    # min_src:  src load must exceed this before a negative (offload) bias fires
-    _RULE_BIAS_PARAMS = {
-        "eMBB":  {"scale": 0.35, "deadband": 0.10, "min_src": 0.40},
-        "URLLC": {"scale": 0.25, "deadband": 0.07, "min_src": 0.35},
-        "mMTC":  {"scale": 0.40, "deadband": 0.12, "min_src": 0.45},
-    }
-    _RULE_BIAS_DEFAULT_PARAMS = {"scale": 0.35, "deadband": 0.10, "min_src": 0.40}
-
-    def _rule_bias(self):
-        # Proportional directional rule bias b_{src,tgt,s}.
-        #
-        # raw = -(src_load - tgt_load) / scale
-        #   → large positive diff (src much more loaded) → strong negative bias (offload)
-        #   → large negative diff (tgt much more loaded) → strong positive bias (retain)
-        #
-        # Gating:
-        #   - Deadband suppresses noise from tiny imbalances.
-        #   - min_src prevents recommending offload from a lightly loaded cell.
-        #
-        # Slice-awareness: URLLC reacts faster (smaller scale & deadband),
-        # mMTC is more conservative (larger scale & deadband).
-        bias = {}
-        gnb_ids = [int(gnb.id) for gnb in self.base_env.gnbs]
-        for src_id in gnb_ids:
-            for tgt_id in gnb_ids:
-                if src_id == tgt_id:
-                    continue
-                for slice_type in self.slice_types:
-                    p = self._RULE_BIAS_PARAMS.get(slice_type, self._RULE_BIAS_DEFAULT_PARAMS)
-                    src_load = self.base_env.estimate_slice_load(src_id, slice_type)
-                    tgt_load = self.base_env.estimate_slice_load(tgt_id, slice_type)
-                    diff = src_load - tgt_load
-
-                    if abs(diff) < p["deadband"]:
-                        value = 0.0
-                    else:
-                        raw = -diff / p["scale"]
-                        # Veto offload recommendation when src itself is lightly loaded
-                        if raw < 0.0 and src_load < p["min_src"]:
-                            raw = 0.0
-                        value = float(np.clip(raw, -1.0, 1.0))
-
-                    bias[(src_id, tgt_id, slice_type)] = value
-        return bias
+    def _upper_expert_bias(self):
+        neighbor_graph = {
+            int(src_id): tuple(
+                int(tgt_id)
+                for tgt_id in [int(gnb.id) for gnb in self.base_env.gnbs]
+                if int(tgt_id) != int(src_id)
+            )
+            for src_id in [int(gnb.id) for gnb in self.base_env.gnbs]
+        }
+        return compute_upper_expert_directional_bias(
+            self.base_env,
+            gnb_ids=[int(gnb.id) for gnb in self.base_env.gnbs],
+            neighbor_graph=neighbor_graph,
+            slice_types=self.slice_types,
+        )
 
     def _empty_action_debug(self) -> Dict[str, object]:
         return {
@@ -848,15 +1125,15 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         }
         return self._format_action_array(applied_action)
 
-    def _held_or_new_rule_bias(self, force: bool = False):
-        if force or self._held_rule_bias is None or self._bias_hold_counter <= 0:
-            self._held_rule_bias = dict(self._rule_bias())
+    def _held_or_new_upper_expert_bias(self, force: bool = False):
+        if force or self._held_upper_expert_bias is None or self._bias_hold_counter <= 0:
+            self._held_upper_expert_bias = dict(self._upper_expert_bias())
             self._bias_hold_counter = max(self.bias_hold_steps - 1, 0)
             self._last_bias_changed = True
         else:
             self._bias_hold_counter -= 1
             self._last_bias_changed = False
-        return dict(self._held_rule_bias)
+        return dict(self._held_upper_expert_bias)
 
     def _augment_info(
         self,
@@ -866,6 +1143,7 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
     ) -> Dict:
         info = dict(info or {})
         info["rule_bias"] = dict(self.local_env.global_bias)
+        info["upper_expert_bias"] = dict(self.local_env.global_bias)
         pairwise = self.local_env._pairwise_debug()
         info["serving_bias"] = pairwise["serving_bias"]
         info["target_bias"] = pairwise["target_bias"]
@@ -876,7 +1154,8 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
             "bias_hold_counter": int(self._bias_hold_counter),
             "bias_hold_steps": int(self.bias_hold_steps),
             "bias_changed": bool(self._last_bias_changed),
-            "held_rule_bias": dict(self._held_rule_bias or {}),
+            "held_rule_bias": dict(self._held_upper_expert_bias or {}),
+            "held_upper_expert_bias": dict(self._held_upper_expert_bias or {}),
         }
         scenario_slice_loads = self.base_env.get_slice_loads()
         info["slice_loads"] = scenario_slice_loads
@@ -937,18 +1216,6 @@ class LocalA3RuleBiasTrainingEnv(gym.Env):
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Upper-scenario lower training env
-# ─────────────────────────────────────────────────────────────────────────────
-
-_RULE_BIAS_PARAMS = {
-    "eMBB":  {"scale": 0.35, "deadband": 0.10, "min_src": 0.40},
-    "URLLC": {"scale": 0.25, "deadband": 0.07, "min_src": 0.35},
-    "mMTC":  {"scale": 0.40, "deadband": 0.12, "min_src": 0.45},
-}
-_RULE_BIAS_DEFAULT_PARAMS = {"scale": 0.35, "deadband": 0.10, "min_src": 0.40}
-
-
 def _reset_local_env_state(local_env: LocalA3OffsetEnv, base_env) -> None:
     """Reset a LocalA3OffsetEnv's internal state without touching the simulator."""
     for key in local_env._offsets:
@@ -981,10 +1248,6 @@ class UpperScenarioLowerEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    # Shared rule-bias parameters (same formula as LocalA3RuleBiasTrainingEnv)
-    _RULE_BIAS_PARAMS = _RULE_BIAS_PARAMS
-    _RULE_BIAS_DEFAULT_PARAMS = _RULE_BIAS_DEFAULT_PARAMS
-
     def __init__(
         self,
         seed: int = 7,
@@ -1007,6 +1270,19 @@ class UpperScenarioLowerEnv(gym.Env):
         bias_hold_steps: int = 20,
         max_offset_change_db: float = 2.0,
         print_scenarios: bool = True,
+        scenario_mode: str = "curriculum",
+        num_random_scenarios: int = 0,
+        demand_seed: int | None = None,
+        min_demand_load: float = 0.05,
+        max_demand_load: float = 0.95,
+        safe_total_gnb_load: float = 0.65,
+        min_total_gnb_load: float = 0.25,
+        randomize_traffic_profiles: bool = True,
+        traffic_bit_rate_scale_min: float = 0.5,
+        traffic_bit_rate_scale_max: float = 2.5,
+        traffic_packet_size_scale_min: float = 0.75,
+        traffic_packet_size_scale_max: float = 1.5,
+        placement_jitter_m: float = 18.0,
     ):
         super().__init__()
         self.seed_value = int(seed)
@@ -1018,11 +1294,30 @@ class UpperScenarioLowerEnv(gym.Env):
         self.max_offset_change_db = float(max_offset_change_db)
         self.print_scenarios = bool(print_scenarios)
 
+        scenario_mode = str(scenario_mode).strip().lower()
+        if scenario_mode == "random_demand":
+            training_scenarios = generate_demand_curriculum(
+                num_scenarios=max(1, int(num_random_scenarios or 256)),
+                demand_seed=self.seed_value if demand_seed is None else int(demand_seed),
+                min_demand_load=min_demand_load,
+                max_demand_load=max_demand_load,
+                safe_total_gnb_load=safe_total_gnb_load,
+                min_total_gnb_load=min_total_gnb_load,
+                duration_s=float(episode_steps),
+                randomize_traffic_profiles=randomize_traffic_profiles,
+                bit_rate_scale_range=(traffic_bit_rate_scale_min, traffic_bit_rate_scale_max),
+                packet_size_scale_range=(traffic_packet_size_scale_min, traffic_packet_size_scale_max),
+                placement_jitter_m=placement_jitter_m,
+            )
+            scenario_mode_for_upper = "curriculum"
+        else:
+            scenario_mode_for_upper = "curriculum"
+
         GlobalPPO3GNBEnv = _import_global_ppo_env()
         self.upper_env = GlobalPPO3GNBEnv(
             seed=seed,
             slice_types=self.slice_types,
-            scenario_mode="curriculum",
+            scenario_mode=scenario_mode_for_upper,
             training_scenarios=training_scenarios,
             scenario_selection=scenario_selection,
             upper_window_seconds=upper_window_seconds,
@@ -1069,9 +1364,10 @@ class UpperScenarioLowerEnv(gym.Env):
         self._reset_count = 0
         self._action_hold_counter = 0
         self._held_action: Optional[np.ndarray] = None
-        self._held_rule_bias: Optional[Dict] = None
+        self._held_upper_expert_bias: Optional[Dict] = None
         self._bias_hold_counter = 0
         self._current_scenario_name = "unknown"
+        self._current_scenario_metadata: Dict[str, object] = {}
 
     # ── gym interface ─────────────────────────────────────────────────────────
 
@@ -1094,17 +1390,18 @@ class UpperScenarioLowerEnv(gym.Env):
         self._elapsed_steps = 0
         self._action_hold_counter = 0
         self._held_action = None
-        self._held_rule_bias = None
+        self._held_upper_expert_bias = None
         self._bias_hold_counter = 0
 
-        # Seed the initial rule bias.
-        bias = self._compute_rule_bias(force=True)
+        # Seed the initial upper-expert bias.
+        bias = self._compute_upper_expert_bias(force=True)
         for local_env in self.local_envs.values():
             local_env.set_global_bias(bias)
 
         self._current_scenario_name = str(
             info.get("scenario_name", getattr(self.upper_env, "_active_scenario", "unknown"))
         )
+        self._current_scenario_metadata = dict(info.get("scenario_metadata", {}) or {})
         if self.print_scenarios:
             print(
                 f"[UpperScenarioLowerEnv] reset={self._reset_count} "
@@ -1113,9 +1410,38 @@ class UpperScenarioLowerEnv(gym.Env):
                 flush=True,
             )
 
-        return self._ctrl_env._build_observation(), {}
+        return self._ctrl_env._build_observation(), dict(info or {})
 
     def step(self, action: np.ndarray):
+        current_bias = dict(self._ctrl_env.global_bias)
+        if hasattr(self.base_env, "safe_admission_load_provider"):
+            try:
+                demand_matrix = np.asarray(self.upper_env._load_matrix(), dtype=float)
+                demand_lookup = {
+                    (int(gid), normalize_slice_type(st)): float(demand_matrix[int(gid), s_idx])
+                    for gid in self.gnb_ids
+                    for s_idx, st in enumerate(self.slice_types)
+                }
+                self.base_env.safe_admission_load_provider = (
+                    lambda gid, st, _lookup=demand_lookup: float(
+                        _lookup.get((int(gid), normalize_slice_type(st)), 0.0)
+                    )
+                )
+            except Exception:
+                pass
+        if hasattr(self.base_env, "begin_safe_admission_window"):
+            bias_tensor = np.zeros(
+                (len(self.gnb_ids), max(len(v) for v in self.neighbors.values()), len(self.slice_types)),
+                dtype=float,
+            )
+            for src_idx, src_id in enumerate(self.gnb_ids):
+                for nb_slot, nb_id in enumerate(self.neighbors[int(src_id)]):
+                    for s_idx, slice_type in enumerate(self.slice_types):
+                        bias_tensor[src_idx, nb_slot, s_idx] = float(
+                            current_bias.get((int(src_id), int(nb_id), slice_type), 0.0)
+                        )
+            self.base_env.begin_safe_admission_window(bias_tensor, self.slice_types)
+
         # Heuristic gNBs run first (A3 offsets applied + handovers executed)
         # before radio time advances — same ordering as LocalA3RuleBiasTrainingEnv.
         self._run_heuristic_gnbs()
@@ -1131,8 +1457,8 @@ class UpperScenarioLowerEnv(gym.Env):
         # advances the radio simulator one step, computes reward.
         obs, reward, terminated, truncated, info = self._ctrl_env.step(held)
 
-        # Update rule bias with hold logic.
-        bias = self._compute_rule_bias()
+        # Update upper-expert bias with hold logic.
+        bias = self._compute_upper_expert_bias()
         for local_env in self.local_envs.values():
             local_env.set_global_bias(bias)
 
@@ -1140,7 +1466,12 @@ class UpperScenarioLowerEnv(gym.Env):
         truncated = bool(truncated or self._elapsed_steps >= self.episode_steps)
 
         info["rule_bias"] = bias
+        info["upper_expert_bias"] = bias
         info["scenario_name"] = self._current_scenario_name
+        info["scenario_metadata"] = dict(self._current_scenario_metadata)
+        info["scenario_case_type"] = str(self._current_scenario_metadata.get("case_type", ""))
+        if hasattr(self.base_env, "get_safe_admission_state"):
+            info["safe_admission"] = self.base_env.get_safe_admission_state()
         return obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self):
@@ -1148,34 +1479,20 @@ class UpperScenarioLowerEnv(gym.Env):
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
-    def _compute_rule_bias(self, force: bool = False) -> Dict:
-        """Load-diff proportional bias; holds for bias_hold_steps steps."""
-        if force or self._held_rule_bias is None or self._bias_hold_counter <= 0:
-            bias: Dict = {}
-            for src_id in self.gnb_ids:
-                for tgt_id in self.gnb_ids:
-                    if src_id == tgt_id:
-                        continue
-                    for slice_type in self.slice_types:
-                        p = self._RULE_BIAS_PARAMS.get(
-                            slice_type, self._RULE_BIAS_DEFAULT_PARAMS
-                        )
-                        src_load = self.base_env.estimate_slice_load(src_id, slice_type)
-                        tgt_load = self.base_env.estimate_slice_load(tgt_id, slice_type)
-                        diff = src_load - tgt_load
-                        if abs(diff) < p["deadband"]:
-                            value = 0.0
-                        else:
-                            raw = -diff / p["scale"]
-                            if raw < 0.0 and src_load < p["min_src"]:
-                                raw = 0.0
-                            value = float(np.clip(raw, -1.0, 1.0))
-                        bias[(src_id, tgt_id, slice_type)] = value
-            self._held_rule_bias = bias
+    def _compute_upper_expert_bias(self, force: bool = False) -> Dict:
+        """Upper-expert directional bias; holds for bias_hold_steps steps."""
+        if force or self._held_upper_expert_bias is None or self._bias_hold_counter <= 0:
+            bias = compute_upper_expert_directional_bias(
+                self.base_env,
+                gnb_ids=self.gnb_ids,
+                neighbor_graph=self.neighbors,
+                slice_types=self.slice_types,
+            )
+            self._held_upper_expert_bias = bias
             self._bias_hold_counter = max(self.bias_hold_steps - 1, 0)
         else:
             self._bias_hold_counter -= 1
-        return dict(self._held_rule_bias)
+        return dict(self._held_upper_expert_bias)
 
     def _apply_action_hold(self, action) -> np.ndarray:
         """Hold the current action for action_hold_steps steps; rate-limit deltas."""
@@ -1240,13 +1557,37 @@ class UpperScenarioLowerEnv(gym.Env):
                     except Exception:
                         pass
 
-        load = np.array([
-            [
-                self.base_env.get_window_average_slice_loads().get((gid, st), 0.0)
-                for st in self.slice_types
-            ]
-            for gid in all_gnb_ids
-        ], dtype=float)
+        load = None
+        for method_name in ("_load_matrix", "_persistent_demand_load_matrix"):
+            if hasattr(self.upper_env, method_name):
+                try:
+                    candidate = np.asarray(getattr(self.upper_env, method_name)(), dtype=float)
+                    if candidate.shape == (n_gnbs, len(self.slice_types)):
+                        load = candidate
+                        break
+                except Exception:
+                    pass
+        if load is None:
+            profile = getattr(self.base_env, "_last_demand_profile", None)
+            if isinstance(profile, dict):
+                profile_load = np.array([
+                    [
+                        float(profile.get((int(gid), normalize_slice_type(st)), {}).get("target_load", 0.0))
+                        for st in self.slice_types
+                    ]
+                    for gid in all_gnb_ids
+                ], dtype=float)
+                if np.any(profile_load > 0.0):
+                    load = profile_load
+        if load is None:
+            window_loads = self.base_env.get_window_average_slice_loads()
+            load = np.array([
+                [
+                    window_loads.get((gid, st), 0.0)
+                    for st in self.slice_types
+                ]
+                for gid in all_gnb_ids
+            ], dtype=float)
         sla_flags = (
             self.base_env.get_slice_sla_flags()
             if hasattr(self.base_env, "get_slice_sla_flags")

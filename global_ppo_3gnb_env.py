@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import csv
 import math
+from pathlib import Path
 from typing import Dict, Mapping, Sequence, Tuple
 
 import gymnasium as gym
@@ -167,10 +169,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         served_active_floor: float = 0.20,
         jain_fairness_weight: float = 1.0,
         upper_reward_mode: str = "paper_cost",
-        paper_handover_penalty_weight: float = 1.0,
-        paper_pingpong_penalty_weight: float = 5.0,
+        paper_handover_penalty_weight: float = 0.0,
+        paper_pingpong_penalty_weight: float = 0.0,
         paper_excess_load_penalty_weight: float = 3.0,
-        contradictory_bias_penalty_weight: float = 1.0,
+        contradictory_bias_penalty_weight: float = 0.05,
+        idle_slice_bias_penalty_weight: float = 0.0,
+        sinr_penalty_weight: float = 0.4,
+        sinr_floor_db: float = 5.0,
+        expert_bias_csv: str | Path | None = "results/upper_heuristic_3gnb_baseline/upper_heuristic_3gnb_scenario_summary.csv",
+        expert_bias_reward_weight: float = 0.5,
+        expert_bias_closeness_threshold: float = 0.95,
         a3_handover_cooldown_s: float = 2.0,
         a3_min_residence_s: float = 2.0,
         a3_history_window_s: float = 20.0,
@@ -204,10 +212,12 @@ class GlobalPPO3GNBEnv(gym.Env):
             "staged",
             "block",
             "controllable_type1_then_mixed",
+            "controlled_slice_curriculum",
         }:
             raise ValueError(
                 "scenario_selection must be 'cycle', 'random', 'staged', "
-                "'block', or 'controllable_type1_then_mixed'"
+                "'block', 'controllable_type1_then_mixed', or "
+                "'controlled_slice_curriculum'"
             )
         self.curriculum_block_episodes = max(1, int(curriculum_block_episodes))
         self.fixed_stage_episodes = max(int(fixed_stage_episodes), 0)
@@ -310,6 +320,17 @@ class GlobalPPO3GNBEnv(gym.Env):
         self.contradictory_bias_penalty_weight = max(
             float(contradictory_bias_penalty_weight), 0.0
         )
+        self.idle_slice_bias_penalty_weight = max(
+            float(idle_slice_bias_penalty_weight), 0.0
+        )
+        self.sinr_penalty_weight = max(float(sinr_penalty_weight), 0.0)
+        self.sinr_floor_db = float(sinr_floor_db)
+        self.expert_bias_reward_weight = max(float(expert_bias_reward_weight), 0.0)
+        self.expert_bias_closeness_threshold = float(
+            np.clip(expert_bias_closeness_threshold, 0.0, 0.999999)
+        )
+        self.expert_bias_csv = None if expert_bias_csv is None else Path(expert_bias_csv)
+        self._expert_bias_by_scenario: Dict[str, np.ndarray] = {}
         self.a3_handover_cooldown_s = max(float(a3_handover_cooldown_s), 0.0)
         self.a3_min_residence_s = max(float(a3_min_residence_s), self.a3_handover_cooldown_s)
         self.a3_history_window_s = max(float(a3_history_window_s), 0.0)
@@ -351,6 +372,7 @@ class GlobalPPO3GNBEnv(gym.Env):
 
         self.neighbors = {0: [1, 2], 1: [0, 2], 2: [0, 1]}
         self.max_neighbors = max(len(values) for values in self.neighbors.values())
+        self._expert_bias_by_scenario = self._load_expert_bias_csv(self.expert_bias_csv)
         self.lower_agents = {}
 
         action_dim = self.n_gnbs * self.max_neighbors * len(self.slice_types)
@@ -480,6 +502,7 @@ class GlobalPPO3GNBEnv(gym.Env):
 
         self.base_env.clear_ues(reset_ids=True)
         self.base_env.reset(seed=seed)
+        self.base_env._last_demand_profile = {}
         if self.scenario_mode == "curriculum":
             self._initialize_training_scenario()
         else:
@@ -857,6 +880,21 @@ class GlobalPPO3GNBEnv(gym.Env):
             self.contradictory_bias_penalty_weight
             * contradictory_bias_raw
         )
+        idle_slice_bias_raw = self._idle_slice_bias_penalty(
+            start_demand_loads, directional_bias
+        )
+        idle_slice_bias_penalty = (
+            self.idle_slice_bias_penalty_weight * idle_slice_bias_raw
+        )
+        # Radio-quality term: penalize ending a window with active UEs left
+        # on a poor-SINR link, regardless of how well-balanced PRB load is.
+        # Causal on the post-settle/measurement state the action produced.
+        end_sinr_matrix = self._end_state_sinr_matrix()
+        active_demand_mask = end_demand_loads > 1e-9
+        sinr_deficit_raw = self._sinr_deficit_penalty(
+            end_sinr_matrix, active_demand_mask
+        )
+        sinr_penalty = self.sinr_penalty_weight * sinr_deficit_raw
         # Directional upper reward:
         #   r_H(t) = [J_H(t) - J_H(t + T_H)] / |S_active|
         #            - lambda_delta * mean_active((B(t)-B(t-T_H))^2)
@@ -957,6 +995,8 @@ class GlobalPPO3GNBEnv(gym.Env):
             + self.paper_handover_penalty_weight * paper_handover_ratio
             + self.paper_pingpong_penalty_weight * paper_pingpong_ratio
             + contradictory_bias_penalty
+            + idle_slice_bias_penalty
+            + sinr_penalty
         )
         # paper_cost_delta: improvement-based reward using demand PRB load
         pd_demand_load_start_vec = self._gnb_total_demand_load_vector(start_demand_loads)
@@ -1075,6 +1115,15 @@ class GlobalPPO3GNBEnv(gym.Env):
             window_reward = paper_cost_delta_reward
         else:
             window_reward = paper_cost_reward
+        (
+            expert_bias_bonus,
+            expert_bias_mse,
+            expert_bias_closeness,
+            expert_bias_found,
+            expert_bias_active_entries,
+            expert_bias_active_fraction,
+        ) = self._expert_bias_guidance_reward(directional_bias)
+        window_reward = float(window_reward + expert_bias_bonus)
         self._previous_window_sla_severity = float(end_sla_severity)
         instant_rewards = [window_reward]
         # Legacy target-error shaping is intentionally excluded from the v15
@@ -1111,6 +1160,10 @@ class GlobalPPO3GNBEnv(gym.Env):
             contradictory_bias_penalty
         )
         info["global_contradictory_bias_raw"] = float(contradictory_bias_raw)
+        info["idle_slice_bias_penalty"] = float(idle_slice_bias_penalty)
+        info["idle_slice_bias_raw"] = float(idle_slice_bias_raw)
+        info["global_sinr_penalty"] = float(sinr_penalty)
+        info["global_sinr_deficit_raw"] = float(sinr_deficit_raw)
         info["reward_load_improvement"] = float(load_reward)
         info["reward_load_improvement_raw"] = float(raw_load_improvement)
         info["reward_active_slice_count"] = int(active_slice_count)
@@ -1155,6 +1208,17 @@ class GlobalPPO3GNBEnv(gym.Env):
         info["upper_reward_mode"] = self.upper_reward_mode
         info["paper_load_source"] = "demand_prbs"
         info["paper_cost_reward"] = float(paper_cost_reward)
+        info["expert_bias_reward"] = float(expert_bias_bonus)
+        info["expert_bias_mse"] = float(expert_bias_mse)
+        info["expert_bias_closeness"] = float(expert_bias_closeness)
+        info["expert_bias_found"] = bool(expert_bias_found)
+        info["expert_bias_active_entries"] = int(expert_bias_active_entries)
+        info["expert_bias_active_fraction"] = float(expert_bias_active_fraction)
+        info["expert_bias_reward_weight"] = float(self.expert_bias_reward_weight)
+        info["expert_bias_closeness_threshold"] = float(
+            self.expert_bias_closeness_threshold
+        )
+        info["expert_bias_csv"] = str(self.expert_bias_csv or "")
         info["paper_load_std_penalty"] = float(
             self.global_reward_mu * paper_demand_load_std
         )
@@ -1285,6 +1349,69 @@ class GlobalPPO3GNBEnv(gym.Env):
             self.max_neighbors,
             len(self.slice_types),
         )
+
+    def _load_expert_bias_csv(self, path: Path | None) -> Dict[str, np.ndarray]:
+        if path is None or self.expert_bias_reward_weight <= 0.0:
+            return {}
+        if not path.exists():
+            return {}
+        table: Dict[str, np.ndarray] = {}
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                scenario_name = str(row.get("scenario_name", "")).strip()
+                if not scenario_name:
+                    continue
+                tensor = np.zeros(
+                    (self.n_gnbs, self.max_neighbors, len(self.slice_types)),
+                    dtype=np.float32,
+                )
+                for source_gnb in range(self.n_gnbs):
+                    for neighbor_slot, target_gnb in enumerate(
+                        self.neighbors.get(int(source_gnb), [])
+                    ):
+                        for slice_idx, slice_type in enumerate(self.slice_types):
+                            col = (
+                                f"first_upper_bias_g{source_gnb}"
+                                f"_to_g{target_gnb}_{slice_type}"
+                            )
+                            try:
+                                tensor[source_gnb, neighbor_slot, slice_idx] = float(
+                                    row.get(col, 0.0) or 0.0
+                                )
+                            except (TypeError, ValueError):
+                                tensor[source_gnb, neighbor_slot, slice_idx] = 0.0
+                table[scenario_name] = np.clip(tensor, -1.0, 1.0)
+        return table
+
+    def _expert_bias_guidance_reward(
+        self, directional_bias: np.ndarray
+    ) -> tuple[float, float, float, bool, int, float]:
+        if self.expert_bias_reward_weight <= 0.0:
+            return 0.0, 0.0, 0.0, False, 0, 0.0
+        expert = self._expert_bias_by_scenario.get(str(self._active_scenario))
+        if expert is None:
+            return 0.0, 0.0, 0.0, False, 0, 0.0
+        bias = np.asarray(directional_bias, dtype=float)
+        expert = np.asarray(expert, dtype=float)
+        mask = np.abs(expert) > max(float(self.neutral_bias_eps), 1e-6)
+        if not np.any(mask):
+            return 0.0, 0.0, 0.0, False, 0, 0.0
+        mse = float(np.mean(np.square(bias[mask] - expert[mask])))
+        expert_energy = float(np.mean(np.square(expert[mask])))
+        expert_rmse = float(np.sqrt(max(mse, 0.0)))
+        zero_action_rmse = float(np.sqrt(max(expert_energy, 1e-12)))
+        # Score relative to the no-action baseline:
+        #   expert action -> +1, zero action -> 0, worse/opposite action -> < 0.
+        # The previous 1 - mse / 4 scaling gave near-zero actions almost full
+        # credit for moderate expert biases, so PPO could learn to stay inert.
+        closeness = float(
+            np.clip(1.0 - expert_rmse / max(zero_action_rmse, 1e-6), -1.0, 1.0)
+        )
+        reward = float(self.expert_bias_reward_weight * closeness)
+        active_entries = int(np.count_nonzero(mask))
+        active_fraction = float(active_entries / max(mask.size, 1))
+        return reward, mse, closeness, True, active_entries, active_fraction
 
     def _action_to_bias_matrix(self, action: np.ndarray) -> np.ndarray:
         """Compatibility view: strongest release/protection per source-slice."""
@@ -1654,6 +1781,8 @@ class GlobalPPO3GNBEnv(gym.Env):
             "queue_kbits_matrix": np.zeros(shape, dtype=float),
             "drop_ratio_matrix": np.zeros(shape, dtype=float),
             "packet_failure_ratio_matrix": np.zeros(shape, dtype=float),
+            "sinr_db_matrix": np.zeros(shape, dtype=float),
+            "rsrq_db_matrix": np.zeros(shape, dtype=float),
         }
         metrics = self.base_env.get_slice_sla_metrics()
         duration_s = max(
@@ -1694,6 +1823,13 @@ class GlobalPPO3GNBEnv(gym.Env):
                 queue_bits = sum(
                     max(float(getattr(ue, "queue", 0.0)), 0.0) for ue in ues
                 )
+                sinr_values = []
+                rsrq_values = []
+                for ue in ues:
+                    serving = self.base_env._get_gnb_by_id(gnb_id)
+                    link = self.base_env._compute_link_metrics(serving, ue)
+                    sinr_values.append(float(link.get("sinr_db", 0.0)))
+                    rsrq_values.append(float(link.get("rsrq_db", 0.0)))
 
                 matrices["throughput_mbps_matrix"][gnb_id, s_idx] = (
                     delivered / duration_s / 1e6
@@ -1719,6 +1855,12 @@ class GlobalPPO3GNBEnv(gym.Env):
                 )
                 matrices["packet_failure_ratio_matrix"][gnb_id, s_idx] = (
                     failed / generated if generated > 0.0 else 0.0
+                )
+                matrices["sinr_db_matrix"][gnb_id, s_idx] = (
+                    float(np.mean(sinr_values)) if sinr_values else 0.0
+                )
+                matrices["rsrq_db_matrix"][gnb_id, s_idx] = (
+                    float(np.mean(rsrq_values)) if rsrq_values else 0.0
                 )
 
                 total_offered += offered
@@ -1826,7 +1968,17 @@ class GlobalPPO3GNBEnv(gym.Env):
         )
 
     def _contradictory_directional_bias(self, directional_bias: np.ndarray) -> float:
-        """Penalty raw value for same-sign reciprocal source-target commands."""
+        """Penalty raw value for mutual-offload reciprocal source-target commands.
+
+        Negative bias means "offload to this neighbor" (see
+        strong_heuristic_local_executor.evaluate_candidate_offset: negative
+        offsets make handover easier). A pair only contradicts when BOTH
+        sides simultaneously try to offload the same slice onto each other;
+        both sides holding (positive/positive) is not a conflict. Contributions
+        are summed rather than averaged so an agent racking up contradictions
+        on several links at once is penalized proportionally more, instead of
+        the penalty being diluted by unaffected links.
+        """
         bias = np.asarray(directional_bias, dtype=float)
         expected = (self.n_gnbs, self.max_neighbors, len(self.slice_types))
         if bias.shape != expected:
@@ -1844,12 +1996,81 @@ class GlobalPPO3GNBEnv(gym.Env):
                 for s_idx in range(len(self.slice_types)):
                     forward = float(bias[src, neighbor_slot, s_idx])
                     reverse = float(bias[int(dst), reverse_slot, s_idx])
+                    if forward >= 0.0 or reverse >= 0.0:
+                        continue
                     if abs(forward) <= deadband or abs(reverse) <= deadband:
                         continue
-                    if forward * reverse <= 0.0:
-                        continue
                     contradictions.append(min(abs(forward), abs(reverse)) ** 2)
-        return float(np.mean(contradictions)) if contradictions else 0.0
+        return float(np.sum(contradictions)) if contradictions else 0.0
+
+    def _idle_slice_bias_penalty(
+        self, loads: np.ndarray, directional_bias: np.ndarray
+    ) -> float:
+        """Penalty for nonzero bias on slices carrying no demand anywhere.
+
+        Slices with zero network-wide demand have no useful direction to
+        signal, so any nonzero bias there is pure exploration noise that can
+        still trip the contradictory-bias check. Mean |bias| over all edges
+        of each idle slice, averaged across idle slices (0 if none idle).
+        """
+        loads = np.asarray(loads, dtype=float)
+        bias = np.asarray(directional_bias, dtype=float)
+        penalties = []
+        for s_idx in range(len(self.slice_types)):
+            if float(np.sum(loads[:, s_idx])) <= 1e-9:
+                penalties.append(float(np.mean(np.abs(bias[:, :, s_idx]))))
+        return float(np.mean(penalties)) if penalties else 0.0
+
+    def _end_state_sinr_matrix(self) -> np.ndarray:
+        """Mean serving SINR (dB) per gNB/slice for currently connected UEs.
+
+        Same per-UE link-metric source as ``_qos_snapshot``'s logging matrix,
+        kept as a small standalone helper so the reward path does not depend
+        on (or risk perturbing) the existing logging computation.
+        """
+        shape = (self.n_gnbs, len(self.slice_types))
+        sinr_matrix = np.zeros(shape, dtype=float)
+        for gnb_id in range(self.n_gnbs):
+            serving = self.base_env._get_gnb_by_id(gnb_id)
+            for s_idx, slice_type in enumerate(self.slice_types):
+                ues = [
+                    ue for ue in self.base_env.get_all_ues()
+                    if ue.connected
+                    and ue.serving_gnb is not None
+                    and int(ue.serving_gnb) == gnb_id
+                    and normalize_slice_type(getattr(ue, "slice_type", "eMBB"))
+                    == slice_type
+                ]
+                if not ues:
+                    continue
+                sinr_values = [
+                    float(
+                        self.base_env._compute_link_metrics(serving, ue).get(
+                            "sinr_db", 0.0
+                        )
+                    )
+                    for ue in ues
+                ]
+                sinr_matrix[gnb_id, s_idx] = float(np.mean(sinr_values))
+        return sinr_matrix
+
+    def _sinr_deficit_penalty(
+        self, sinr_matrix: np.ndarray, active_mask: np.ndarray
+    ) -> float:
+        """Mean SINR shortfall below ``sinr_floor_db`` over active cells.
+
+        Normalized by a 20 dB scale and clipped to [0, 1], matching the
+        clipping convention used by ``load_reward``/``excess_load_reward``.
+        Cells with no demand are excluded so idle slices cannot contribute.
+        """
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if not np.any(active_mask):
+            return 0.0
+        deficits = np.maximum(
+            self.sinr_floor_db - np.asarray(sinr_matrix, dtype=float)[active_mask],
+            0.0,
+        )
+        return float(np.clip(np.mean(deficits) / 20.0, 0.0, 1.0))
 
     def _active_direction_values(
         self,
@@ -2390,6 +2611,16 @@ class GlobalPPO3GNBEnv(gym.Env):
         return {
             "global_step": int(self._global_step),
             "scenario_name": self._active_scenario,
+            "scenario_case_type": str(
+                getattr(self._active_training_scenario, "metadata", {}).get("case_type", "")
+                if self._active_training_scenario is not None
+                else ""
+            ),
+            "scenario_metadata": dict(
+                getattr(self._active_training_scenario, "metadata", {})
+                if self._active_training_scenario is not None
+                else {}
+            ),
             "scenario_selection": self.scenario_selection,
             "curriculum_block_episodes": int(self.curriculum_block_episodes),
             "curriculum_block_index": int(
@@ -2556,6 +2787,23 @@ class GlobalPPO3GNBEnv(gym.Env):
                 index = self._episode_index // self.curriculum_block_episodes
             else:
                 index = len(pool) - 1
+        elif self.scenario_selection == "controlled_slice_curriculum":
+            pool = self.training_scenarios
+            if len(pool) < 7:
+                raise ValueError(
+                    "controlled_slice_curriculum expects scenarios ordered as "
+                    "3 single-slice, 3 two-slice, then mixed."
+                )
+            single_block = max(int(self.curriculum_block_episodes), 1)
+            two_block = max(int(self.fixed_stage_episodes), 1)
+            single_end = 3 * single_block
+            two_end = single_end + 3 * two_block
+            if self._episode_index < single_end:
+                index = self._episode_index // single_block
+            elif self._episode_index < two_end:
+                index = 3 + (self._episode_index - single_end) // two_block
+            else:
+                index = 6
         elif self.scenario_selection == "random":
             pool = self.training_scenarios
             index = int(self.rng.integers(len(self.training_scenarios)))
@@ -2569,6 +2817,10 @@ class GlobalPPO3GNBEnv(gym.Env):
         scenario = self._choose_training_scenario()
         self._active_training_scenario = scenario
         self._active_scenario = scenario.name
+        scenario_metadata = dict(getattr(scenario, "metadata", {}) or {})
+        traffic_profiles = scenario_metadata.get("traffic_profiles")
+        if hasattr(self.base_env, "set_ue_traffic_profiles"):
+            self.base_env.set_ue_traffic_profiles(traffic_profiles if traffic_profiles else None)
         self._active_episode_steps = max(
             1,
             int(math.ceil(float(scenario.duration_s) / self.upper_window_seconds)),
@@ -2774,6 +3026,7 @@ class GlobalPPO3GNBEnv(gym.Env):
         target_used = int(round(float(np.clip(target_load, 0.0, 1.0)) * budget))
         per_ue = target_used // len(ues)
         remainder = target_used % len(ues)
+        offered_bits = 0.0
         for idx, ue in enumerate(ues):
             prbs = int(per_ue + (1 if idx < remainder else 0))
             ue.upper_demand_prbs = prbs
@@ -2791,6 +3044,7 @@ class GlobalPPO3GNBEnv(gym.Env):
                 )
                 sinr_db = float(np.mean(snr_vector))
             bits_per_prb = self._bits_per_prb(sinr_db, slice_type)
+            offered_bits += float(SNAPSHOT_DEMAND_SAFETY * prbs * bits_per_prb)
             source = getattr(ue, "traffic_source", None)
             if source is not None and hasattr(source, "packet_size"):
                 source.packet_size = max(1.0, min(float(source.packet_size), bits_per_prb))
@@ -2798,6 +3052,21 @@ class GlobalPPO3GNBEnv(gym.Env):
                 ue,
                 SNAPSHOT_DEMAND_SAFETY * prbs * bits_per_prb / max(float(self.base_env.step_dt), 1e-9),
             )
+        profile = getattr(self.base_env, "_last_demand_profile", None)
+        if profile is None:
+            self.base_env._last_demand_profile = {}
+            profile = self.base_env._last_demand_profile
+        profile[(int(gnb_id), normalize_slice_type(slice_type))] = {
+            "target_load": float(np.clip(target_load, 0.0, 1.0)),
+            "demand_prb": float(target_used),
+            "offered_bits": float(offered_bits),
+            "n_ues": int(len(ues)),
+            "traffic_profile": dict(
+                self.base_env._traffic_profile_for_slice(slice_type)
+                if hasattr(self.base_env, "_traffic_profile_for_slice")
+                else {}
+            ),
+        }
 
     def _recalibrate_handover_ues(self) -> None:
         """Restore persistent UE demand after mobility without exceeding budgets.

@@ -1,0 +1,90 @@
+[
+  {
+    "scenario_name": "jain_balance_controllable",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.9535571594894834,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_balance_controllable_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 3.0,
+    "mean_sla_count": 1.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.1428571428571428
+  },
+  {
+    "scenario_name": "jain_control_embb_mmtc",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.6534044054718529,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_embb_mmtc_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 6.0,
+    "mean_sla_count": 2.3,
+    "mean_overloaded_negative_fraction": 0.5,
+    "mean_light_nonnegative_fraction": 0.0
+  },
+  {
+    "scenario_name": "jain_control_embb_urllc",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.96550365582745,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_embb_urllc_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 9.0,
+    "mean_sla_count": 5.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.16666666666666657
+  },
+  {
+    "scenario_name": "jain_control_mixed",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.020146668457178,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_mixed_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 11.0,
+    "mean_sla_count": 6.2,
+    "mean_overloaded_negative_fraction": 0.9,
+    "mean_light_nonnegative_fraction": 0.0
+  },
+  {
+    "scenario_name": "jain_control_mmtc",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.7134389317612748,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_mmtc_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 3.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 0.0,
+    "mean_light_nonnegative_fraction": 0.0
+  },
+  {
+    "scenario_name": "jain_control_outer_congested",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.0915030112227968,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_outer_congested_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 0.0,
+    "mean_sla_count": 0.0,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.1428571428571428
+  },
+  {
+    "scenario_name": "jain_control_urllc",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -2.2528790052610494,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_urllc_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 6.0,
+    "mean_sla_count": 1.1,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.14107142857142851
+  },
+  {
+    "scenario_name": "jain_control_urllc_mmtc",
+    "n_eval_episodes": 10,
+    "mean_eval_return": -1.726920707789689,
+    "validation_csv": "results/all_controllable_model_demand_qos_eval/jain_control_urllc_mmtc_trained_policy_trace.csv",
+    "mean_target_load_error_delta": NaN,
+    "mean_handover_count_per_step": 8.0,
+    "mean_sla_count": 3.2,
+    "mean_overloaded_negative_fraction": 1.0,
+    "mean_light_nonnegative_fraction": 0.0
+  }
+]

@@ -19,12 +19,22 @@ def test_scenario_catalog_is_slice_aware_and_uses_explicit_regions():
         "jain_control_urllc",
         "jain_control_mmtc",
         "jain_control_mixed",
+        "jain_control_embb_urllc",
+        "jain_control_embb_mmtc",
+        "jain_control_urllc_mmtc",
+        "jain_control_outer_congested",
+        "jain_control_embb_urllc_impossible",
     ]
     assert all(scenario.tier == "fixed" for scenario in UPPER_TRAINING_SCENARIOS)
     assert all(scenario.duration_s == 1.0 for scenario in UPPER_TRAINING_SCENARIOS)
     assert any(
         {group.slice_type for group in scenario.groups}
         == {"eMBB", "URLLC", "mMTC"}
+        for scenario in UPPER_TRAINING_SCENARIOS
+    )
+    assert any(
+        scenario.metadata.get("slice_family") == "two_slice"
+        and scenario.metadata.get("feasible") is False
         for scenario in UPPER_TRAINING_SCENARIOS
     )
     for scenario in UPPER_TRAINING_SCENARIOS:
@@ -167,6 +177,9 @@ def test_controlled_jain_scenarios_build_symmetric_directional_budgets():
         ("jain_control_urllc", (1,)),
         ("jain_control_mmtc", (2,)),
         ("jain_control_mixed", (0, 1, 2)),
+        ("jain_control_embb_urllc", (0, 1)),
+        ("jain_control_embb_mmtc", (0, 2)),
+        ("jain_control_urllc_mmtc", (1, 2)),
     ):
         env = GlobalPPO3GNBEnv(
             seed=123,
@@ -199,6 +212,107 @@ def test_controlled_jain_scenarios_build_symmetric_directional_budgets():
             assert state["stats"]["rejected_no_source_excess"] == 0
         finally:
             env.close()
+
+
+def test_impossible_two_slice_scenario_has_no_light_target():
+    env = GlobalPPO3GNBEnv(
+        seed=123,
+        gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
+        scenario_mode="curriculum",
+        training_scenarios="jain_control_embb_urllc_impossible",
+        upper_window_seconds=1.0,
+        local_steps_per_global=10,
+        radio_substeps=2,
+        terminal_reward_only=False,
+        max_handovers_per_local_step=3,
+        safe_admission_enabled=True,
+        a3_handover_cooldown_s=0.0,
+        a3_min_residence_s=0.0,
+    )
+    try:
+        _obs, reset_info = env.reset(seed=123)
+        loads = np.asarray(reset_info["target_load_matrix"], dtype=float)
+        assert np.allclose(loads.sum(axis=1), [0.70, 0.80, 0.70])
+
+        action = np.zeros(env.action_space.shape, dtype=np.float32)
+        action.reshape(3, 2, 3)[1, :, 0] = -1.0
+        action.reshape(3, 2, 3)[1, :, 1] = -1.0
+        _obs, _reward, _terminated, _truncated, info = env.step(action)
+
+        assert info["handover_count"] == 0
+        assert all(total > 0.65 for total in loads.sum(axis=1))
+        assert info["safe_admission"]["stats"]["accepted"] == 0
+    finally:
+        env.close()
+
+
+def test_outer_congested_scenario_is_inward_feasible():
+    env = GlobalPPO3GNBEnv(
+        seed=123,
+        gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
+        scenario_mode="curriculum",
+        training_scenarios="jain_control_outer_congested",
+        upper_window_seconds=1.0,
+        local_steps_per_global=10,
+        radio_substeps=2,
+        terminal_reward_only=False,
+        max_handovers_per_local_step=3,
+        safe_admission_enabled=True,
+        a3_handover_cooldown_s=0.0,
+        a3_min_residence_s=0.0,
+    )
+    try:
+        _obs, reset_info = env.reset(seed=123)
+        loads = np.asarray(reset_info["target_load_matrix"], dtype=float)
+        assert np.allclose(loads.sum(axis=1), [0.66, 0.0, 0.66])
+
+        ues = list(env.base_env.get_all_ues())
+        assert len(ues) == 12
+        assert sum(int(ue.serving_gnb) == 0 for ue in ues) == 6
+        assert sum(int(ue.serving_gnb) == 2 for ue in ues) == 6
+
+        for ue in ues:
+            center = env.base_env._get_gnb_by_id(1)
+            assert env.base_env._is_in_coverage(center, ue)
+
+        neutral_action = np.zeros(env.action_space.shape, dtype=np.float32)
+        _obs, _reward, _terminated, _truncated, neutral_info = env.step(neutral_action)
+        assert neutral_info["handover_count"] == 0
+    finally:
+        env.close()
+
+    env = GlobalPPO3GNBEnv(
+        seed=123,
+        gnb_configs=CENTER_LEFT_RIGHT_GNB_CONFIGS,
+        scenario_mode="curriculum",
+        training_scenarios="jain_control_outer_congested",
+        upper_window_seconds=1.0,
+        local_steps_per_global=10,
+        radio_substeps=2,
+        terminal_reward_only=False,
+        max_handovers_per_local_step=3,
+        safe_admission_enabled=True,
+        a3_handover_cooldown_s=0.0,
+        a3_min_residence_s=0.0,
+    )
+    try:
+        env.reset(seed=123)
+        action = np.zeros(env.action_space.shape, dtype=np.float32).reshape(3, 2, 3)
+        for source in (0, 2):
+            for slot, target in enumerate(env.neighbors[source]):
+                if target == 1:
+                    action[source, slot, 0] = -0.4
+
+        _obs, _reward, _terminated, _truncated, info = env.step(action.reshape(-1))
+        end_loads = np.asarray(info["gnb_total_demand_load_end"], dtype=float)
+        assert info["handover_count"] == 6
+        assert np.allclose(end_loads, [0.33, 0.66, 0.33], atol=0.04)
+        assert info["safe_admission"]["stats"]["rejected_target_safety"] == 0
+        assert info["safe_admission"]["stats"]["rejected_target_total_safety"] == 0
+        assert info["safe_admission"]["direction_used"][(0, 1, "eMBB")] == 3
+        assert info["safe_admission"]["direction_used"][(2, 1, "eMBB")] == 3
+    finally:
+        env.close()
 
 
 def test_center_gap_catalog_keeps_controllable_placement_and_three_cell_coverage():

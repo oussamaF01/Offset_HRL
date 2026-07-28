@@ -328,14 +328,12 @@ def strong_directional_heuristic_local_executor(
 ):
     """Choose one A3 offset for every source-neighbor-slice direction.
 
-    Uses a direct proportional mapping from bias to offset:
-        bias < 0  ->  raw_offset = bias * 6    (e.g. -0.1 -> -0.6, -1.0 -> -6)
-        bias > 0  ->  raw_offset = bias * 6    (e.g. +0.1 -> +0.6, +1.0 -> +6)
-        bias = 0  ->  raw_offset = 0
+    The upper directional bias is applied directly as the lower A3 offset
+    command:
 
-    Safety corrections (load overload, mobility instability) add a positive
-    offset term that reduces aggressiveness. A hard veto forces the offset to
-    zero when the target is overloaded or no UE has a viable radio path.
+    * positive bias means retain traffic from that neighbor direction;
+    * neutral bias means do not create extra A3 pressure;
+    * negative bias means release traffic toward that neighbor direction.
 
     The result is snapped to the nearest 1 dB step in EXTENDED_1DB_OFFSET_SET_DB
     (or OFFSET_SET_DB when allow_extended_negative_offsets=False).
@@ -403,10 +401,12 @@ def strong_directional_heuristic_local_executor(
     offsets = np.zeros(expected_prev_shape, dtype=float)
     debug: Dict[Tuple[int, int, int], Dict[str, object]] = {}
 
+    bias_deadband = 0.05
+
     for gnb_idx in range(num_gnbs):
-        for neighbor_slot, neighbor_idx in enumerate(neighbor_graph.get(gnb_idx, ())):
-            neighbor_idx = int(neighbor_idx)
-            for slice_idx in range(num_slices):
+        neighbors = [int(n) for n in neighbor_graph.get(gnb_idx, ())]
+        for slice_idx in range(num_slices):
+            for neighbor_slot, neighbor_idx in enumerate(neighbors):
                 bias = float(np.clip(
                     B[gnb_idx, neighbor_slot, slice_idx]
                     if B.ndim == 3
@@ -416,34 +416,25 @@ def strong_directional_heuristic_local_executor(
                 ))
                 prev = float(prev_offsets[gnb_idx, neighbor_slot, slice_idx])
 
-                # Radio feasibility: at least one served UE can reach the neighbor.
                 source_ue_indices = np.flatnonzero(
                     (ue_serving_gnb == gnb_idx) & (ue_slice == slice_idx)
                 )
+                best_radio_margin = -np.inf
                 if source_ue_indices.size == 0:
                     radio_feasible = True
+                    best_radio_margin = 0.0
                 else:
                     rsrp_threshold = float(max_target_rsrp_deficit_db) - float(hysteresis_db)
-                    radio_feasible = any(
+                    margins = [
                         float(rsrp_matrix[ue_idx, neighbor_idx])
-                        >= float(rsrp_matrix[ue_idx, gnb_idx]) - rsrp_threshold
+                        - float(rsrp_matrix[ue_idx, gnb_idx])
                         for ue_idx in source_ue_indices
-                    )
+                    ]
+                    best_radio_margin = max(margins) if margins else -np.inf
+                    radio_feasible = best_radio_margin >= -rsrp_threshold
 
                 target_load = float(load[neighbor_idx, slice_idx])
                 target_is_safe = target_load < l_safe
-
-                # 1. Proportional mapping: bias -> raw offset
-                # Symmetric ±6 dB mapping. Safe admission, rather than offset
-                # magnitude alone, limits the number of executed handovers.
-                if abs(bias) <= EPS:
-                    raw_offset = 0.0
-                elif bias < 0.0:
-                    raw_offset = bias * 6.0
-                else:
-                    raw_offset = bias * 6.0
-
-                # 2. Safety corrections (push offset positive)
                 load_over = max(target_load - l_safe, 0.0)
                 load_safety = alpha_load * load_over
 
@@ -459,29 +450,23 @@ def strong_directional_heuristic_local_executor(
                 )
                 mobility_safety = alpha_mobility * (max(rhf, 0.0) + max(rpp, 0.0))
 
-                proto_offset = raw_offset + load_safety + mobility_safety
-
-                # 3. Hard veto: never negative if target is unsafe or radio infeasible.
-                # Also veto if the target has no headroom for one more UE —
-                # prevents over-migration when multiple UEs are already in-flight.
-                # 0.15 = 1 typical eMBB UE (15 PRBs / 100 total).
-                target_has_headroom = (target_load + 0.15) < l_safe
-                if proto_offset < 0.0 and (not target_is_safe or not target_has_headroom or not radio_feasible):
-                    proto_offset = 0.0
-
-                # 4. Clip to valid range
-                proto_offset = float(np.clip(proto_offset, min_offset, max_offset))
-
-                # 5. Optional EMA smoothing with previous applied offset
+                if abs(bias) <= bias_deadband:
+                    raw_offset = 0.0
+                    mode = "neutral"
+                elif bias > 0.0:
+                    raw_offset = 6.0 * bias
+                    mode = "retain"
+                else:
+                    raw_offset = 6.0 * bias
+                    mode = "release"
+                proto_offset = float(np.clip(raw_offset, min_offset, max_offset))
                 if eta > 0.0:
                     proto_offset = (1.0 - eta) * proto_offset + eta * prev
-
-                # 6. Snap to nearest 1 dB step
                 applied_offset = _snap_to_set(proto_offset, candidate_set)
-
                 offsets[gnb_idx, neighbor_slot, slice_idx] = applied_offset
                 debug[(gnb_idx, neighbor_idx, slice_idx)] = {
                     "bias": bias,
+                    "mode": mode,
                     "raw_offset_db": raw_offset,
                     "load_safety_db": load_safety,
                     "mobility_safety_db": mobility_safety,
@@ -489,6 +474,7 @@ def strong_directional_heuristic_local_executor(
                     "applied_offset_db": applied_offset,
                     "target_is_safe": target_is_safe,
                     "radio_feasible": radio_feasible,
+                    "best_radio_margin_db": float(best_radio_margin),
                 }
 
     if return_debug:
